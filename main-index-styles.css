@@ -1,0 +1,158 @@
+/* ==========================================================================
+   MAIN INDEX STYLES
+   Specific styles for main/index.html to override global container styles
+   and implement responsive flex layout for the logo and text block
+   ========================================================================== */
+
+/* Main container layout - using higher specificity instead of !important */
+html body.home .container.grid-layout {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: clamp(10px, 2vw, 15px);
+  width: 100%;
+  justify-content: center;
+  padding: 1rem;
+  box-sizing: border-box;
+}
+
+/* Logo styling with responsive dimensions */
+html body.home .container.grid-layout .logo {
+  width: clamp(150px, 20vw, 200px);
+  height: auto;
+  max-height: clamp(150px, 20vw, 200px);
+  object-fit: contain;
+  flex-shrink: 0;
+}
+
+/* Text content container */
+html body.home .container.grid-layout .text-content {
+  max-width: min(600px, 90%);
+  flex-grow: 1;
+}
+
+/* Typography styles */
+html body.home .container.grid-layout .heading {
+  color: rgb(14, 98, 134); /* Primary brand color */
+  font-size: clamp(1.25rem, 3vw, 1.55rem);
+  font-weight: bold;
+  margin: 0 0 0.5rem 0;
+  text-align: left;
+}
+
+html body.home .container.grid-layout .paragraph {
+  color: rgba(0, 0, 0, 0.85);
+  font-family: Helvetica, sans-serif;
+  font-size: clamp(0.95rem, 2vw, 1.05rem);
+  line-height: 1.6;
+  text-align: left;
+  margin-bottom: 1rem;
+}
+
+/* ==========================================================================
+   BUTTON STYLES
+   ========================================================================== */
+
+/* Button container styles */
+html body.home .container.grid-layout .button-container,
+html body.home .container.grid-layout .learn-more-container {
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+  margin-top: 1rem;
+}
+
+/* Common button styles */
+html body.home .container.grid-layout .elementor-button {
+  --button-bg-color: #0e6286;
+  --button-hover-color: #094861;
+  
+  background-color: var(--button-bg-color);
+  color: white;
+  border-radius: 5px;
+  text-decoration: none;
+  font-size: clamp(0.9rem, 1.5vw, 1rem);
+  font-weight: bold;
+  transition: background-color 0.2s ease;
+  border: none;
+  cursor: pointer;
+}
+
+/* Standard button with icon */
+html body.home .container.grid-layout .button-container .elementor-button {
+  padding: 0.75rem 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Learn more button specific styles */
+html body.home .container.grid-layout .learn-more-container .elementor-button {
+  padding: 0.5rem 1rem;
+  display: inline-block;
+  text-align: center;
+  width: auto;
+  white-space: nowrap;
+}
+
+/* Hover state for all buttons */
+html body.home .container.grid-layout .elementor-button:hover {
+  background-color: var(--button-hover-color);
+}
+
+/* ==========================================================================
+   RESPONSIVE ADJUSTMENTS
+   ========================================================================== */
+
+@media (max-width: 768px) {
+  html body.home .container.grid-layout {
+    flex-direction: column;
+    text-align: center;
+  }
+  
+  html body.home .container.grid-layout .heading,
+  html body.home .container.grid-layout .paragraph {
+    text-align: center;
+  }
+  
+  html body.home .container.grid-layout .button-container,
+  html body.home .container.grid-layout .learn-more-container {
+    justify-content: center;
+  }
+}
+
+/* ==========================================================================
+   FULL WIDTH SLIDER
+   ========================================================================== */
+
+.main-slider-container.full-width {
+    width: 100vw;
+    max-width: none;
+    margin: 0;
+}
+
+/* ==========================================================================
+   OVERRIDE FOR ATTACHED AGENCIES IMAGE ROW
+   ========================================================================== */
+
+.attached-agencies .image-row {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  gap: 10px;
+  padding: 10px 0;
+}
+
+
+/* Optional: Apply similar behavior to all .image-row elements on large screens */
+@media screen and (min-width: 1024px) {
+  .image-row.no-wrap {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+  }
+  
+  .image-row.no-wrap img {
+    width: auto;
+    flex: 0 0 150px;
+    max-width: 150px;
+  }
+}
