@@ -149,6 +149,13 @@ To work on this website locally:
 
 4. Make changes and test locally before pushing to GitHub
 
+## Calendar Integration
+
+The website includes FullCalendar integration with Google Calendar support. For the calendar to function properly:
+
+- The Google Calendar (`sogodwaterworks2025@gmail.com`) must be shared publicly.
+- The API key must have the Google Calendar API enabled in the Google Cloud console.
+
 ## Responsive Design
 
 The website is designed to be responsive across different screen sizes:
