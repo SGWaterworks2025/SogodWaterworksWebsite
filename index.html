@@ -1340,9 +1340,10 @@
                                                         <!-- wrap for responsiveness -->
                                                         <div style="max-width: 800px; margin: 0 auto; padding: 1rem;">
                                                           <iframe
+                                                            id="calendarIframe"
                                                             src="https://calendar.google.com/calendar/embed?src=sogodwaterworks2025%40gmail.com&ctz=Asia%2FManila"
                                                             width="100%"
-                                                            height="800"
+                                                            height="500"
                                                             frameborder="0"
                                                             marginheight="0"
                                                             marginwidth="0"
@@ -1350,6 +1351,15 @@
                                                             Loading…
                                                           </iframe>
                                                         </div>
+
+                                                        <script>
+                                                          // every 10 seconds, reset the iframe src to itself
+                                                          const calIframe = document.getElementById('calendarIframe');
+                                                          setInterval(() => {
+                                                            // re‐assigning src forces a reload of the embed
+                                                            calIframe.src = calIframe.src;
+                                                          }, 10_000);
+                                                        </script>
 
 
                                                         <!-- wrap for responsiveness -->
@@ -1550,7 +1560,7 @@
   <div class="row justify-content-center">
   <div class="col-md text-center">
   <div class="jupiterx-subfooter-copyright">
-    © 2025 - SOGOD Waterworks Sogod, Cebu. All rights reserved. Created by: ISA I POL JOSEPH LOUIE L. LACANDULA
+    © 2025 - SOGOD Waterworks Sogod, Cebu. All rights reserved. Created by: POLSTER NOKSMAN
   </div>
   <div class="elementor-widget-container" style="margin-top: 10px;">
     <div style="font-weight: bold; margin-bottom: 5px;">Philippine Standard Time</div>
