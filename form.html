@@ -842,6 +842,32 @@
     <link rel="shortlink" href="index.html" />
      <meta name="generator" content="Elementor 3.28.1; features: additional_custom_breakpoints, e_local_google_fonts; settings: css_print_method-external, google_font-enabled, font_display-auto" />
     <link rel="stylesheet" href="menu.css" type="text/css" media="all">
+    <style>
+      #loadingOverlay { 
+        position: fixed; 
+        top: 0; 
+        left: 0; 
+        width: 100%; 
+        height: 100%; 
+        background: rgba(0,0,0,0.5); 
+        display: flex; 
+        align-items: center; 
+        justify-content: center; 
+        flex-direction: column; 
+        opacity: 0; 
+        pointer-events: none; 
+        transition: opacity 0.2s ease; 
+        z-index: 9999;
+      }
+      #loadingOverlay.visible { 
+        opacity: 1; 
+        pointer-events: all; 
+      }
+      @keyframes spin { 
+        from { transform: rotate(0deg); } 
+        to { transform: rotate(360deg); } 
+      }
+    </style>
   </head>
   <body class="home page-template page-template-elementor_header_footer page page-id-250 current_page_item no-js jet-desktop-menu-active elementor-default elementor-template-full-width elementor-kit-3750 elementor-page elementor-page-250 jupiterx-header-fixed jupiterx-header-overlapped jupiterx-header-overlapped-tablet jupiterx-header-overlapped-mobile main-page" itemscope="itemscope" itemtype="http://schema.org/WebPage">
     <div class="jupiterx-site">
@@ -1367,20 +1393,78 @@
 
 
                                                         <!-- wrap for responsiveness -->
-                                                        <div style="max-width: 800px; margin: 0 auto; padding: 1rem;">
-                                                          <iframe
-                                                            id="myGoogleForm" 
-                                                            src="https://docs.google.com/forms/d/e/1FAIpQLScO5tMXW546nmElzrAlrMU_L3g219xtNl_9f2ZqvW9ofNurWg/viewform?embedded=true"
-                                                            width="100%"
-                                                            height="1200"
-                                                            frameborder="0"
-                                                            marginheight="0"
-                                                            marginwidth="0"
-                                                            scrolling="no"
-                                                          >
-                                                            Loading…
-                                                          </iframe>
-                                                        </div>
+<!-- Your Google Form iframe -->
+<iframe
+  id="myGoogleForm"
+  src="https://docs.google.com/forms/d/e/1FAIpQLScO5tMXW546nmElzrAlrMU_L3g219xtNl_9f2ZqvW9ofNurWg/viewform?embedded=true"
+  width="100%"
+  height="1200"
+  frameborder="0"
+  marginheight="0"
+  marginwidth="0"
+  scrolling="no">
+  Loading…
+</iframe>
+
+<!-- Loading Overlay -->
+<div id="loadingOverlay">
+  <div style="
+    width: 50px; height: 50px;
+    border: 5px solid #f3f3f3;
+    border-top: 5px solid #3498db;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+  "></div>
+  <p style="color: white; margin-top: 1rem; font-size: 1.2rem;">
+    Booking your appointment! Please wait.
+  </p>
+</div>
+
+<!-- Overlay CSS -->
+<style>
+  #loadingOverlay {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    background: rgba(0,0,0,0.5);
+    display: flex; align-items: center; justify-content: center; flex-direction: column;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+    z-index: 9999;
+  }
+  #loadingOverlay.visible {
+    opacity: 1;
+    pointer-events: all;
+  }
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+  }
+</style>
+
+<!-- Script to toggle overlay only on form submit -->
+<script>
+  document.addEventListener('DOMContentLoaded', function() {
+    const overlay = document.getElementById('loadingOverlay');
+    const iframe  = document.getElementById('myGoogleForm');
+    let initialLoad = true;
+
+    iframe.addEventListener('load', function() {
+      if (initialLoad) {
+        initialLoad = false;  // Skip the initial load of the form
+        return;
+      }
+      // On second load (after submission):
+      overlay.classList.add('visible');
+      // Give overlay a moment to appear, then redirect
+      setTimeout(() => {
+        window.location.href = 'index.html';
+      }, 11000); // Adjust time as needed
+    });
+  });
+</script>
+
 
 
 
@@ -1392,30 +1476,9 @@
 
 
 
-                                                        <script>
-                                                          // Check if form was submitted on page load
-                                                          window.addEventListener('load', function() {
-                                                            if (localStorage.getItem('formSubmitted') === 'true') {
-                                                              localStorage.removeItem('formSubmitted');
-                                                              window.location.href = 'index.html'; // Redirect instantly
-                                                            }
-                                                          });
 
-                                                          // Monitor iframe for form submission
-                                                          const iframe = document.getElementById('myGoogleForm');
-                                                          let initialLoad = true;
 
-                                                          iframe.addEventListener('load', function() {
-                                                            if (initialLoad) {
-                                                              initialLoad = false;
-                                                              return;
-                                                            }
 
-                                                            // Form has been submitted, set flag and reload parent
-                                                            localStorage.setItem('formSubmitted', 'true');
-                                                            window.location.reload();
-                                                          });
-                                                        </script>
 
 
 
@@ -1838,5 +1901,23 @@
         });
       </script>
     </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
   </body>
 </html>
