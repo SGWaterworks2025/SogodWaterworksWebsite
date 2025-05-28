@@ -1382,6 +1382,33 @@
                                                           </iframe>
                                                         </div>
 
+                                                        <script>
+                                                          // Check if form was submitted on page load
+                                                          window.addEventListener('load', function() {
+                                                            if (localStorage.getItem('formSubmitted') === 'true') {
+                                                              localStorage.removeItem('formSubmitted');
+                                                              setTimeout(function() {
+                                                                window.location.href = 'index.html';
+                                                              }, 1);
+                                                            }
+                                                          });
+
+                                                          // Monitor iframe for form submission
+                                                          const iframe = document.getElementById('myGoogleForm');
+                                                          let initialLoad = true;
+
+                                                          iframe.addEventListener('load', function() {
+                                                            if (initialLoad) {
+                                                              initialLoad = false;
+                                                              return;
+                                                            }
+                                                            
+                                                            // Form has been submitted, set flag and reload parent
+                                                            localStorage.setItem('formSubmitted', 'true');
+                                                            window.location.reload();
+                                                          });
+                                                        </script>
+
 
 
 
@@ -1392,7 +1419,7 @@
 
 
 
-
+<!-- 
                               <div class="container grid-layout">
                                 <div class="text-content">
                                   <div class="learn-more-container">
@@ -1404,7 +1431,7 @@
                                   </div>
                                 </div>
                               </div>
-
+--> 
 
 
 
