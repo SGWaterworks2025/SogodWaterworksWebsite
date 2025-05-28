@@ -1,0 +1,225 @@
+/**
+ * Main worker: 
+ *  • Reads form responses (coercing values into Dates),
+ *  • Updates the Form’s "Date of Appointment" dropdown,
+ *  • Syncs per-day summary events on Calendar,
+ *  • Writes an Availability table into a sheet.
+ */
+function updateAvailability_everywhere() {
+  const FORM_ID     = '1a7K-SKOU5n3mYlCMM7y0bUqvaO_u5LHtDDS3eLq3mhs';
+  const RESP_SHEET  = SpreadsheetApp
+                        .getActiveSpreadsheet()
+                        .getSheetByName('Form Responses 1');
+  const AVAIL_SHEET = getOrCreateSheet_('Availability');
+  const form        = FormApp.openById(FORM_ID);
+  const cal         = CalendarApp.getDefaultCalendar();
+  const SLOT_CAP    = 20;
+  const TZ          = Session.getScriptTimeZone();
+
+  // 1️⃣ Read & coerce column-F values into Date objects
+  const lastRow = RESP_SHEET.getLastRow();
+  const rawData = lastRow > 1
+    // ← column 6 = "Date of Appointment"
+    ? RESP_SHEET.getRange(2, 6, lastRow - 1, 1).getValues()
+    : [];
+  const data = rawData.map(([cell]) => {
+    if (cell instanceof Date) return cell;
+    const s = String(cell);
+    const match = s.match(/(\d{4}-\d{2}-\d{2})/);
+    return match ? new Date(match[1]) : null;
+  });
+
+  // 2️⃣ Tally per-day counts
+  const counts = data.reduce((m, d) => {
+    if (d instanceof Date && !isNaN(d)) {
+      const key = Utilities.formatDate(d, TZ, 'yyyy-MM-dd');
+      m[key] = (m[key] || 0) + 1;
+    }
+    return m;
+  }, {});
+
+  // 3️⃣ Build dropdown choices for next 60 business days
+  const choices    = [];
+  const availDates = [];
+  const today      = new Date();
+  for (let i = 0; i < 60; i++) {
+    const d = new Date(today);
+    d.setDate(today.getDate() + i);
+    if (d.getDay() === 0 || d.getDay() === 6) continue;
+    const key  = Utilities.formatDate(d, TZ, 'yyyy-MM-dd');
+    const used = counts[key] || 0;
+    availDates.push(key);
+    if (used < SLOT_CAP) {
+      choices.push(`${key} (${SLOT_CAP - used} slots left)`);
+    }
+  }
+
+  // 4️⃣ Update Form dropdown
+  const dateItem = form.getItems(FormApp.ItemType.LIST)
+                       .find(i => i.asListItem().getTitle() === 'Date of Appointment');
+  if (!dateItem) throw new Error('No LIST item titled "Date of Appointment"');
+  dateItem.asListItem().setChoiceValues(choices);
+
+  // 5️⃣ Sync calendar summary events
+  const TAG = '##SLOT_SUMMARY##';
+  availDates.forEach(dateStr => {
+    const [y, m, d] = dateStr.split('-').map(Number);
+    const startDay = new Date(y, m - 1, d);
+    const endDay   = new Date(y, m - 1, d + 1);
+    const used     = counts[dateStr] || 0;
+    const left     = SLOT_CAP - used;
+
+    // delete old summary
+    cal.getEvents(startDay, endDay)
+       .filter(ev => ev.getDescription().includes(TAG))
+       .forEach(ev => ev.deleteEvent());
+
+    // write new one
+    cal.createAllDayEvent(
+      left > 0
+        ? `${left} Slots left (${SLOT_CAP} total)`
+        : `Fully booked`,
+      startDay,
+      { description: TAG }
+    );
+  });
+
+  // 6️⃣ Write Availability sheet
+  AVAIL_SHEET.clearContents();
+  AVAIL_SHEET.appendRow(['Date', 'Booked', 'Slots Left']);
+  availDates.forEach(dateStr => {
+    const used = counts[dateStr] || 0;
+    const left = SLOT_CAP - used;
+    AVAIL_SHEET.appendRow([dateStr, used, left]);
+  });
+}
+
+/**
+ * Trigger: on every Form submit
+ */
+function onFormSubmit(e) {
+  // e.values = [Timestamp, LAST NAME, FIRST NAME, PUROK, BARANGAY, Date of Appointment]
+  const [, lastName, firstName, purok, barangay, dateChoice] = e.values;
+  const dateText = dateChoice.split(' ')[0];
+  const start    = new Date(dateText);
+
+  // create appointment event
+  CalendarApp.getDefaultCalendar().createAllDayEvent(
+    `Appointment: ${lastName}, ${firstName} (${purok}, ${barangay})`,
+    start,
+    { description: `Purok: ${purok} — Barangay: ${barangay}` }
+  );
+
+  // rebuild availability
+  updateAvailability_everywhere();
+}
+
+/** Helper to get or create a sheet by name */
+function getOrCreateSheet_(name) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh   = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  return sh;
+}
+
+/**
+ * Integrity Checker: Runs every 1 minute.
+ * • Removes orphaned calendar events no longer in the form response.
+ * • Rebuilds the availability sheet and form dropdown.
+ */
+function checkCalendarIntegrity() {
+
+  const RESP_SHEET = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Form Responses 1');
+  const cal = CalendarApp.getDefaultCalendar();
+  const TZ = Session.getScriptTimeZone();
+  const TAG = 'Appointment:';
+
+  // ── Delete all past “Appointment:” events through yesterday ──
+  const now = new Date();
+  const yesterdayEnd = new Date(now);
+  yesterdayEnd.setDate(now.getDate() - 1);
+  yesterdayEnd.setHours(23, 59, 59, 999);
+
+  // Remove any “Appointment:” events whose start date is ≤ yesterday
+  cal.getEvents(new Date(1970,0,1), yesterdayEnd)
+     .filter(ev => ev.getTitle().startsWith(TAG))
+     .forEach(ev => ev.deleteEvent());
+
+  // ── 1b) Delete all past “Slots left” summary events through yesterday ──
+  const SUMMARY_TAG = '##SLOT_SUMMARY##';
+  cal.getEvents(new Date(1970, 0, 1), yesterdayEnd)
+     .filter(ev => ev.getDescription().includes(SUMMARY_TAG))
+     .forEach(ev => ev.deleteEvent());
+
+  // Get all appointment dates from sheet (column 6)
+  const lastRow = RESP_SHEET.getLastRow();
+  const rawData = lastRow > 1
+    ? RESP_SHEET.getRange(2, 6, lastRow - 1, 1).getValues()
+    : [];
+  const validDates = new Set(
+    rawData
+      .map(([cell]) => {
+        if (!(cell instanceof Date)) return null;
+        return Utilities.formatDate(cell, TZ, 'yyyy-MM-dd');
+      })
+      .filter(Boolean)
+  );
+
+  // Check calendar events for next 30 days
+  const today = new Date();
+  const rangeEnd = new Date(today);
+  rangeEnd.setDate(today.getDate() + 30);
+  const events = cal.getEvents(today, rangeEnd);
+
+  let deletedCount = 0;
+
+  events.forEach(event => {
+    const title = event.getTitle();
+    if (!title.startsWith(TAG)) return;
+
+    const start = event.getStartTime();
+    const eventDate = Utilities.formatDate(start, TZ, 'yyyy-MM-dd');
+
+    if (!validDates.has(eventDate)) {
+      event.deleteEvent();
+      deletedCount++;
+    }
+  });
+
+  if (deletedCount > 0) {
+    updateAvailability_everywhere(); // Rebuild availability after deletions
+  }
+  // ── 4) Also remove yesterday’s date from the Form dropdown ──
+  const FORM_ID  = '1a7K-SKOU5n3mYlCMM7y0bUqvaO_u5LHtDDS3eLq3mhs';
+  const form     = FormApp.openById(FORM_ID);
+ // const TZ       = Session.getScriptTimeZone();
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  const yStr     = Utilities.formatDate(yesterday, TZ, 'yyyy-MM-dd');
+
+  // Find the “Date of Appointment” list item
+  const item = form.getItems(FormApp.ItemType.LIST)
+                   .find(i => i.asListItem().getTitle() === 'Date of Appointment')
+                   .asListItem();
+  if (item) {
+    // Extract raw values
+    const allValues = item.getChoices().map(choice => choice.getValue());
+    // Filter out yesterday’s date
+    const filtered  = allValues.filter(v => !v.startsWith(yStr));
+    // Re-set the dropdown
+    item.setChoiceValues(filtered);
+  }
+
+}
+//Owned by
+//Last run
+//Deployment
+//Event
+//Function
+//Error rate
+//Me	May 28, 2025, 12:08:28 AM	Head	Time-based	updateAvailability_everywhere	
+//50%
+//Me	May 28, 2025, 8:33:03 PM	Head	From spreadsheet - On form submit	onFormSubmit	
+//16.67%
+//Me	May 28, 2025, 8:33:03 PM	Head	From spreadsheet - On form submit	checkCalendarIntegrity	
+//0.62%
