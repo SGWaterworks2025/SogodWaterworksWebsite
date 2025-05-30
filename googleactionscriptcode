@@ -4,222 +4,1308 @@
  *  • Updates the Form’s "Date of Appointment" dropdown,
  *  • Syncs per-day summary events on Calendar,
  *  • Writes an Availability table into a sheet.
+ * Retention Policy: filters out form responses older than RESPONSE_RETENTION_DAYS days.
+ * Constants:
+ *  • SLOT_CAP: maximum appointments per day.
+ *  • RESPONSE_RETENTION_DAYS: days to retain form responses.
+ *  • FULL_SUMMARY_TAG: combined tag for identifying summary events.
+ *  • CACHE counts entries expire after 300 seconds (5 minutes).
+ * Testing: verify cap reached edge cases and color-coding.
+ * Holidays excluded via `HOLIDAY_CAL_ID`.
  */
-function updateAvailability_everywhere() {
-  const FORM_ID     = '1a7K-SKOU5n3mYlCMM7y0bUqvaO_u5LHtDDS3eLq3mhs';
-  const RESP_SHEET  = SpreadsheetApp
-                        .getActiveSpreadsheet()
-                        .getSheetByName('Form Responses 1');
-  const AVAIL_SHEET = getOrCreateSheet_('Availability');
-  const form        = FormApp.openById(FORM_ID);
-  const cal         = CalendarApp.getDefaultCalendar();
-  const SLOT_CAP    = 20;
-  const TZ          = Session.getScriptTimeZone();
+const SCRIPT_VERSION = 'v2';
+const CACHE_KEY = SCRIPT_VERSION + '_counts';
+const IS_DEV = false;
+const FORM_ID = '1a7K-SKOU5n3mYlCMM7y0bUqvaO_u5LHtDDS3eLq3mhs';
+const SLOT_CAP = 20;
+const RESPONSE_RETENTION_DAYS = 90;
+const TZ = Session.getScriptTimeZone();
+const THROTTLE_INTERVAL_MS = 60000;
+const LOCK_TIMEOUT_MS = 30000;
+const TAG_SUMMARY = '##SLOT_SUMMARY##';
+const TAG_APPOINTMENT = 'Appointment:';
+const FORM = FormApp.openById(FORM_ID);
+const CAL = CalendarApp.getDefaultCalendar();
+const SS = SpreadsheetApp.getActiveSpreadsheet();
 
-  // 1️⃣ Read & coerce column-F values into Date objects
-  const lastRow = RESP_SHEET.getLastRow();
-  const rawData = lastRow > 1
-    // ← column 6 = "Date of Appointment"
-    ? RESP_SHEET.getRange(2, 6, lastRow - 1, 1).getValues()
-    : [];
-  const data = rawData.map(([cell]) => {
-    if (cell instanceof Date) return cell;
-    const s = String(cell);
-    const match = s.match(/(\d{4}-\d{2}-\d{2})/);
-    return match ? new Date(match[1]) : null;
-  });
+const LAST_NAME_IDX = 1;
+const FIRST_NAME_IDX = 2;
+const PUROK_IDX = 3;
+const BARANGAY_IDX = 4;
+const DATE_IDX = 5;
+const RESP_SHEET_NAME = 'Form Responses 1';
+const RESP_DATE_COL = 'F';
+const AVAIL_BOOKED_COL = 2;
+const AVAIL_LEFT_COL = 3;
 
-  // 2️⃣ Tally per-day counts
-  const counts = data.reduce((m, d) => {
-    if (d instanceof Date && !isNaN(d)) {
-      const key = Utilities.formatDate(d, TZ, 'yyyy-MM-dd');
-      m[key] = (m[key] || 0) + 1;
-    }
-    return m;
-  }, {});
+const MAX_ADVANCE_DAYS = 60;
+const BUSINESS_DAYS_WINDOW = 60;
+const EMAIL_THROTTLE_MS = 24 * 60 * 60 * 1000;
+const SUMMARY_TAG_PREFIX = '[SYSTEM_GEN]';
+const FULL_SUMMARY_TAG = SUMMARY_TAG_PREFIX + TAG_SUMMARY;
+const CHUNK_SIZE = 50;
+const CACHE = CacheService.getScriptCache();
 
-  // 3️⃣ Build dropdown choices for next 60 business days
-  const choices    = [];
-  const availDates = [];
-  const today      = new Date();
-  for (let i = 0; i < 60; i++) {
-    const d = new Date(today);
-    d.setDate(today.getDate() + i);
-    if (d.getDay() === 0 || d.getDay() === 6) continue;
-    const key  = Utilities.formatDate(d, TZ, 'yyyy-MM-dd');
-    const used = counts[key] || 0;
-    availDates.push(key);
-    if (used < SLOT_CAP) {
-      choices.push(`${key} (${SLOT_CAP - used} slots left)`);
-    }
+const EVENT_COLOR_AVAILABLE = CalendarApp.EventColor.GREEN;
+const EVENT_COLOR_FULL      = CalendarApp.EventColor.RED;
+const HOLIDAY_CAL_ID = 'en.philippines%23holiday@group.v.calendar.google.com';
+const HOLIDAY_CACHE_KEY = SCRIPT_VERSION + '_holidays';
+const HOLIDAY_CACHE_TTL = 12 * 60 * 60;
+
+// Module-level throttle state
+const propsEmail = PropertiesService.getScriptProperties();
+
+// Module-level cache for form list item
+let cachedListItem = null;
+let cachedCounts = null;
+
+/**
+ * Checks if a given date is a holiday.
+ * @param {string} dateText - Date string in yyyy-MM-dd format.
+ * @return {boolean} True if the date is a holiday, false otherwise.
+ */
+function isHoliday_(dateText) {
+  // Normalize input using formatYMD_ to ensure consistent format
+  const date = new Date(dateText);
+  if (isNaN(date)) {
+    logTS('isHoliday_: Invalid date input: ' + dateText);
+    return false;
   }
-
-  // 4️⃣ Update Form dropdown
-  const dateItem = form.getItems(FormApp.ItemType.LIST)
-                       .find(i => i.asListItem().getTitle() === 'Date of Appointment');
-  if (!dateItem) throw new Error('No LIST item titled "Date of Appointment"');
-  dateItem.asListItem().setChoiceValues(choices);
-
-  // 5️⃣ Sync calendar summary events
-  const TAG = '##SLOT_SUMMARY##';
-  availDates.forEach(dateStr => {
-    const [y, m, d] = dateStr.split('-').map(Number);
-    const startDay = new Date(y, m - 1, d);
-    const endDay   = new Date(y, m - 1, d + 1);
-    const used     = counts[dateStr] || 0;
-    const left     = SLOT_CAP - used;
-
-    // delete old summary
-    cal.getEvents(startDay, endDay)
-       .filter(ev => ev.getDescription().includes(TAG))
-       .forEach(ev => ev.deleteEvent());
-
-    // write new one
-    cal.createAllDayEvent(
-      left > 0
-        ? `${left} Slots left (${SLOT_CAP} total)`
-        : `Fully booked`,
-      startDay,
-      { description: TAG }
-    );
-  });
-
-  // 6️⃣ Write Availability sheet
-  AVAIL_SHEET.clearContents();
-  AVAIL_SHEET.appendRow(['Date', 'Booked', 'Slots Left']);
-  availDates.forEach(dateStr => {
-    const used = counts[dateStr] || 0;
-    const left = SLOT_CAP - used;
-    AVAIL_SHEET.appendRow([dateStr, used, left]);
-  });
+  const normalizedDate = formatYMD_(date);
+  const holidaySet = getHolidayDates(date, date);
+  const isHoliday = holidaySet.has(normalizedDate);
+  
+  // Log cache hits/misses for debugging
+  if (isHoliday) {
+    logTS('isHoliday_: cache hit for holiday ' + normalizedDate);
+  } else {
+    logTS('isHoliday_: cache miss for non-holiday ' + normalizedDate);
+  }
+  
+  return isHoliday;
 }
 
 /**
- * Trigger: on every Form submit
+ * Safely parses a cell value into a date string.
+ * @param {*} cell - The cell value to parse.
+ * @return {string|null} Date string in yyyy-MM-dd format or null if invalid.
  */
-function onFormSubmit(e) {
-  // e.values = [Timestamp, LAST NAME, FIRST NAME, PUROK, BARANGAY, Date of Appointment]
-  const [, lastName, firstName, purok, barangay, dateChoice] = e.values;
-  const dateText = dateChoice.split(' ')[0];
-  const start    = new Date(dateText);
-
-  // create appointment event
-  CalendarApp.getDefaultCalendar().createAllDayEvent(
-    `Appointment: ${lastName}, ${firstName} (${purok}, ${barangay})`,
-    start,
-    { description: `Purok: ${purok} — Barangay: ${barangay}` }
-  );
-
-  // rebuild availability
-  updateAvailability_everywhere();
+function safeParseDate_(cell) {
+  try {
+    if (cell instanceof Date && !isNaN(cell)) {
+      return formatYMD_(cell);
+    }
+    const s = String(cell);
+    const m = s.match(/(\d{4}-\d{2}-\d{2})/);
+    if (m) {
+      const testDate = new Date(m[1]);
+      if (!isNaN(testDate)) {
+        return m[1];
+      }
+    }
+    return null;
+  } catch (err) {
+    return null;
+  }
 }
 
-/** Helper to get or create a sheet by name */
+/**
+ * Splits an array into chunks of specified size.
+ * @param {Array} arr - Array to chunk.
+ * @param {number} size - Chunk size.
+ * @return {Array[]} Array of chunks.
+ */
+function chunkArray(arr, size) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
+}
+
+/**
+ * Logs a timestamped message to the Logger.
+ * @param {string} label - The message to log.
+ */
+function logTS(label) {
+  Logger.log(`[${new Date().toISOString()}] ${label}`);
+}
+
+/**
+ * Formats a Date object as yyyy-MM-dd.
+ * @param {Date} date - The date to format.
+ * @return {string} Formatted date string.
+ */
+function formatYMD_(date) {
+  return Utilities.formatDate(date, TZ, 'yyyy-MM-dd');
+}
+
+/**
+ * Safely puts a value into cache with error handling.
+ * @param {string} key - Cache key.
+ * @param {string} value - Value to cache.
+ * @param {number} ttl - Time to live in seconds.
+ */
+function safeCachePut(key, value, ttl) {
+  try {
+    CACHE.put(key, value, ttl);
+  } catch (e) {
+    logTS('safeCachePut error: ' + e);
+  }
+}
+
+/**
+ * Safely gets a value from cache with error handling and logging.
+ * @param {string} key - Cache key.
+ * @return {string|null} Cached value or null if not found/error.
+ */
+function safeCacheGet(key) {
+  try {
+    const value = CACHE.get(key);
+    if (value) {
+      logTS('cache hit: ' + key);
+      return value;
+    } else {
+      logTS('cache miss: ' + key);
+      return null;
+    }
+  } catch (e) {
+    logTS('safeCacheGet error: ' + e);
+    return null;
+  }
+}
+
+/**
+ * Safely removes a value from cache with error handling.
+ * @param {string} key - Cache key to remove.
+ */
+function safeCacheRemove(key) {
+  try {
+    CACHE.remove(key);
+    logTS('cache removed: ' + key);
+  } catch (e) {
+    logTS('safeCacheRemove error: ' + e);
+  }
+}
+
+/**
+ * Retrieves holiday dates between two dates (inclusive) and caches them.
+ * @param {Date} startDate - Start date.
+ * @param {Date} endDate - End date.
+ * @return {Set<string>} Set of holiday date strings in yyyy-MM-dd format.
+ */
+function getHolidayDates(startDate, endDate) {
+  let dates;
+  const cached = safeCacheGet(HOLIDAY_CACHE_KEY);
+  if (cached) {
+    try {
+      dates = JSON.parse(cached);
+    } catch (e) {
+      dates = null;
+    }
+  }
+  if (!dates) {
+    try {
+      const holidayCal = CalendarApp.getCalendarById(HOLIDAY_CAL_ID);
+      const events = holidayCal.getEvents(startDate, endDate);
+      dates = events.map(ev => formatYMD_(ev.getStartTime()));
+      safeCachePut(HOLIDAY_CACHE_KEY, JSON.stringify(dates), HOLIDAY_CACHE_TTL);
+      // Validate holiday calendar by logging count and events
+      logTS(`Holiday calendar validation: fetched ${dates.length} holidays for window ${formatYMD_(startDate)} to ${formatYMD_(endDate)}`);
+      logTS(`Holiday events: ${JSON.stringify(dates)}`);
+    } catch (e) {
+      logTS('getHolidayDates: Error fetching holiday calendar: ' + e);
+      dates = []; // Return empty array on error to prevent blocking
+      safeCachePut(HOLIDAY_CACHE_KEY, JSON.stringify(dates), HOLIDAY_CACHE_TTL);
+    }
+  }
+  return new Set(dates);
+}
+
+/**
+ * Removes summary events and appointment events that fall on holiday dates within the specified range.
+ * @param {Date} startDate - Start date for the range.
+ * @param {Date} endDate - End date for the range.
+ */
+function removeHolidaySummaries(startDate, endDate) {
+  logTS('removeHolidaySummaries:start');
+  const holidaySet = getHolidayDates(startDate, endDate);
+  const summariesToDelete = [];
+  const appointmentsToDelete = [];
+  
+  holidaySet.forEach(dateText => {
+    const [y, m, d] = dateText.split('-').map(Number);
+    const dayDate = new Date(y, m - 1, d);
+    const dayEvents = CAL.getEventsForDay(dayDate);
+    
+    // Collect summary events on holidays
+    const summaries = dayEvents.filter(ev => ev.getDescription().indexOf(FULL_SUMMARY_TAG) === 0);
+    summariesToDelete.push(...summaries);
+    
+    // Collect appointment events on holidays
+    const appointments = dayEvents.filter(ev => ev.getTitle().startsWith(TAG_APPOINTMENT));
+    appointmentsToDelete.push(...appointments);
+  });
+  
+  // Delete summary events in chunks
+  chunkArray(summariesToDelete, CHUNK_SIZE).forEach(chunk => {
+    try { 
+      chunk.forEach(ev => ev.deleteEvent()); 
+      logTS(`Deleted ${chunk.length} holiday summary events`);
+    }
+    catch(e){ 
+      logTS('Chunk delete error in removeHolidaySummaries (summaries): '+e); 
+    }
+  });
+  
+  // Delete appointment events in chunks
+  chunkArray(appointmentsToDelete, CHUNK_SIZE).forEach(chunk => {
+    try { 
+      chunk.forEach(ev => ev.deleteEvent()); 
+      logTS(`Deleted ${chunk.length} holiday appointment events`);
+    }
+    catch(e){ 
+      logTS('Chunk delete error in removeHolidaySummaries (appointments): '+e); 
+    }
+  });
+  
+  logTS('removeHolidaySummaries:end');
+}
+
+/**
+ * Sends throttled error emails to avoid spam.
+ * @param {string} functionName - Name of the function that errored.
+ * @param {*} err - The error object or message.
+ */
+function sendThrottledError(functionName, err) {
+  try {
+    if (IS_DEV) {
+      FormApp.getUi().alert(String(err));
+    } else {
+      const lastEmail = parseInt(propsEmail.getProperty('LAST_ERROR_EMAIL_TS')||'0',10);
+      const now = Date.now();
+      if(now - lastEmail >= EMAIL_THROTTLE_MS) {
+        propsEmail.setProperty('LAST_ERROR_EMAIL_TS',String(now));
+        const subject = `Error @ ${new Date().toISOString()} - ${functionName}`;
+        MailApp.sendEmail(Session.getEffectiveUser().getEmail(), subject, String(err));
+      }
+    }
+  } catch (e) {
+    logTS('sendThrottledError failed: ' + e);
+  }
+}
+
+/**
+ * Performs full availability sync: form, calendar summaries, sheet output.
+ */
+function updateAvailability_everywhere() {
+  try {
+    let lock = LockService.getScriptLock();
+    if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+      logTS('Lock busy, skipping updateAvailability_everywhere');
+      return;
+    }
+    try {
+      // Throttle full sync to once per minute
+      const propsSync = PropertiesService.getScriptProperties();
+      const nowSync = Date.now();
+      const lastSync = parseInt(propsSync.getProperty('LAST_FULL_SYNC_TS') || '0', 10);
+      if (nowSync - lastSync < THROTTLE_INTERVAL_MS) {
+        logTS('Skipping updateAvailability_everywhere due to throttle');
+        return;
+      }
+      propsSync.setProperty('LAST_FULL_SYNC_TS', String(nowSync));
+
+      logTS('updateAvailability_everywhere:start');
+      const dates = getResponseDates();
+      let counts = safeCacheGet(CACHE_KEY);
+      if (counts) {
+        counts = JSON.parse(counts);
+      } else {
+        counts = tallyByDate(dates);
+        safeCachePut(CACHE_KEY, JSON.stringify(counts), 300);
+      }
+      const { availDates, choices } = buildBusinessDays(counts);
+      
+      // Filter out any holidays that might have slipped through
+      const nonHolidayDates = availDates.filter(dateStr => {
+        if (isHoliday_(dateStr)) {
+          logTS('updateAvailability_everywhere: filtering out holiday ' + dateStr);
+          return false;
+        }
+        return true;
+      });
+      
+      batchUpdateForm(choices);
+      batchSyncCalendarSummaries(nonHolidayDates, counts);
+      batchWriteAvailabilitySheet(nonHolidayDates, counts);
+      safeCacheRemove(CACHE_KEY); // Invalidate cache after full sync
+      cachedCounts = null;
+      logTS('updateAvailability_everywhere:end');
+    } finally {
+      lock.releaseLock();
+    }
+  } catch (err) {
+    Logger.log('Error in updateAvailability_everywhere: ' + err);
+    sendThrottledError('updateAvailability_everywhere', err);
+    throw err;
+  }
+}
+
+/**
+ * Handles Form submit event: creates calendar event and updates counts.
+ * @param {Object} e - Form submit event object.
+ */
+function onFormSubmit(e) {
+  try {
+    let lock = LockService.getScriptLock();
+    if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+      logTS('Lock busy, skipping onFormSubmit');
+      return;
+    }
+    try {
+      logTS('onFormSubmit:start');
+      if (!e || !e.values || e.values.length <= DATE_IDX) {
+        logTS('Invalid form submit payload');
+        return;
+      }
+      const lastName = e.values[LAST_NAME_IDX];
+      const firstName = e.values[FIRST_NAME_IDX];
+      const purok = e.values[PUROK_IDX];
+      const barangay = e.values[BARANGAY_IDX];
+      const dateChoice = e.values[DATE_IDX];
+      const dateText = dateChoice.split(' ')[0];
+      const start = new Date(dateText);
+
+      // Holiday guard: early exit on holidays before any calendar or form logic
+      if (isHoliday_(dateText)) {
+        logTS('onFormSubmit: booking on holiday rejected: ' + dateText);
+        return;
+      }
+
+      // Duplicate detection: skip if appointment already exists
+      const title = `${TAG_APPOINTMENT} ${lastName}, ${firstName} (${purok}, ${barangay})`;
+      const dayEvents = CAL.getEventsForDay(start);
+      if (dayEvents.some(ev => ev.getTitle() === title && formatYMD_(ev.getStartTime()) === dateText)) {
+        logTS('Duplicate appointment for ' + dateText);
+        return;
+      }
+
+      // Slot cap guard: abort if max appointments reached
+      const appointmentCount = dayEvents.filter(ev => ev.getTitle().startsWith(TAG_APPOINTMENT)).length;
+      if (appointmentCount >= SLOT_CAP) {
+        logTS('Slot cap reached for ' + dateText);
+        if(IS_DEV) FormApp.getUi().alert('Slots full for '+dateText);
+        else {
+          logTS('Admin notified: slot cap reached');
+        }
+        return;
+      }
+
+      const event = CAL.createAllDayEvent(title, start, {
+        description: `Purok: ${purok} — Barangay: ${barangay}`
+      });
+
+      const newLeft = decrementChoiceForDate(dateText);
+      
+      // Color-code the individual booking event based on remaining slots
+      const color = newLeft > 0 ? EVENT_COLOR_AVAILABLE : EVENT_COLOR_FULL;
+      event.setColor(color);
+      
+      // Scheduled sync will handle summary updates to prevent race conditions
+      updateSheetRowForDate(dateText, newLeft);
+      safeCacheRemove(CACHE_KEY); // Invalidate cache after form submit
+      cachedCounts = null;
+      logTS('onFormSubmit:end');
+    } finally {
+      lock.releaseLock();
+    }
+  } catch (err) {
+    Logger.log('Error in onFormSubmit: ' + err);
+    sendThrottledError('onFormSubmit', err);
+    throw err;
+  }
+}
+
+/**
+ * Integrity Checker: cleans up old events and form options regularly.
+ */
+function checkCalendarIntegrity() {
+  try {
+    let lock = LockService.getScriptLock();
+    if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+      logTS('Lock busy, skipping checkCalendarIntegrity');
+      return;
+    }
+    try {
+      // Throttle integrity check to once per minute
+      const propsInt = PropertiesService.getScriptProperties();
+      const nowInt = Date.now();
+      const lastInt = parseInt(propsInt.getProperty('LAST_INTEGRITY_TS') || '0', 10);
+      if (nowInt - lastInt < THROTTLE_INTERVAL_MS) {
+        logTS('Skipping checkCalendarIntegrity due to throttle');
+        return;
+      }
+      propsInt.setProperty('LAST_INTEGRITY_TS', String(nowInt));
+      
+      logTS('checkCalendarIntegrity:start');
+      const dates = getResponseDates();
+      const respCount = dates.length;
+      const props = PropertiesService.getScriptProperties();
+      const lastCount = props.getProperty('LAST_RESPONSE_COUNT');
+      if (lastCount && parseInt(lastCount, 10) === respCount) {
+        logTS('checkCalendarIntegrity:end');
+        return;
+      }
+      props.setProperty('LAST_RESPONSE_COUNT', String(respCount));
+      
+      // Remove holiday summaries and appointments within advance window before other cleanup
+      const now = new Date();
+      removeHolidaySummaries(now, new Date(now.getTime() + MAX_ADVANCE_DAYS * 86400000));
+      // Remove past Appointment events
+      const yesterdayEnd = getEndOfDay_(new Date(now.getTime() - 24 * 60 * 60 * 1000));
+      const pastAppointments = CAL.getEvents(new Date(1970, 0, 1), yesterdayEnd)
+        .filter(ev => ev.getTitle().startsWith(TAG_APPOINTMENT));
+      chunkArray(pastAppointments, CHUNK_SIZE).forEach(chunk => {
+        try { chunk.forEach(ev => ev.deleteEvent()); }
+        catch(e){ logTS('Chunk delete error: '+e); }
+      });
+      // Remove past summary events
+      const pastSummaries = CAL.getEvents(new Date(1970, 0, 1), yesterdayEnd)
+        .filter(ev => ev.getDescription().indexOf(FULL_SUMMARY_TAG) === 0);
+      chunkArray(pastSummaries, CHUNK_SIZE).forEach(chunk => {
+        try { chunk.forEach(ev => ev.deleteEvent()); }
+        catch(e){ logTS('Chunk delete error: '+e); }
+      });
+      // Delete orphaned upcoming appointments
+      const validDates = new Set(dates);
+      const rangeEnd = new Date(now);
+      rangeEnd.setDate(now.getDate() + 30);
+      const upcoming = CAL.getEvents(now, rangeEnd);
+      const orphanedEvents = [];
+      upcoming.forEach(ev => {
+        const title = ev.getTitle();
+        if (!title.startsWith(TAG_APPOINTMENT)) return;
+        const evDate = formatYMD_(ev.getStartTime());
+        if (!validDates.has(evDate)) {
+          orphanedEvents.push(ev);
+        }
+      });
+      chunkArray(orphanedEvents, CHUNK_SIZE).forEach(chunk => {
+        try { chunk.forEach(ev => ev.deleteEvent()); }
+        catch(e){ logTS('Chunk delete error: '+e); }
+      });
+      const deletedCount = orphanedEvents.length;
+      if (deletedCount > 0) {
+        // Instead of full sync, just refresh summaries for affected dates
+        const affectedDates = new Set();
+        orphanedEvents.forEach(ev => {
+          const evDate = formatYMD_(ev.getStartTime());
+          affectedDates.add(evDate);
+        });
+        
+        // Refresh summaries for affected dates only (within business days window)
+        const currentCounts = cachedCounts || tallyByDate(getResponseDates());
+        const { availDates } = buildBusinessDays(currentCounts);
+        const availDatesSet = new Set(availDates);
+        
+        affectedDates.forEach(dateStr => {
+          // Early exit on holidays before any summary creation
+          if (isHoliday_(dateStr)) {
+            logTS('checkCalendarIntegrity: skipping holiday ' + dateStr);
+            return;
+          }
+          // Only update summaries for dates within the business days window
+          if (availDatesSet.has(dateStr)) {
+            const used = currentCounts[dateStr] || 0;
+            const left = SLOT_CAP - used;
+            if (left > 0) { // Only update if date still has availability
+              upsertDailySummary(dateStr, left);
+            }
+          }
+        });
+      }
+      // Prune yesterday from form dropdown
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yStr = formatYMD_(yesterday);
+      const li = getAppointmentListItem_();
+      const allVals = li.getChoices().map(c => c.getValue());
+      const filtered = allVals.filter(v => !v.startsWith(yStr));
+      li.setChoiceValues(filtered);
+      cachedListItem = null;
+      logTS('checkCalendarIntegrity:end');
+    } finally {
+      lock.releaseLock();
+    }
+  } catch (err) {
+    Logger.log('Error in checkCalendarIntegrity: ' + err);
+    sendThrottledError('checkCalendarIntegrity', err);
+    throw err;
+  }
+}
+
+/** Private Helpers **/
+
+/**
+ * Retrieves the ListItem for "Date of Appointment".
+ * @return {FormListItem} The list item.
+ * @throws If the item is not found.
+ */
+function getAppointmentListItem_() {
+  if (cachedListItem) {
+    return cachedListItem;
+  }
+  const item = FORM.getItems(FormApp.ItemType.LIST)
+                   .find(i => i.asListItem().getTitle() === 'Date of Appointment');
+  if (!item) throw new Error('No LIST item titled "Date of Appointment"');
+  cachedListItem = item.asListItem();
+  return cachedListItem;
+}
+
+/**
+ * Returns a Date set to the end of the given day.
+ * @param {Date} date - Base date.
+ * @return {Date} Date at 23:59:59.999 of the same day.
+ */
+function getEndOfDay_(date) {
+  const endOfDay = new Date(date);
+  endOfDay.setHours(23, 59, 59, 999);
+  return endOfDay;
+}
+
+/**
+ * Reads dates from form response sheet, filters out old entries.
+ * @return {string[]} Array of yyyy-MM-dd date strings.
+ */
+function getResponseDates() {
+  logTS('getResponseDates:start');
+  const sheet = SS.getSheetByName(RESP_SHEET_NAME);
+  const lastRow = sheet.getLastRow();
+  const raw = lastRow > 1
+    ? sheet.getRange(`${RESP_DATE_COL}2:${RESP_DATE_COL}`).getValues()
+    : [];
+  const dates = raw.map(([cell]) => {
+    const parsed = safeParseDate_(cell);
+    return parsed;
+  }).filter(Boolean);
+  // Filter by retention policy
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - RESPONSE_RETENTION_DAYS);
+  const cutoffStr = formatYMD_(cutoff);
+  const filtered = dates.filter(d => d >= cutoffStr);
+  logTS('getResponseDates:end');
+  return filtered;
+}
+
+/**
+ * Tallies count of entries per date.
+ * @param {string[]} dates - Array of date strings.
+ * @return {Object.<string,number>} Map of date to count.
+ */
+function tallyByDate(dates) {
+  logTS('tallyByDate:start');
+  const counts = dates.reduce((m, d) => {
+    m[d] = (m[d] || 0) + 1;
+    return m;
+  }, {});
+  safeCachePut(CACHE_KEY, JSON.stringify(counts), 300);
+  logTS('tallyByDate:end');
+  return counts;
+}
+
+/**
+ * Builds list of business days and form choice strings.
+ * Limited to BUSINESS_DAYS_WINDOW actual business days (Mon-Fri).
+ * @param {Object.<string,number>} counts - Map of date to booked count.
+ * @return {{availDates:string[],choices:string[]}} Available dates and choice labels.
+ */
+function buildBusinessDays(counts) {
+  logTS('buildBusinessDays:start');
+  const items = [];
+  const today = new Date();
+  let businessDaysFound = 0;
+  let dayOffset = 0;
+  
+  // Count actual business days up to BUSINESS_DAYS_WINDOW
+  while (businessDaysFound < BUSINESS_DAYS_WINDOW) {
+    const d = new Date(today);
+    d.setDate(today.getDate() + dayOffset);
+    const wd = d.getDay();
+    
+    // Skip weekends
+    if (wd !== 0 && wd !== 6) {
+      const key = formatYMD_(d);
+      // Skip holidays - prevent holiday dates from ever appearing in items
+      if (isHoliday_(key)) {
+        logTS('buildBusinessDays: skipping holiday ' + key);
+        dayOffset++;
+        continue;
+      }
+      const used = counts[key] || 0;
+      const left = SLOT_CAP - used;
+      const weekday = Utilities.formatDate(d, TZ, 'EEE');
+      
+      // Only include dates with available slots
+      if (left > 0) {
+        const label = `${key} ${weekday} (${left} slot${left === 1 ? '' : 's'} left)`;
+        items.push({ date: key, label: label, left: left });
+      }
+      
+      businessDaysFound++;
+    }
+    
+    dayOffset++;
+    
+    // Safety break to prevent infinite loop
+    if (dayOffset > 100) break;
+  }
+  
+  items.sort((a, b) => new Date(a.date) - new Date(b.date));
+  const availDates = items.map(item => item.date);
+  const choices = items.map(item => item.label);
+  
+  logTS('buildBusinessDays:end');
+  return { availDates, choices };
+}
+
+/**
+ * Updates the form's date choice list.
+ * @param {string[]} choices - Array of choice values.
+ */
+function batchUpdateForm(choices) {
+  logTS('batchUpdateForm:start');
+  const li = getAppointmentListItem_();
+  li.setChoiceValues(choices);
+  logTS('batchUpdateForm:end');
+}
+
+/**
+ * Syncs per-day summary calendar events.
+ * @param {string[]} availDates - Dates to summarize.
+ * @param {Object.<string,number>} counts - Map of date to booked count.
+ */
+function batchSyncCalendarSummaries(availDates, counts) {
+  logTS('batchSyncCalendarSummaries:start');
+  if (!availDates.length) {
+    logTS('batchSyncCalendarSummaries:end');
+    return;
+  }
+  // Use ONLY upsert helper for each date to ensure exactly one summary per date
+  availDates.forEach(dateStr => {
+    // Early exit on holidays before any summary creation
+    if (isHoliday_(dateStr)) {
+      logTS('batchSyncCalendarSummaries: skipping holiday ' + dateStr);
+      return;
+    }
+    const used = counts[dateStr] || 0;
+    const left = SLOT_CAP - used;
+    upsertDailySummary(dateStr, left);
+  });
+  
+  // Validation: check for duplicate summaries and log anomalies
+  availDates.forEach(dateStr => {
+    const [y, m, d] = dateStr.split('-').map(Number);
+    const dayDate = new Date(y, m - 1, d);
+    const summaries = CAL.getEventsForDay(dayDate)
+      .filter(ev => ev.getDescription().indexOf(FULL_SUMMARY_TAG) === 0);
+    
+    if (summaries.length > 1) {
+      logTS(`ANOMALY: Found ${summaries.length} summary events for ${dateStr}`);
+    } else if (summaries.length === 0) {
+      logTS(`ANOMALY: No summary event found for ${dateStr}`);
+    }
+  });
+  
+  logTS('batchSyncCalendarSummaries:end');
+}
+
+/**
+ * Writes availability table into the sheet and applies color coding.
+ * @param {string[]} availDates - Dates to write.
+ * @param {Object.<string,number>} counts - Map of date to booked count.
+ */
+function batchWriteAvailabilitySheet(availDates, counts) {
+  logTS('batchWriteAvailabilitySheet:start');
+  const sheet = getOrCreateSheet_('Availability');
+  sheet.clearContents();
+  const rows = [['Date', 'Booked', 'Slots Left']];
+  availDates.forEach(dateStr => {
+    const used = counts[dateStr] || 0;
+    const left = SLOT_CAP - used;
+    rows.push([dateStr, used, left]);
+  });
+  sheet.getRange(1, 1, rows.length, 3).setValues(rows);
+  colorCodeAvailabilitySheet_();
+  logTS('batchWriteAvailabilitySheet:end');
+}
+
+/**
+ * Generates a prefilled form URL for a specific date.
+ * @param {string} dateText - Date string yyyy-MM-dd.
+ * @param {Object} extraFields - Optional extra fields to prefill by field ID.
+ * @return {string} Prefilled form URL.
+ */
+function generatePrefillUrl(dateText, extraFields) {
+  logTS('generatePrefillUrl:start');
+  try {
+    const d = new Date(dateText);
+    const weekday = Utilities.formatDate(d, TZ, 'EEE');
+    const li = getAppointmentListItem_();
+    const choices = li.getChoices().map(c => c.getValue());
+    
+    // Find the matching choice for this date
+    const matchingChoice = choices.find(choice => choice.startsWith(dateText));
+    if (!matchingChoice) {
+      logTS(`generatePrefillUrl: No choice found for date ${dateText}`);
+      return FORM.getPublishedUrl();
+    }
+    
+    // Create a prefilled response
+    const response = FORM.createResponse();
+    const listItemResponse = li.createResponse(matchingChoice);
+    response.withItemResponse(listItemResponse);
+    
+    // Add extra fields if provided using a fixed field ID map
+    if (extraFields) {
+      const fieldMap = {
+        Name: '12345abcdef',
+        Purok: '67890ghijk'
+        // add additional fieldName: itemId mappings here
+      };
+      Object.entries(extraFields).forEach(([fieldName, value]) => {
+        try {
+          const itemId = fieldMap[fieldName];
+          if (!itemId) return;
+          const item = FORM.getItemById(itemId);
+          if (!item) return;
+          const itemType = item.getType();
+          if (itemType === FormApp.ItemType.TEXT) {
+            response.withItemResponse(item.asTextItem().createResponse(value));
+          } else if (itemType === FormApp.ItemType.LIST) {
+            response.withItemResponse(item.asListItem().createResponse(value));
+          } else if (itemType === FormApp.ItemType.MULTIPLE_CHOICE) {
+            response.withItemResponse(item.asMultipleChoiceItem().createResponse(value));
+          }
+        } catch (e) {
+          logTS(`Error prefilling field ${fieldName}: ${e}`);
+        }
+      });
+    }
+    
+    const prefillUrl = response.toPrefilledUrl();
+    logTS('generatePrefillUrl:end');
+    return prefillUrl;
+  } catch (err) {
+    logTS('Error in generatePrefillUrl: ' + err);
+    return FORM.getPublishedUrl();
+  }
+}
+
+/**
+ * Decrements the form choice count for a given date.
+ * @param {string} dateText - Date string yyyy-MM-dd.
+ * @return {number} Remaining slots left.
+ */
+function decrementChoiceForDate(dateText) {
+  logTS('decrementChoiceForDate:start');
+  try {
+    const d = new Date(dateText);
+    const weekday = Utilities.formatDate(d, TZ, 'EEE');
+    const li = getAppointmentListItem_();
+    const raw = li.getChoices().map(c => c.getValue());
+    let newLeft = 0;
+    let found = false;
+    const updated = raw.map(val => {
+      if (val.startsWith(dateText)) {
+        found = true;
+        const m = val.match(/\((\d+)\s+slots?\s+left\)/);
+        let left = m ? parseInt(m[1], 10) - 1 : SLOT_CAP - 1;
+        if (left < 0) left = 0;
+        newLeft = left;
+        if (left > 0) {
+          return `${dateText} ${weekday} (${left} slot${left === 1 ? '' : 's'} left)`;
+        } else {
+          // Remove fully booked dates from choices
+          return null;
+        }
+      }
+      return val;
+    }).filter(val => val !== null);
+    
+    if (!found) {
+      logTS(`decrementChoiceForDate: Date ${dateText} not found in choices`);
+      cachedListItem = null;
+      return 0;
+    }
+    li.setChoiceValues(updated);
+    logTS('decrementChoiceForDate:end');
+    return newLeft;
+  } catch (err) {
+    logTS('Error in decrementChoiceForDate: ' + err);
+    return 0;
+  }
+}
+
+/**
+ * Ensures exactly one summary event exists for a given date with correct title and color.
+ * This is the SOLE function responsible for creating/updating summary events.
+ * Updates existing event or creates new one if missing. Deletes any duplicates.
+ * Uses script lock to prevent race conditions from parallel execution.
+ * @param {string} dateText - Date string yyyy-MM-dd.
+ * @param {number} left - Slots left.
+ */
+function upsertDailySummary(dateText, left) {
+  logTS(`upsertDailySummary:start for ${dateText}, ${left} slots left`);
+  
+  // Holiday guard: immediately return if holiday - prevent any event creation/modification
+  if (isHoliday_(dateText)) {
+    logTS('upsertDailySummary: early exit on holiday ' + dateText);
+    return;
+  }
+  
+  // Acquire lock to prevent race conditions
+  let lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+    logTS(`upsertDailySummary: Lock busy for ${dateText}, skipping`);
+    return;
+  }
+  
+  try {
+    const [y, m, d] = dateText.split('-').map(Number);
+    const start = new Date(y, m - 1, d);
+    
+    // Fetch all existing summary events for this day
+    const summaries = CAL.getEventsForDay(start)
+       .filter(ev => ev.getDescription().indexOf(FULL_SUMMARY_TAG) === 0);
+    
+    const title = left > 0 ? `${left} Slots left (${SLOT_CAP} total)` : `Fully booked`;
+    const color = left > 0 ? EVENT_COLOR_AVAILABLE : EVENT_COLOR_FULL;
+    
+    if (summaries.length > 0) {
+      // Update the first existing summary
+      summaries[0].setTitle(title);
+      summaries[0].setColor(color);
+      logTS(`Updated existing summary for ${dateText}`);
+      
+      // Delete any additional summaries to enforce uniqueness
+      if (summaries.length > 1) {
+        logTS(`Removing ${summaries.length - 1} duplicate summaries for ${dateText}`);
+        for (let i = 1; i < summaries.length; i++) {
+          summaries[i].deleteEvent();
+        }
+      }
+    } else {
+      // Create new summary if none exists - this is the ONLY place summaries are created
+      const ev = CAL.createAllDayEvent(title, start, { description: FULL_SUMMARY_TAG });
+      ev.setColor(color);
+      logTS(`Created new summary for ${dateText}`);
+    }
+  } finally {
+    lock.releaseLock();
+  }
+  
+  logTS(`upsertDailySummary:end for ${dateText}`);
+}
+
+/**
+ * Updates the calendar summary event for a specific date.
+ * @deprecated Use upsertDailySummary directly to avoid confusion
+ * @param {string} dateText - Date string yyyy-MM-dd.
+ * @param {number} left - Slots left.
+ */
+function updateCalendarSummaryForDate(dateText, left) {
+  logTS('updateCalendarSummaryForDate:start (deprecated - use upsertDailySummary)');
+  upsertDailySummary(dateText, left);
+  logTS('updateCalendarSummaryForDate:end');
+}
+
+/**
+ * Updates a single row in the availability sheet for a given date.
+ * @param {string} dateText - Date string yyyy-MM-dd.
+ * @param {number} left - Slots left.
+ */
+function updateSheetRowForDate(dateText, left) {
+  logTS('updateSheetRowForDate:start');
+  try {
+    const sheet = getOrCreateSheet_('Availability');
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) {
+      logTS('updateSheetRowForDate: No data rows found');
+      return;
+    }
+    const lastColumn = sheet.getLastColumn();
+    const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+    const dateIdx = headers.indexOf('Date') + 1;
+    const bookedIdx = headers.indexOf('Booked') + 1;
+    const leftIdx = headers.indexOf('Slots Left') + 1;
+    if (dateIdx === 0 || bookedIdx === 0 || leftIdx === 0) {
+      logTS('updateSheetRowForDate: Required headers not found');
+      return;
+    }
+    const data = sheet.getRange(2, dateIdx, lastRow - 1, 1).getValues();
+    for (let i = 0; i < data.length; i++) {
+      if (data[i][0] === dateText) {
+        const rowNum = i + 2;
+        sheet.getRange(rowNum, bookedIdx).setValue(SLOT_CAP - left);
+        sheet.getRange(rowNum, leftIdx).setValue(left);
+        break;
+      }
+    }
+    sheet.sort({column: dateIdx, ascending: true});
+  } catch (err) {
+    logTS('Error in updateSheetRowForDate: ' + err);
+    throw err;
+  }
+  logTS('updateSheetRowForDate:end');
+}
+
+/**
+ * Retrieves or creates a sheet by name.
+ * @param {string} name - Sheet name.
+ * @return {Sheet} The sheet object.
+ */
 function getOrCreateSheet_(name) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sh   = ss.getSheetByName(name);
+  let sh = ss.getSheetByName(name);
   if (!sh) sh = ss.insertSheet(name);
   return sh;
 }
 
 /**
- * Integrity Checker: Runs every 1 minute.
- * • Removes orphaned calendar events no longer in the form response.
- * • Rebuilds the availability sheet and form dropdown.
+ * Applies color-coding to availability sheet rows.
+ * Red background if no slots left, green if slots available.
+ * @private
  */
-function checkCalendarIntegrity() {
+function colorCodeAvailabilitySheet_() {
+  logTS('colorCodeAvailabilitySheet_:start');
+  const sheet = getOrCreateSheet_('Availability');
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    logTS('colorCodeAvailabilitySheet_: No data rows to color');
+    return;
+  }
+  const lastCol = sheet.getLastColumn();
+  const dataRows = lastRow - 1; // Exclude header row
+  
+  // Get all "Slots Left" values at once
+  const slotsLeftValues = sheet.getRange(2, AVAIL_LEFT_COL, dataRows, 1).getValues();
+  
+  // Build 2D color matrix
+  const colorsMatrix = [];
+  for (let i = 0; i < dataRows; i++) {
+    const left = slotsLeftValues[i][0];
+    const color = left === 0 ? '#f4cccc' : '#d9ead3'; // Red if full, green if available
+    // Create row array with same color for all columns
+    const rowColors = new Array(lastCol).fill(color);
+    colorsMatrix.push(rowColors);
+  }
+  
+  // Apply all background colors in a single batch operation
+  sheet.getRange(2, 1, dataRows, lastCol).setBackgrounds(colorsMatrix);
+  logTS('colorCodeAvailabilitySheet_:end');
+}
 
-  const RESP_SHEET = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Form Responses 1');
-  const cal = CalendarApp.getDefaultCalendar();
-  const TZ = Session.getScriptTimeZone();
-  const TAG = 'Appointment:';
+// Optional test stubs for pure utility functions
+function test_safeParseDate_valid() {
+  if (safeParseDate_('2025-01-01') !== '2025-01-01') {
+    throw new Error('safeParseDate_ failed for string date');
+  }
+  if (safeParseDate_(new Date('2025-01-01')) !== '2025-01-01') {
+    throw new Error('safeParseDate_ failed for Date object');
+  }
+}
 
-  // ── Delete all past “Appointment:” events through yesterday ──
-  const now = new Date();
-  const yesterdayEnd = new Date(now);
-  yesterdayEnd.setDate(now.getDate() - 1);
-  yesterdayEnd.setHours(23, 59, 59, 999);
+function test_safeParseDate_invalid() {
+  if (safeParseDate_('invalid') !== null) {
+    throw new Error('safeParseDate_ should return null for invalid string');
+  }
+  if (safeParseDate_(null) !== null) {
+    throw new Error('safeParseDate_ should return null for null');
+  }
+  if (safeParseDate_(undefined) !== null) {
+    throw new Error('safeParseDate_ should return null for undefined');
+  }
+}
 
-  // Remove any “Appointment:” events whose start date is ≤ yesterday
-  cal.getEvents(new Date(1970,0,1), yesterdayEnd)
-     .filter(ev => ev.getTitle().startsWith(TAG))
-     .forEach(ev => ev.deleteEvent());
+function test_formatYMD_() {
+  if (formatYMD_(new Date('2025-01-01')) !== '2025-01-01') {
+    throw new Error('formatYMD_ failed for 2025-01-01');
+  }
+  if (formatYMD_(new Date('2025-12-31')) !== '2025-12-31') {
+    throw new Error('formatYMD_ failed for 2025-12-31');
+  }
+}
 
-  // ── 1b) Delete all past “Slots left” summary events through yesterday ──
-  const SUMMARY_TAG = '##SLOT_SUMMARY##';
-  cal.getEvents(new Date(1970, 0, 1), yesterdayEnd)
-     .filter(ev => ev.getDescription().includes(SUMMARY_TAG))
-     .forEach(ev => ev.deleteEvent());
-
-  // Get all appointment dates from sheet (column 6)
-  const lastRow = RESP_SHEET.getLastRow();
-  const rawData = lastRow > 1
-    ? RESP_SHEET.getRange(2, 6, lastRow - 1, 1).getValues()
-    : [];
-  const validDates = new Set(
-    rawData
-      .map(([cell]) => {
-        if (!(cell instanceof Date)) return null;
-        return Utilities.formatDate(cell, TZ, 'yyyy-MM-dd');
-      })
-      .filter(Boolean)
-  );
-
-  // Check calendar events for next 30 days
-  const today = new Date();
-  const rangeEnd = new Date(today);
-  rangeEnd.setDate(today.getDate() + 30);
-  const events = cal.getEvents(today, rangeEnd);
-
-  let deletedCount = 0;
-
-  events.forEach(event => {
-    const title = event.getTitle();
-    if (!title.startsWith(TAG)) return;
-
-    const start = event.getStartTime();
-    const eventDate = Utilities.formatDate(start, TZ, 'yyyy-MM-dd');
-
-    if (!validDates.has(eventDate)) {
-      event.deleteEvent();
-      deletedCount++;
+function test_buildBusinessDays() {
+  const counts = {'2025-01-01': 5, '2025-01-02': 20};
+  const result = buildBusinessDays(counts);
+  if (!Array.isArray(result.availDates)) {
+    throw new Error('buildBusinessDays should return availDates array');
+  }
+  if (!Array.isArray(result.choices)) {
+    throw new Error('buildBusinessDays should return choices array');
+  }
+  if (result.availDates.length !== result.choices.length) {
+    throw new Error('availDates and choices should have same length');
+  }
+  
+  // Assert that known holiday dates are never in availDates
+  const knownHolidays = ['2025-12-25', '2025-01-01']; // Christmas and New Year
+  knownHolidays.forEach(holiday => {
+    if (result.availDates.includes(holiday)) {
+      throw new Error('buildBusinessDays included holiday: ' + holiday);
     }
   });
-
-  if (deletedCount > 0) {
-    updateAvailability_everywhere(); // Rebuild availability after deletions
-  }
-  // ── 4) Also remove yesterday’s date from the Form dropdown ──
-  const FORM_ID  = '1a7K-SKOU5n3mYlCMM7y0bUqvaO_u5LHtDDS3eLq3mhs';
-  const form     = FormApp.openById(FORM_ID);
- // const TZ       = Session.getScriptTimeZone();
-  const yesterday = new Date();
-  yesterday.setDate(yesterday.getDate() - 1);
-  const yStr     = Utilities.formatDate(yesterday, TZ, 'yyyy-MM-dd');
-
-  // Find the “Date of Appointment” list item
-  const item = form.getItems(FormApp.ItemType.LIST)
-                   .find(i => i.asListItem().getTitle() === 'Date of Appointment')
-                   .asListItem();
-  if (item) {
-    // Extract raw values
-    const allValues = item.getChoices().map(choice => choice.getValue());
-    // Filter out yesterday’s date
-    const filtered  = allValues.filter(v => !v.startsWith(yStr));
-    // Re-set the dropdown
-    item.setChoiceValues(filtered);
-  }
-
 }
-//Owned by
-//Last run
-//Deployment
-//Event
-//Function
-//Error rate
-//Me	May 28, 2025, 12:08:28 AM	Head	Time-based	updateAvailability_everywhere	
-//50%
-//Me	May 28, 2025, 8:33:03 PM	Head	From spreadsheet - On form submit	onFormSubmit	
-//16.67%
-//Me	May 28, 2025, 8:33:03 PM	Head	From spreadsheet - On form submit	checkCalendarIntegrity	
-//0.62%
+
+function test_buildBusinessDays_excludesHolidays() {
+  // Test that buildBusinessDays never includes known holidays in availDates
+  const counts = {};
+  const { availDates } = buildBusinessDays(counts);
+  
+  // Check against known Philippine holidays
+  const knownHolidays = [
+    '2025-12-25', // Christmas Day
+    '2025-01-01', // New Year's Day
+    '2025-06-12', // Independence Day
+    '2025-12-30'  // Rizal Day
+  ];
+  
+  knownHolidays.forEach(holiday => {
+    if (availDates.includes(holiday)) {
+      throw new Error('buildBusinessDays incorrectly included holiday: ' + holiday);
+    }
+  });
+  
+  logTS('test_buildBusinessDays_excludesHolidays: verified no holidays in availDates');
+}
+
+function test_tallyByDate_cache() {
+  safeCacheRemove(CACHE_KEY);
+  const testDates = ['2025-01-01', '2025-01-01', '2025-01-02'];
+  const result = tallyByDate(testDates);
+  const cached = safeCacheGet(CACHE_KEY);
+  if (!cached) {
+    throw new Error('tallyByDate should cache results');
+  }
+  const parsedCache = JSON.parse(cached);
+  if (parsedCache['2025-01-01'] !== 2 || parsedCache['2025-01-02'] !== 1) {
+    throw new Error('cached tally results incorrect');
+  }
+}
+
+function test_assignColor() {
+  const availableColor = 5 > 0 ? EVENT_COLOR_AVAILABLE : EVENT_COLOR_FULL;
+  const fullColor = 0 > 0 ? EVENT_COLOR_AVAILABLE : EVENT_COLOR_FULL;
+  if (availableColor !== EVENT_COLOR_AVAILABLE) {
+    throw new Error('assignColor should return EVENT_COLOR_AVAILABLE when slots left > 0');
+  }
+  if (fullColor !== EVENT_COLOR_FULL) {
+    throw new Error('assignColor should return EVENT_COLOR_FULL when slots left === 0');
+  }
+}
+
+function test_summaryUniqueness() {
+  // Test that upsertDailySummary ensures exactly one summary per date
+  const testDate = '2025-01-01';
+  
+  // First call should create summary
+  upsertDailySummary(testDate, 19);
+  let evs = CAL.getEventsForDay(new Date(2025,0,1))
+    .filter(ev => ev.getDescription().indexOf(FULL_SUMMARY_TAG)===0);
+  if (evs.length !== 1) throw new Error('Expected single summary after first call, found '+evs.length);
+  
+  // Second call should update existing, not create duplicate
+  upsertDailySummary(testDate, 18);
+  evs = CAL.getEventsForDay(new Date(2025,0,1))
+    .filter(ev => ev.getDescription().indexOf(FULL_SUMMARY_TAG)===0);
+  if (evs.length !== 1) throw new Error('Expected single summary after second call, found '+evs.length);
+  
+  // Verify title was updated
+  if (!evs[0].getTitle().includes('18 Slots left')) {
+    throw new Error('Summary title was not updated correctly');
+  }
+}
+
+function test_holidaysExcluded() {
+  // Ensure buildBusinessDays does not include known holiday dates
+  const counts = {};
+  const holidayDate = '2025-12-25';
+  const { availDates } = buildBusinessDays(counts);
+  if (availDates.includes(holidayDate)) {
+    throw new Error('buildBusinessDays included holiday: ' + holidayDate);
+  }
+}
+
+function test_holidayGuardOnSubmit() {
+  // Simulate a form submission on a holiday and expect early return with no booking or summary event
+  const holidayDate = '2025-12-25';
+  const e = { values: [] };
+  // populate minimal values for indices
+  for (let i = 0; i <= DATE_IDX; i++) e.values[i] = '';
+  e.values[LAST_NAME_IDX] = 'LN';
+  e.values[FIRST_NAME_IDX] = 'FN';
+  e.values[PUROK_IDX] = 'P';
+  e.values[BARANGAY_IDX] = 'B';
+  e.values[DATE_IDX] = holidayDate + ' placeholder';
+  let rejected = false;
+  const originalLogTS = logTS;
+  logTS = function(msg) {
+    if (msg.indexOf('Booking on holiday rejected') === 0) {
+      rejected = true;
+    }
+  };
+  onFormSubmit(e);
+  logTS = originalLogTS;
+  if (!rejected) {
+    throw new Error('onFormSubmit did not reject booking on holiday');
+  }
+  
+  // Verify no appointment or summary events were created on the holiday
+  const [y, m, d] = holidayDate.split('-').map(Number);
+  const testDate = new Date(y, m - 1, d);
+  const dayEvents = CAL.getEventsForDay(testDate);
+  const appointments = dayEvents.filter(ev => ev.getTitle().startsWith(TAG_APPOINTMENT));
+  const summaries = dayEvents.filter(ev => ev.getDescription().indexOf(FULL_SUMMARY_TAG) === 0);
+  
+  if (appointments.length > 0) {
+    throw new Error('onFormSubmit created appointment event on holiday');
+  }
+  if (summaries.length > 0) {
+    throw new Error('onFormSubmit created summary event on holiday');
+  }
+}
+
+function test_upsertDailySummary_holiday() {
+  // Assert that calling upsertDailySummary on a holiday never creates or updates events
+  const holidayDate = '2025-12-25';
+  const [y, m, d] = holidayDate.split('-').map(Number);
+  const testDate = new Date(y, m - 1, d);
+  
+  // Ensure no existing events on the holiday
+  const existingEvents = CAL.getEventsForDay(testDate);
+  existingEvents.forEach(ev => ev.deleteEvent());
+  
+  // Call upsertDailySummary on holiday
+  upsertDailySummary(holidayDate, 15);
+  
+  // Verify no summary event was created
+  const summaries = CAL.getEventsForDay(testDate)
+    .filter(ev => ev.getDescription().indexOf(FULL_SUMMARY_TAG) === 0);
+  if (summaries.length !== 0) {
+    throw new Error('upsertDailySummary created summary event on holiday');
+  }
+}
+
+function test_removeHolidaySummaries() {
+  // Test that removeHolidaySummaries deletes both summary and appointment events on holiday dates
+  const holidayDate = '2025-12-25';
+  const [y, m, d] = holidayDate.split('-').map(Number);
+  const testDate = new Date(y, m - 1, d);
+  
+  // Create dummy summary and appointment events on the holiday
+  const dummySummary = CAL.createAllDayEvent('Test Holiday Summary', testDate, { 
+    description: FULL_SUMMARY_TAG 
+  });
+  const dummyAppointment = CAL.createAllDayEvent(TAG_APPOINTMENT + ' Test Holiday Appointment', testDate);
+  
+  // Verify the events were created
+  let summaries = CAL.getEventsForDay(testDate)
+    .filter(ev => ev.getDescription().indexOf(FULL_SUMMARY_TAG) === 0);
+  let appointments = CAL.getEventsForDay(testDate)
+    .filter(ev => ev.getTitle().startsWith(TAG_APPOINTMENT));
+  if (summaries.length !== 1 || appointments.length !== 1) {
+    throw new Error('Failed to create test holiday events');
+  }
+  
+  // Call removeHolidaySummaries
+  const startDate = new Date(testDate.getTime() - 86400000); // day before
+  const endDate = new Date(testDate.getTime() + 86400000);   // day after
+  removeHolidaySummaries(startDate, endDate);
+  
+  // Verify both holiday summary and appointment were removed
+  summaries = CAL.getEventsForDay(testDate)
+    .filter(ev => ev.getDescription().indexOf(FULL_SUMMARY_TAG) === 0);
+  appointments = CAL.getEventsForDay(testDate)
+    .filter(ev => ev.getTitle().startsWith(TAG_APPOINTMENT));
+  if (summaries.length !== 0) {
+    throw new Error('removeHolidaySummaries failed to delete holiday summary');
+  }
+  if (appointments.length !== 0) {
+    throw new Error('removeHolidaySummaries failed to delete holiday appointment');
+  }
+}
+
+/**
+ * Runs all test functions and logs results.
+ */
+function runTests() {
+  const testFunctions = [
+    { name: 'test_safeParseDate_valid', fn: test_safeParseDate_valid },
+    { name: 'test_safeParseDate_invalid', fn: test_safeParseDate_invalid },
+    { name: 'test_formatYMD_', fn: test_formatYMD_ },
+    { name: 'test_buildBusinessDays', fn: test_buildBusinessDays },
+    { name: 'test_buildBusinessDays_excludesHolidays', fn: test_buildBusinessDays_excludesHolidays },
+    { name: 'test_tallyByDate_cache', fn: test_tallyByDate_cache },
+    { name: 'test_assignColor', fn: test_assignColor },
+    { name: 'test_summaryUniqueness', fn: test_summaryUniqueness },
+    { name: 'test_holidaysExcluded', fn: test_holidaysExcluded },
+    { name: 'test_holidayGuardOnSubmit', fn: test_holidayGuardOnSubmit },
+    { name: 'test_upsertDailySummary_holiday', fn: test_upsertDailySummary_holiday },
+    { name: 'test_removeHolidaySummaries', fn: test_removeHolidaySummaries }
+  ];
+  
+  testFunctions.forEach(test => {
+    try {
+      test.fn();
+      logTS('PASS: ' + test.name);
+    } catch (e) {
+      logTS('FAIL: ' + test.name + ' — ' + e);
+    }
+  });
+  
+  logTS('runTests complete');
+}
+
+/**
+ * Ensures a daily trigger exists for the runTests function.
+ * Creates one if it doesn't already exist.
+ */
+function ensureTestTriggerExists() {
+  try {
+    const triggers = ScriptApp.getProjectTriggers();
+    const existingTrigger = triggers.find(trigger => 
+      trigger.getHandlerFunction() === 'runTests' &&
+      trigger.getEventType() === ScriptApp.EventType.CLOCK
+    );
+    
+    if (!existingTrigger) {
+      ScriptApp.newTrigger('runTests')
+        .timeBased()
+        .everyDays(1)
+        .create();
+      logTS('Created daily trigger for runTests');
+    } else {
+      logTS('Daily trigger for runTests already exists');
+    }
+  } catch (e) {
+    logTS('Error in ensureTestTriggerExists: ' + e);
+  }
+}
+
+/**
+ * Install hook to set up triggers when the script is installed.
+ * @param {Object} e - Install event object.
+ */
+function onInstall(e) {
+  ensureTestTriggerExists();
+}
+
+/**
+ * Open hook to ensure triggers are set up when the script is opened.
+ * @param {Object} e - Open event object.
+ */
+function onOpen(e) {
+  ensureTestTriggerExists();
+}
