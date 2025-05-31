@@ -48,7 +48,7 @@ const CACHE = CacheService.getScriptCache();
 
 const EVENT_COLOR_AVAILABLE = CalendarApp.EventColor.GREEN;
 const EVENT_COLOR_FULL      = CalendarApp.EventColor.RED;
-const HOLIDAY_CAL_ID = 'en.philippines%23holiday@group.v.calendar.google.com';
+const HOLIDAY_CAL_ID = 'en.philippines#holiday@group.v.calendar.google.com';
 const HOLIDAY_CACHE_KEY = SCRIPT_VERSION + '_holidays';
 const HOLIDAY_CACHE_TTL = 12 * 60 * 60;
 
@@ -60,29 +60,279 @@ let cachedListItem = null;
 let cachedCounts = null;
 
 /**
+ * Centralized holiday service with fallback mechanisms
+ */
+const HolidayService = {
+  _holidayCalendar: null,
+  _initialized: false,
+  _calendarAvailable: false,
+  _manualHolidays: [
+    { month: 1, day: 1 },   // New Year's Day
+    { month: 4, day: 9 },   // Araw ng Kagitingan
+    { month: 5, day: 1 },   // Labor Day
+    { month: 6, day: 12 },  // Independence Day
+    { month: 8, day: 21 },  // Ninoy Aquino Day
+    { month: 11, day: 1 },  // All Saints' Day
+    { month: 11, day: 2 },  // All Souls' Day
+    { month: 11, day: 30 }, // Bonifacio Day
+    { month: 12, day: 8 },  // Feast of the Immaculate Conception
+    { month: 12, day: 25 }, // Christmas Day
+    { month: 12, day: 30 }, // Rizal Day
+    { month: 12, day: 31 }  // New Year's Eve
+  ],
+
+  /**
+   * Calculate National Heroes Day (last Monday of August)
+   * @param {number} year - The year to calculate for
+   * @return {Date} The National Heroes Day date
+   */
+  getNationalHeroesDay(year) {
+    // Start from August 31 and work backwards to find the last Monday
+    let date = new Date(year, 7, 31); // August 31 (month is 0-indexed)
+    while (date.getDay() !== 1) { // 1 = Monday
+      date.setDate(date.getDate() - 1);
+    }
+    return date;
+  },
+
+  /**
+   * Initialize the holiday calendar instance and test access
+   */
+  initHolidayCalendar() {
+    if (this._initialized) return;
+    
+    try {
+      this._holidayCalendar = CalendarApp.getCalendarById(HOLIDAY_CAL_ID);
+      // Test access by trying to get events for a small range
+      const testStart = new Date();
+      const testEnd = new Date(testStart.getTime() + 86400000); // +1 day
+      this._holidayCalendar.getEvents(testStart, testEnd);
+      this._calendarAvailable = true;
+      logTS('HolidayService: Calendar access verified');
+    } catch (e) {
+      this._calendarAvailable = false;
+      logTS('HolidayService: Calendar access failed, will use fallbacks: ' + e);
+    }
+    
+    this._initialized = true;
+  },
+
+  /**
+   * Fetch holiday dates for a range with fallback mechanisms
+   * @param {Date} startDate - Start date
+   * @param {Date} endDate - End date
+   * @return {Set<string>} Set of holiday date strings in yyyy-MM-dd format
+   */
+  fetchRange(startDate, endDate) {
+    this.initHolidayCalendar();
+    
+    const startStr = DateUtils.formatYMD(startDate);
+    const endStr = DateUtils.formatYMD(endDate);
+    const cacheKey = `${SCRIPT_VERSION}_holidays_${startStr}_${endStr}`;
+    
+    // Check cache first
+    const cached = safeCacheGet(cacheKey);
+    if (cached) {
+      try {
+        const dates = JSON.parse(cached);
+        logTS(`HolidayService: cache hit for range ${startStr} to ${endStr}`);
+        return new Set(dates);
+      } catch (e) {
+        logTS('HolidayService: cache parse error: ' + e);
+      }
+    }
+    
+    let dates = [];
+    
+    // Try CalendarApp first
+    if (this._calendarAvailable) {
+      try {
+        const events = this._holidayCalendar.getEvents(startDate, endDate);
+        dates = events.map(ev => DateUtils.formatYMD(ev.getStartTime()));
+        logTS(`HolidayService: CalendarApp fetched ${dates.length} holidays`);
+      } catch (e) {
+        logTS('HolidayService: CalendarApp fetch failed: ' + e);
+        this._calendarAvailable = false;
+        dates = [];
+      }
+    }
+    
+    // Fallback to ICS feed if CalendarApp failed
+    if (dates.length === 0 && !this._calendarAvailable) {
+      try {
+        const icsUrl = 'https://calendar.google.com/calendar/ical/en.philippines%23holiday%40group.v.calendar.google.com/public/basic.ics';
+        const response = UrlFetchApp.fetch(icsUrl);
+        const icsContent = response.getContentText();
+        
+        // Parse DTSTART lines from ICS content
+        const dtStartRegex = /DTSTART;VALUE=DATE:(\d{4})(\d{2})(\d{2})/g;
+        let match;
+        const icsHolidays = [];
+        
+        while ((match = dtStartRegex.exec(icsContent)) !== null) {
+          const year = parseInt(match[1], 10);
+          const month = parseInt(match[2], 10);
+          const day = parseInt(match[3], 10);
+          const holidayDate = DateUtils.buildDate(year, month, day);
+          
+          // Only include holidays within our date range
+          if (holidayDate >= startDate && holidayDate <= endDate) {
+            icsHolidays.push(DateUtils.formatYMD(holidayDate));
+          }
+        }
+        
+        dates = icsHolidays;
+        logTS(`HolidayService: ICS fallback fetched ${dates.length} holidays`);
+      } catch (e) {
+        logTS('HolidayService: ICS fallback failed: ' + e);
+        dates = [];
+      }
+    }
+    
+    // Final fallback to manual recurring rules
+    if (dates.length === 0) {
+      const manualHolidays = [];
+      const startYear = startDate.getFullYear();
+      const endYear = endDate.getFullYear();
+      
+      for (let year = startYear; year <= endYear; year++) {
+        this._manualHolidays.forEach(holiday => {
+          const holidayDate = DateUtils.buildDate(year, holiday.month, holiday.day);
+          if (holidayDate >= startDate && holidayDate <= endDate) {
+            manualHolidays.push(DateUtils.formatYMD(holidayDate));
+          }
+        });
+      }
+      
+      dates = manualHolidays;
+      logTS(`HolidayService: Manual rules generated ${dates.length} holidays`);
+    }
+    
+    // Cache the results
+    safeCachePut(cacheKey, JSON.stringify(dates), HOLIDAY_CACHE_TTL);
+    return new Set(dates);
+  },
+
+  /**
+   * Check if a specific date is a holiday
+   * @param {string|Date} dateInput - Date string in yyyy-MM-dd format or Date object
+   * @return {boolean} True if holiday, false otherwise (defaults to true on error)
+   */
+  isHoliday(dateInput) {
+    try {
+      this.initHolidayCalendar();
+      
+      let date;
+      if (dateInput instanceof Date) {
+        date = dateInput;
+      } else {
+        date = DateUtils.parseDate(dateInput);
+        if (!date) {
+          logTS('HolidayService.isHoliday: Invalid date: ' + dateInput);
+          return true; // Assume holiday on invalid date
+        }
+      }
+      
+      // Try calendar first if available
+      if (this._calendarAvailable) {
+        try {
+          const events = this._holidayCalendar.getEventsForDay(date);
+          if (events.length > 0) {
+            logTS('HolidayService.isHoliday: confirmed holiday via calendar ' + DateUtils.formatYMD(date));
+            return true;
+          }
+        } catch (e) {
+          logTS('HolidayService.isHoliday: calendar error, falling back to manual: ' + e);
+          this._calendarAvailable = false;
+        }
+      }
+      
+      // Fallback to manual holiday checks
+      const month = date.getMonth() + 1; // Convert to 1-12
+      const day = date.getDate();
+      const year = date.getFullYear();
+      
+      // Check fixed holidays
+      for (const holiday of this._manualHolidays) {
+        if (holiday.month === month && holiday.day === day) {
+          logTS('HolidayService.isHoliday: confirmed fixed holiday ' + DateUtils.formatYMD(date));
+          return true;
+        }
+      }
+      
+      // Check National Heroes Day (last Monday of August)
+      const nationalHeroesDay = this.getNationalHeroesDay(year);
+      if (date.getTime() === nationalHeroesDay.getTime()) {
+        logTS('HolidayService.isHoliday: confirmed National Heroes Day ' + DateUtils.formatYMD(date));
+        return true;
+      }
+      
+      return false;
+    } catch (e) {
+      logTS('HolidayService.isHoliday: error checking ' + dateInput + ': ' + e);
+      return true; // Assume holiday on error to be safe
+    }
+  }
+};
+
+/**
+ * Centralized date utilities for timezone-safe operations
+ */
+const DateUtils = {
+  /**
+   * Build a Date object from year, month, day components
+   * @param {number} year - Full year
+   * @param {number} month - Month (1-12)
+   * @param {number} day - Day of month
+   * @return {Date} Date object
+   */
+  buildDate(year, month, day) {
+    return new Date(year, month - 1, day);
+  },
+
+  /**
+   * Format a Date object as yyyy-MM-dd using script timezone
+   * @param {Date} date - Date to format
+   * @return {string} Formatted date string
+   */
+  formatYMD(date) {
+    return Utilities.formatDate(date, TZ, 'yyyy-MM-dd');
+  },
+
+  /**
+   * Parse a date string into a Date object
+   * @param {string} dateText - Date string in yyyy-MM-dd format
+   * @return {Date|null} Date object or null if invalid
+   */
+  parseDate(dateText) {
+    try {
+      const match = dateText.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (!match) return null;
+      
+      const year = parseInt(match[1], 10);
+      const month = parseInt(match[2], 10);
+      const day = parseInt(match[3], 10);
+      
+      const date = this.buildDate(year, month, day);
+      return isNaN(date) ? null : date;
+    } catch (e) {
+      return null;
+    }
+  }
+};
+
+/**
  * Checks if a given date is a holiday.
  * @param {string} dateText - Date string in yyyy-MM-dd format.
  * @return {boolean} True if the date is a holiday, false otherwise.
  */
 function isHoliday_(dateText) {
-  // Normalize input using formatYMD_ to ensure consistent format
-  const date = new Date(dateText);
-  if (isNaN(date)) {
-    logTS('isHoliday_: Invalid date input: ' + dateText);
-    return false;
+  try {
+    return HolidayService.isHoliday(dateText);
+  } catch (e) {
+    logTS('isHoliday_: error delegating to HolidayService: ' + e);
+    return true; // Assume holiday on error to be safe
   }
-  const normalizedDate = formatYMD_(date);
-  const holidaySet = getHolidayDates(date, date);
-  const isHoliday = holidaySet.has(normalizedDate);
-  
-  // Log cache hits/misses for debugging
-  if (isHoliday) {
-    logTS('isHoliday_: cache hit for holiday ' + normalizedDate);
-  } else {
-    logTS('isHoliday_: cache miss for non-holiday ' + normalizedDate);
-  }
-  
-  return isHoliday;
 }
 
 /**
@@ -93,13 +343,13 @@ function isHoliday_(dateText) {
 function safeParseDate_(cell) {
   try {
     if (cell instanceof Date && !isNaN(cell)) {
-      return formatYMD_(cell);
+      return DateUtils.formatYMD(cell);
     }
     const s = String(cell);
     const m = s.match(/(\d{4}-\d{2}-\d{2})/);
     if (m) {
-      const testDate = new Date(m[1]);
-      if (!isNaN(testDate)) {
+      const testDate = DateUtils.parseDate(m[1]);
+      if (testDate) {
         return m[1];
       }
     }
@@ -137,7 +387,7 @@ function logTS(label) {
  * @return {string} Formatted date string.
  */
 function formatYMD_(date) {
-  return Utilities.formatDate(date, TZ, 'yyyy-MM-dd');
+  return DateUtils.formatYMD(date);
 }
 
 /**
@@ -195,31 +445,7 @@ function safeCacheRemove(key) {
  * @return {Set<string>} Set of holiday date strings in yyyy-MM-dd format.
  */
 function getHolidayDates(startDate, endDate) {
-  let dates;
-  const cached = safeCacheGet(HOLIDAY_CACHE_KEY);
-  if (cached) {
-    try {
-      dates = JSON.parse(cached);
-    } catch (e) {
-      dates = null;
-    }
-  }
-  if (!dates) {
-    try {
-      const holidayCal = CalendarApp.getCalendarById(HOLIDAY_CAL_ID);
-      const events = holidayCal.getEvents(startDate, endDate);
-      dates = events.map(ev => formatYMD_(ev.getStartTime()));
-      safeCachePut(HOLIDAY_CACHE_KEY, JSON.stringify(dates), HOLIDAY_CACHE_TTL);
-      // Validate holiday calendar by logging count and events
-      logTS(`Holiday calendar validation: fetched ${dates.length} holidays for window ${formatYMD_(startDate)} to ${formatYMD_(endDate)}`);
-      logTS(`Holiday events: ${JSON.stringify(dates)}`);
-    } catch (e) {
-      logTS('getHolidayDates: Error fetching holiday calendar: ' + e);
-      dates = []; // Return empty array on error to prevent blocking
-      safeCachePut(HOLIDAY_CACHE_KEY, JSON.stringify(dates), HOLIDAY_CACHE_TTL);
-    }
-  }
-  return new Set(dates);
+  return HolidayService.fetchRange(startDate, endDate);
 }
 
 /**
@@ -329,7 +555,7 @@ function updateAvailability_everywhere() {
       
       // Filter out any holidays that might have slipped through
       const nonHolidayDates = availDates.filter(dateStr => {
-        if (isHoliday_(dateStr)) {
+        if (HolidayService.isHoliday(dateStr)) {
           logTS('updateAvailability_everywhere: filtering out holiday ' + dateStr);
           return false;
         }
@@ -378,7 +604,7 @@ function onFormSubmit(e) {
       const start = new Date(dateText);
 
       // Holiday guard: early exit on holidays before any calendar or form logic
-      if (isHoliday_(dateText)) {
+      if (HolidayService.isHoliday(dateText)) {
         logTS('onFormSubmit: booking on holiday rejected: ' + dateText);
         return;
       }
@@ -511,7 +737,7 @@ function checkCalendarIntegrity() {
         
         affectedDates.forEach(dateStr => {
           // Early exit on holidays before any summary creation
-          if (isHoliday_(dateStr)) {
+          if (HolidayService.isHoliday(dateStr)) {
             logTS('checkCalendarIntegrity: skipping holiday ' + dateStr);
             return;
           }
@@ -635,9 +861,9 @@ function buildBusinessDays(counts) {
     
     // Skip weekends
     if (wd !== 0 && wd !== 6) {
-      const key = formatYMD_(d);
+      const key = DateUtils.formatYMD(d);
       // Skip holidays - prevent holiday dates from ever appearing in items
-      if (isHoliday_(key)) {
+      if (HolidayService.isHoliday(key)) {
         logTS('buildBusinessDays: skipping holiday ' + key);
         dayOffset++;
         continue;
@@ -694,7 +920,7 @@ function batchSyncCalendarSummaries(availDates, counts) {
   // Use ONLY upsert helper for each date to ensure exactly one summary per date
   availDates.forEach(dateStr => {
     // Early exit on holidays before any summary creation
-    if (isHoliday_(dateStr)) {
+    if (HolidayService.isHoliday(dateStr)) {
       logTS('batchSyncCalendarSummaries: skipping holiday ' + dateStr);
       return;
     }
@@ -859,7 +1085,7 @@ function upsertDailySummary(dateText, left) {
   logTS(`upsertDailySummary:start for ${dateText}, ${left} slots left`);
   
   // Holiday guard: immediately return if holiday - prevent any event creation/modification
-  if (isHoliday_(dateText)) {
+  if (HolidayService.isHoliday(dateText)) {
     logTS('upsertDailySummary: early exit on holiday ' + dateText);
     return;
   }
@@ -1081,6 +1307,111 @@ function test_buildBusinessDays_excludesHolidays() {
   logTS('test_buildBusinessDays_excludesHolidays: verified no holidays in availDates');
 }
 
+function test_HolidayService_calendarFallback() {
+  // Test HolidayService fallback when CalendarApp fails
+  const originalCalendarAvailable = HolidayService._calendarAvailable;
+  const originalInit = HolidayService._initialized;
+  
+  try {
+    // Force fallback mode
+    HolidayService._calendarAvailable = false;
+    HolidayService._initialized = true;
+    
+    const testStart = DateUtils.buildDate(2025, 1, 1);
+    const testEnd = DateUtils.buildDate(2025, 1, 31);
+    const holidays = HolidayService.fetchRange(testStart, testEnd);
+    
+    // Should include New Year's Day from manual rules
+    if (!holidays.has('2025-01-01')) {
+      throw new Error('HolidayService fallback failed to include New Year\'s Day');
+    }
+    
+    logTS('test_HolidayService_calendarFallback: verified fallback works');
+  } finally {
+    // Restore original state
+    HolidayService._calendarAvailable = originalCalendarAvailable;
+    HolidayService._initialized = originalInit;
+  }
+}
+
+function test_HolidayService_manualRules() {
+  // Test manual holiday rules generation
+  const testStart = DateUtils.buildDate(2025, 12, 20);
+  const testEnd = DateUtils.buildDate(2025, 12, 31);
+  
+  // Force manual rules by simulating all other methods failed
+  const originalCalendarAvailable = HolidayService._calendarAvailable;
+  const originalInit = HolidayService._initialized;
+  
+  try {
+    HolidayService._calendarAvailable = false;
+    HolidayService._initialized = true;
+    
+    const holidays = HolidayService.fetchRange(testStart, testEnd);
+    
+    // Should include Christmas and Rizal Day
+    if (!holidays.has('2025-12-25')) {
+      throw new Error('Manual rules failed to include Christmas Day');
+    }
+    if (!holidays.has('2025-12-30')) {
+      throw new Error('Manual rules failed to include Rizal Day');
+    }
+    
+    logTS('test_HolidayService_manualRules: verified manual rules work');
+  } finally {
+    HolidayService._calendarAvailable = originalCalendarAvailable;
+    HolidayService._initialized = originalInit;
+  }
+}
+
+function test_DateUtils_buildAndFormat() {
+  // Test DateUtils date building and formatting
+  const testDate = DateUtils.buildDate(2025, 1, 15);
+  const formatted = DateUtils.formatYMD(testDate);
+  
+  if (formatted !== '2025-01-15') {
+    throw new Error('DateUtils formatting failed: expected 2025-01-15, got ' + formatted);
+  }
+  
+  const parsed = DateUtils.parseDate('2025-01-15');
+  if (!parsed || DateUtils.formatYMD(parsed) !== '2025-01-15') {
+    throw new Error('DateUtils parsing failed');
+  }
+  
+  logTS('test_DateUtils_buildAndFormat: verified date utilities work');
+}
+
+function test_HolidayService_cacheKeys() {
+  // Test that HolidayService generates unique cache keys per range
+  const start1 = DateUtils.buildDate(2025, 1, 1);
+  const end1 = DateUtils.buildDate(2025, 1, 31);
+  const start2 = DateUtils.buildDate(2025, 2, 1);
+  const end2 = DateUtils.buildDate(2025, 2, 28);
+  
+  // Clear any existing cache
+  const key1 = `${SCRIPT_VERSION}_holidays_2025-01-01_2025-01-31`;
+  const key2 = `${SCRIPT_VERSION}_holidays_2025-02-01_2025-02-28`;
+  safeCacheRemove(key1);
+  safeCacheRemove(key2);
+  
+  // Fetch ranges to populate cache
+  HolidayService.fetchRange(start1, end1);
+  HolidayService.fetchRange(start2, end2);
+  
+  // Verify different cache keys were used
+  const cached1 = safeCacheGet(key1);
+  const cached2 = safeCacheGet(key2);
+  
+  if (!cached1) {
+    throw new Error('HolidayService failed to cache first range');
+  }
+  if (!cached2) {
+    throw new Error('HolidayService failed to cache second range');
+  }
+  
+  logTS('test_HolidayService_cacheKeys: verified unique cache keys per range');
+}
+
 function test_tallyByDate_cache() {
   safeCacheRemove(CACHE_KEY);
   const testDates = ['2025-01-01', '2025-01-01', '2025-01-02'];
@@ -1152,7 +1483,7 @@ function test_holidayGuardOnSubmit() {
   let rejected = false;
   const originalLogTS = logTS;
   logTS = function(msg) {
-    if (msg.indexOf('Booking on holiday rejected') === 0) {
+    if (msg.indexOf('booking on holiday rejected') >= 0) {
       rejected = true;
     }
   };
@@ -1164,7 +1495,7 @@ function test_holidayGuardOnSubmit() {
   
   // Verify no appointment or summary events were created on the holiday
   const [y, m, d] = holidayDate.split('-').map(Number);
-  const testDate = new Date(y, m - 1, d);
+  const testDate = DateUtils.buildDate(y, m, d);
   const dayEvents = CAL.getEventsForDay(testDate);
   const appointments = dayEvents.filter(ev => ev.getTitle().startsWith(TAG_APPOINTMENT));
   const summaries = dayEvents.filter(ev => ev.getDescription().indexOf(FULL_SUMMARY_TAG) === 0);
@@ -1181,7 +1512,7 @@ function test_upsertDailySummary_holiday() {
   // Assert that calling upsertDailySummary on a holiday never creates or updates events
   const holidayDate = '2025-12-25';
   const [y, m, d] = holidayDate.split('-').map(Number);
-  const testDate = new Date(y, m - 1, d);
+  const testDate = DateUtils.buildDate(y, m, d);
   
   // Ensure no existing events on the holiday
   const existingEvents = CAL.getEventsForDay(testDate);
@@ -1202,7 +1533,7 @@ function test_removeHolidaySummaries() {
   // Test that removeHolidaySummaries deletes both summary and appointment events on holiday dates
   const holidayDate = '2025-12-25';
   const [y, m, d] = holidayDate.split('-').map(Number);
-  const testDate = new Date(y, m - 1, d);
+  const testDate = DateUtils.buildDate(y, m, d);
   
   // Create dummy summary and appointment events on the holiday
   const dummySummary = CAL.createAllDayEvent('Test Holiday Summary', testDate, { 
@@ -1253,7 +1584,11 @@ function runTests() {
     { name: 'test_holidaysExcluded', fn: test_holidaysExcluded },
     { name: 'test_holidayGuardOnSubmit', fn: test_holidayGuardOnSubmit },
     { name: 'test_upsertDailySummary_holiday', fn: test_upsertDailySummary_holiday },
-    { name: 'test_removeHolidaySummaries', fn: test_removeHolidaySummaries }
+    { name: 'test_removeHolidaySummaries', fn: test_removeHolidaySummaries },
+    { name: 'test_HolidayService_calendarFallback', fn: test_HolidayService_calendarFallback },
+    { name: 'test_HolidayService_manualRules', fn: test_HolidayService_manualRules },
+    { name: 'test_DateUtils_buildAndFormat', fn: test_DateUtils_buildAndFormat },
+    { name: 'test_HolidayService_cacheKeys', fn: test_HolidayService_cacheKeys }
   ];
   
   testFunctions.forEach(test => {
@@ -1299,6 +1634,7 @@ function ensureTestTriggerExists() {
  * @param {Object} e - Install event object.
  */
 function onInstall(e) {
+  HolidayService.initHolidayCalendar();
   ensureTestTriggerExists();
 }
 
@@ -1307,5 +1643,6 @@ function onInstall(e) {
  * @param {Object} e - Open event object.
  */
 function onOpen(e) {
+  HolidayService.initHolidayCalendar();
   ensureTestTriggerExists();
 }
