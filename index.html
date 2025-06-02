@@ -1382,6 +1382,113 @@
                                                           </iframe>
                                                         </div>
 
+                                                      -->
+<div id="welcome-dialog" style="
+  display: none;
+  position: fixed;
+  top: 10%;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 95%;
+  max-width: 1000px;
+  background: white;
+  border-radius: 24px;
+  padding: 60px 50px;
+  box-shadow: 0 6px 30px rgba(0, 0, 0, 0.4);
+  font-family: 'Segoe UI', sans-serif;
+  animation: fadeIn 0.2s ease-out;
+  z-index: 9999;
+">
+  <h2 id="welcome-title" style="font-size: 48px; margin-bottom: 30px; color: #222;"></h2>
+  <p id="welcome-body" style="font-size: 36px; line-height: 1.8; color: #444;"></p>
+  <div style="margin-top: 40px; text-align: right;">
+    <button id="welcome-ok" style="
+      background-color: #4CAF50;
+      color: white;
+      padding: 20px 36px;
+      border: none;
+      border-radius: 10px;
+      font-size: 28px;
+      cursor: pointer;
+    ">Okay</button>
+    <button id="welcome-close" style="
+      margin-left: 20px;
+      background-color: #f44336;
+      color: white;
+      padding: 20px 36px;
+      border: none;
+      border-radius: 10px;
+      font-size: 28px;
+      cursor: pointer;
+    ">Close</button>
+  </div>
+</div>
+
+
+
+
+<script>
+  const sheetURL = 'https://script.google.com/macros/s/AKfycby4pAKdOaXuBIkMxZ1dAniULmIzOKX9p6U-amfdKxYTfOX_j7oGGjc4YBHmiBIjCnpG2Q/exec'; // your web app URL
+
+  let messageQueue = [], currentIndex = 0;
+
+  function showNextMessage() {
+    if (currentIndex >= messageQueue.length) return;
+
+    const msg = messageQueue[currentIndex];
+    const dialog = document.getElementById('welcome-dialog');
+
+    // Fill content
+    document.getElementById('welcome-title').textContent = msg.title;
+    document.getElementById('welcome-body').textContent = msg.body;
+    document.getElementById('welcome-ok').textContent = msg.button;
+
+    // Show dialog with fade-in animation
+    dialog.style.display = 'block';
+    dialog.style.animation = 'fadeIn 0.5s ease';
+
+    // Auto-dismiss after 80 seconds
+    setTimeout(closeDialog, 80000);
+  }
+
+  function closeDialog() {
+    const dialog = document.getElementById('welcome-dialog');
+    dialog.style.display = 'none';
+    dialog.style.animation = ''; // Reset animation for next time
+    currentIndex++;
+    setTimeout(showNextMessage, 300);
+  }
+
+  // Button listeners
+  document.getElementById('welcome-ok').onclick = closeDialog;
+  document.getElementById('welcome-close').onclick = closeDialog;
+
+  // Fetch welcome messages from Google Apps Script
+  document.addEventListener('DOMContentLoaded', function () {
+    fetch(sheetURL)
+      .then(response => response.json())
+      .then(data => {
+        if (Array.isArray(data) && data.length > 0) {
+          messageQueue = data;
+          showNextMessage();
+        }
+      })
+      .catch(err => {
+        console.error('Failed to load welcome messages:', err);
+      });
+  });
+
+  // Inject fadeIn animation keyframes early
+  const style = document.createElement('style');
+  style.textContent = `
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(-10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+  `;
+  document.head.appendChild(style);
+</script>
+
 
 
 
