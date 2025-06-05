@@ -16,7 +16,56 @@
 const SCRIPT_VERSION = 'v2';
 const CACHE_KEY = SCRIPT_VERSION + '_counts';
 const IS_DEV = false;
-const FORM_ID = '1a7K-SKOU5n3mYlCMM7y0bUqvaO_u5LHtDDS3eLq3mhs';
+const FORM_REGISTRY = [
+  {
+    formId: '1a7K-SKOU5n3mYlCMM7y0bUqvaO_u5LHtDDS3eLq3mhs',
+    sheetName: 'Form Responses 1',
+    spreadsheetId: '1SZqf77i655xHA1FI6YzeZ332E6M4Y_dpFmz_h1tM6xQ',
+    availabilitySheetName: 'Availability_Form1'
+  },
+  {
+    formId: '1AGsTaMbhv-aCR_B7fEJZ534jwdcHhxB4HcreOfj6Dq0',
+    sheetName: 'ForConnection',
+    spreadsheetId: '1SZqf77i655xHA1FI6YzeZ332E6M4Y_dpFmz_h1tM6xQ',
+    availabilitySheetName: 'Availability_Connection'
+  },
+  {
+    formId: '1sCsIcymP-cIJK7ziMPA_tjWph5ER62n5nscJl3qyEo4',
+    sheetName: 'ForDisconnection',
+    spreadsheetId: '1SZqf77i655xHA1FI6YzeZ332E6M4Y_dpFmz_h1tM6xQ',
+    availabilitySheetName: 'Availability_Disconnection'
+  },
+  {
+    formId: '1lfrpxChZ6K1vvO4-v--ww7nWzT5yIyXqeX2PYr5aBpg',
+    sheetName: 'ForReconnection',
+    spreadsheetId: '1SZqf77i655xHA1FI6YzeZ332E6M4Y_dpFmz_h1tM6xQ',
+    availabilitySheetName: 'Availability_Reconnection'
+  },
+  {
+    formId: '16pTBxWONNrs4jUb_EXmXKyLkglSjYT7I6S2BZaPIPu4',
+    sheetName: 'ForRepairandMaintenance',
+    spreadsheetId: '1SZqf77i655xHA1FI6YzeZ332E6M4Y_dpFmz_h1tM6xQ',
+    availabilitySheetName: 'Availability_Repair'
+  },
+  {
+    formId: '19acXAZfOnMunLOg9enl9JrSJCfzjqbqwn45_QD9vX4g',
+    sheetName: 'ForOtherConcerns',
+    spreadsheetId: '1SZqf77i655xHA1FI6YzeZ332E6M4Y_dpFmz_h1tM6xQ',
+    availabilitySheetName: 'Availability_Other'
+  }  /* add remaining form entries here */
+];
+
+// Fast-fail if registry entries are malformed
+FORM_REGISTRY.forEach(entry => {
+  if (!entry.formId || !entry.sheetName) {
+    throw new Error('Invalid FORM_REGISTRY entry: ' + JSON.stringify(entry));
+  }
+});
+
+// Event color constants
+const EVENT_COLOR_AVAILABLE = CalendarApp.EventColor.GREEN;
+const EVENT_COLOR_FULL      = CalendarApp.EventColor.RED;
+
 const SLOT_CAP = 20;
 const RESPONSE_RETENTION_DAYS = 90;
 const TZ = Session.getScriptTimeZone();
@@ -24,30 +73,25 @@ const THROTTLE_INTERVAL_MS = 60000;
 const LOCK_TIMEOUT_MS = 30000;
 const TAG_SUMMARY = '##SLOT_SUMMARY##';
 const TAG_APPOINTMENT = 'Appointment:';
-const FORM = FormApp.openById(FORM_ID);
 const CAL = CalendarApp.getDefaultCalendar();
-const SS = SpreadsheetApp.getActiveSpreadsheet();
 
-const LAST_NAME_IDX = 1;
-const FIRST_NAME_IDX = 2;
-const PUROK_IDX = 3;
-const BARANGAY_IDX = 4;
-const DATE_IDX = 5;
-const RESP_SHEET_NAME = 'Form Responses 1';
-const RESP_DATE_COL = 'F';
-const AVAIL_BOOKED_COL = 2;
-const AVAIL_LEFT_COL = 3;
+// Module-level spreadsheet cache
+let spreadsheetCache = {};
 
 const MAX_ADVANCE_DAYS = 60;
 const BUSINESS_DAYS_WINDOW = 60;
 const EMAIL_THROTTLE_MS = 24 * 60 * 60 * 1000;
 const SUMMARY_TAG_PREFIX = '[SYSTEM_GEN]';
 const FULL_SUMMARY_TAG = SUMMARY_TAG_PREFIX + TAG_SUMMARY;
+
+/**
+ * Tag used to identify holiday mirror events.
+ */
+const TAG_HOLIDAY = SUMMARY_TAG_PREFIX + '##HOLIDAY##';
 const CHUNK_SIZE = 50;
 const CACHE = CacheService.getScriptCache();
 
-const EVENT_COLOR_AVAILABLE = CalendarApp.EventColor.GREEN;
-const EVENT_COLOR_FULL      = CalendarApp.EventColor.RED;
+
 const HOLIDAY_CAL_ID = 'en.philippines#holiday@group.v.calendar.google.com';
 const HOLIDAY_CACHE_KEY = SCRIPT_VERSION + '_holidays';
 const HOLIDAY_CACHE_TTL = 12 * 60 * 60;
@@ -55,8 +99,8 @@ const HOLIDAY_CACHE_TTL = 12 * 60 * 60;
 // Module-level throttle state
 const propsEmail = PropertiesService.getScriptProperties();
 
-// Module-level cache for form list item
-let cachedListItem = null;
+// Module-level cache for form list items (per form ID)
+let cachedListItems = {};
 let cachedCounts = null;
 
 /**
@@ -161,30 +205,36 @@ const HolidayService = {
     if (dates.length === 0 && !this._calendarAvailable) {
       try {
         const icsUrl = 'https://calendar.google.com/calendar/ical/en.philippines%23holiday%40group.v.calendar.google.com/public/basic.ics';
-        const response = UrlFetchApp.fetch(icsUrl);
-        const icsContent = response.getContentText();
         
-        // Parse DTSTART lines from ICS content
-        const dtStartRegex = /DTSTART;VALUE=DATE:(\d{4})(\d{2})(\d{2})/g;
-        let match;
-        const icsHolidays = [];
-        
-        while ((match = dtStartRegex.exec(icsContent)) !== null) {
-          const year = parseInt(match[1], 10);
-          const month = parseInt(match[2], 10);
-          const day = parseInt(match[3], 10);
-          const holidayDate = DateUtils.buildDate(year, month, day);
+        try {
+          const response = UrlFetchApp.fetch(icsUrl);
+          const icsContent = response.getContentText();
           
-          // Only include holidays within our date range
-          if (holidayDate >= startDate && holidayDate <= endDate) {
-            icsHolidays.push(DateUtils.formatYMD(holidayDate));
+          // Parse DTSTART lines from ICS content
+          const dtStartRegex = /DTSTART;VALUE=DATE:(\d{4})(\d{2})(\d{2})/g;
+          let match;
+          const icsHolidays = [];
+          
+          while ((match = dtStartRegex.exec(icsContent)) !== null) {
+            const year = parseInt(match[1], 10);
+            const month = parseInt(match[2], 10);
+            const day = parseInt(match[3], 10);
+            const holidayDate = DateUtils.buildDate(year, month, day);
+            
+            // Only include holidays within our date range
+            if (holidayDate >= startDate && holidayDate <= endDate) {
+              icsHolidays.push(DateUtils.formatYMD(holidayDate));
+            }
           }
+          
+          dates = icsHolidays;
+          logTS(`HolidayService: ICS fallback fetched ${dates.length} holidays`);
+        } catch (fetchError) {
+          logTS('HolidayService: UrlFetchApp.fetch failed: ' + fetchError);
+          dates = [];
         }
-        
-        dates = icsHolidays;
-        logTS(`HolidayService: ICS fallback fetched ${dates.length} holidays`);
       } catch (e) {
-        logTS('HolidayService: ICS fallback failed: ' + e);
+        logTS('HolidayService: ICS fallback error: ' + e);
         dates = [];
       }
     }
@@ -522,6 +572,288 @@ function sendThrottledError(functionName, err) {
 }
 
 /**
+ * Gets spreadsheet for a registry entry, with caching and fallback.
+ * @param {Object} entry - Registry entry with spreadsheetId.
+ * @return {Spreadsheet} The spreadsheet object.
+ */
+function getSpreadsheetForEntry(entry) {
+  if (!entry.spreadsheetId) {
+    logTS(`getSpreadsheetForEntry: No spreadsheetId for entry ${entry.sheetName}, falling back to active spreadsheet`);
+    return SpreadsheetApp.getActiveSpreadsheet();
+  }
+  
+  if (spreadsheetCache[entry.spreadsheetId]) {
+    return spreadsheetCache[entry.spreadsheetId];
+  }
+  
+  try {
+    const ss = SpreadsheetApp.openById(entry.spreadsheetId);
+    spreadsheetCache[entry.spreadsheetId] = ss;
+    return ss;
+  } catch (e) {
+    logTS(`getSpreadsheetForEntry: Failed to open spreadsheet ${entry.spreadsheetId} for ${entry.sheetName}: ${e}`);
+    logTS(`getSpreadsheetForEntry: Falling back to active spreadsheet`);
+    return SpreadsheetApp.getActiveSpreadsheet();
+  }
+}
+
+/**
+ * Gets or creates a sheet in the specified spreadsheet.
+ * @param {Spreadsheet} spreadsheet - The spreadsheet object.
+ * @param {string} sheetName - Name of the sheet.
+ * @return {Sheet} The sheet object.
+ */
+function getOrCreateSheetInSpreadsheet(spreadsheet, sheetName) {
+  let sheet = spreadsheet.getSheetByName(sheetName);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(sheetName);
+  }
+  return sheet;
+}
+
+/**
+ * Ensures all sheets in FORM_REGISTRY exist, creating them if necessary.
+ */
+function ensureSheetsExist() {
+  logTS('ensureSheetsExist:start');
+  FORM_REGISTRY.forEach(entry => {
+    try {
+      const ss = getSpreadsheetForEntry(entry);
+      
+      // Ensure form response sheet exists
+      const sheet = getOrCreateSheetInSpreadsheet(ss, entry.sheetName);
+      
+      // Initialize headers if the sheet is new (first row is empty)
+      const lastRow = sheet.getLastRow();
+      if (lastRow === 0 || (lastRow === 1 && sheet.getRange(1, 1).getValue() === '')) {
+        const headers = ['Timestamp', 'Last Name', 'First Name', 'Purok', 'Barangay', 'Date of Appointment'];
+        sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+        logTS(`Initialized headers for ${entry.sheetName}`);
+      }
+      
+      logTS(`Ensured sheet exists: ${entry.sheetName}`);
+      
+      // Ensure availability sheet exists
+      const availSheet = getOrCreateSheetInSpreadsheet(ss, entry.availabilitySheetName);
+      
+      // Initialize headers if the sheet is new (first row is empty)
+      const availLastRow = availSheet.getLastRow();
+      if (availLastRow === 0 || (availLastRow === 1 && availSheet.getRange(1, 1).getValue() === '')) {
+        const headers = ['Date', 'Booked', 'Slots Left'];
+        availSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+        logTS(`Initialized headers for ${entry.availabilitySheetName}`);
+      }
+      
+      logTS(`Ensured availability sheet exists: ${entry.availabilitySheetName}`);
+    } catch (e) {
+      logTS(`Error ensuring sheets for entry ${entry.sheetName}: ${e}`);
+    }
+  });
+  
+  logTS('ensureSheetsExist:end');
+}
+
+/**
+ * Links all forms in FORM_REGISTRY to their corresponding sheets in the spreadsheet.
+ */
+function linkAllFormDestinations() {
+  logTS('linkAllFormDestinations:start');
+  FORM_REGISTRY.forEach(entry => {
+    try {
+      const form = FormApp.openById(entry.formId);
+      form.setDestination(FormApp.DestinationType.SPREADSHEET, entry.spreadsheetId, entry.sheetName);
+      logTS(`Linked form ${entry.formId} to sheet: ${entry.sheetName}`);
+    } catch (e) {
+      logTS(`Error linking form ${entry.formId} to sheet ${entry.sheetName}: ${e}`);
+    }
+  });
+  logTS('linkAllFormDestinations:end');
+}
+
+/**
+ * Creates submit triggers for all forms in FORM_REGISTRY.
+ */
+function createAllSubmitTriggers() {
+  logTS('createAllSubmitTriggers:start');
+  
+  // Remove existing form submit triggers to avoid duplicates
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(trigger => {
+    if (trigger.getEventType() === ScriptApp.EventType.ON_FORM_SUBMIT) {
+      try {
+        ScriptApp.deleteTrigger(trigger);
+        logTS('Removed existing form submit trigger');
+      } catch (e) {
+        logTS('Error removing trigger: ' + e);
+      }
+    }
+  });
+  
+  let successCount = 0;
+  let skipCount = 0;
+  
+  // Create new triggers for each form, skipping invalid ones
+  FORM_REGISTRY.forEach(entry => {
+    try {
+      // Validate form ID before creating trigger
+      let form;
+      try {
+        form = FormApp.openById(entry.formId);
+      } catch (formError) {
+        logTS(`SKIPPING: Invalid form ID ${entry.formId} (${entry.sheetName}) - ${formError}`);
+        skipCount++;
+        return;
+      }
+      
+      ScriptApp.newTrigger('onFormSubmit')
+        .forForm(form)
+        .onFormSubmit()
+        .create();
+      logTS(`Created submit trigger for form: ${entry.formId} (${entry.sheetName})`);
+      successCount++;
+    } catch (e) {
+      logTS(`SKIPPING: Error creating trigger for form ${entry.formId} (${entry.sheetName}): ${e}`);
+      skipCount++;
+    }
+  });
+  
+  logTS(`createAllSubmitTriggers:end - Created ${successCount} triggers, skipped ${skipCount} invalid forms`);
+}
+
+/**
+ * Updates date dropdown choices for all forms in FORM_REGISTRY.
+ * @param {string[]} choices - Array of choice values.
+ */
+function updateAllDateDropdowns(choices) {
+  logTS('updateAllDateDropdowns:start');
+  FORM_REGISTRY.forEach(entry => {
+    try {
+      const li = getAppointmentListItem_(entry.formId);
+      li.setChoiceValues(choices);
+      logTS(`Updated dropdown for form: ${entry.formId}`);
+    } catch (e) {
+      logTS(`Error updating dropdown for form ${entry.formId}: ${e}`);
+    }
+  });
+  logTS('updateAllDateDropdowns:end');
+}
+
+/**
+ * Updates date dropdown choices for a specific form.
+ * @param {string} formId - Form ID to update.
+ * @param {string[]} choices - Array of choice values.
+ */
+function updateDateDropdownForForm(formId, choices) {
+  logTS('updateDateDropdownForForm:start');
+  try {
+    const li = getAppointmentListItem_(formId);
+    li.setChoiceValues(choices);
+    logTS(`Updated dropdown for form: ${formId}`);
+  } catch (e) {
+    logTS(`Error updating dropdown for form ${formId}: ${e}`);
+  }
+  logTS('updateDateDropdownForForm:end');
+}
+
+/**
+ * Validates that all forms in FORM_REGISTRY have the required "Date of Appointment" list item.
+ */
+function validateFormListItems() {
+  logTS('validateFormListItems:start');
+  FORM_REGISTRY.forEach(entry => {
+    try {
+      const form = FormApp.openById(entry.formId);
+      const item = form.getItems(FormApp.ItemType.LIST)
+                       .find(i => i.asListItem().getTitle() === 'Date of Appointment');
+      if (!item) {
+        logTS(`ERROR: Form ${entry.formId} (${entry.sheetName}) missing "Date of Appointment" list item`);
+      } else {
+        logTS(`Validated "Date of Appointment" list item exists in form: ${entry.formId}`);
+      }
+    } catch (e) {
+      logTS(`Error validating form ${entry.formId}: ${e}`);
+    }
+  });
+  logTS('validateFormListItems:end');
+}
+
+/**
+ * Validates that all forms in FORM_REGISTRY are accessible.
+ * Logs errors for inaccessible forms but continues processing.
+ */
+function validateFormAccess() {
+  logTS('validateFormAccess:start');
+  FORM_REGISTRY.forEach(entry => {
+    try {
+      const form = FormApp.openById(entry.formId);
+      logTS(`Validated form access: ${entry.formId} (${entry.sheetName})`);
+    } catch (e) {
+      logTS(`ERROR: Cannot access form ${entry.formId} (${entry.sheetName}): ${e}`);
+    }
+  });
+  logTS('validateFormAccess:end');
+}
+
+/**
+ * Validates that all sheets in FORM_REGISTRY have the required header structure.
+ * Logs errors for missing headers but continues processing.
+ */
+function validateSheetStructures() {
+  logTS('validateSheetStructures:start');
+  const requiredHeaders = ['Last Name', 'First Name', 'Purok', 'Barangay', 'Date of Appointment'];
+  
+  FORM_REGISTRY.forEach(entry => {
+    try {
+      const sheet = getOrCreateSheet_(entry.sheetName);
+      logTS(`Validating sheet structure: ${entry.sheetName}`);
+      
+      requiredHeaders.forEach(headerName => {
+        try {
+          detectColumnIndex_(sheet, headerName);
+          logTS(`  ✓ Found header: ${headerName}`);
+        } catch (e) {
+          logTS(`  ✗ Missing header in ${entry.sheetName}: ${headerName}`);
+        }
+      });
+    } catch (e) {
+      logTS(`Error validating sheet structure for ${entry.sheetName}: ${e}`);
+    }
+  });
+  logTS('validateSheetStructures:end');
+}
+
+/**
+ * Main setup function that initializes all multi-form components.
+ */
+function runSetup() {
+  logTS('runSetup:start');
+  try {
+    validateFormAccess();
+    ensureSheetsExist();
+    validateSheetStructures();
+    HolidayService.initHolidayCalendar();
+    linkAllFormDestinations();
+    createAllSubmitTriggers();
+    validateFormListItems();
+    
+    // Initialize dropdowns with current availability
+    const dates = getResponseDates();
+    const counts = tallyByDate(dates);
+    const { choices } = buildBusinessDays(counts);
+    updateAllDateDropdowns(choices);
+    
+    // Initial full sync to populate summaries and sheet
+    updateAvailability_everywhere();
+    
+    logTS('runSetup completed successfully');
+  } catch (e) {
+    logTS('Error in runSetup: ' + e);
+    sendThrottledError('runSetup', e);
+  }
+  logTS('runSetup:end');
+}
+
+/**
  * Performs full availability sync: form, calendar summaries, sheet output.
  */
 function updateAvailability_everywhere() {
@@ -562,9 +894,14 @@ function updateAvailability_everywhere() {
         return true;
       });
       
-      batchUpdateForm(choices);
+      updateAllDateDropdowns(choices);
       batchSyncCalendarSummaries(nonHolidayDates, counts);
-      batchWriteAvailabilitySheet(nonHolidayDates, counts);
+      batchWriteAvailabilitySheets(nonHolidayDates, counts);
+      // Mirror all holiday dates in the same window
+      const windowStart = new Date();
+      const windowEnd = new Date();
+      windowEnd.setDate(windowEnd.getDate() + BUSINESS_DAYS_WINDOW);
+      getHolidayDates(windowStart, windowEnd).forEach(date => upsertHolidayMirror(date));
       safeCacheRemove(CACHE_KEY); // Invalidate cache after full sync
       cachedCounts = null;
       logTS('updateAvailability_everywhere:end');
@@ -591,17 +928,39 @@ function onFormSubmit(e) {
     }
     try {
       logTS('onFormSubmit:start');
-      if (!e || !e.values || e.values.length <= DATE_IDX) {
+      if (!e || !e.namedValues || !e.source) {
         logTS('Invalid form submit payload');
         return;
       }
-      const lastName = e.values[LAST_NAME_IDX];
-      const firstName = e.values[FIRST_NAME_IDX];
-      const purok = e.values[PUROK_IDX];
-      const barangay = e.values[BARANGAY_IDX];
-      const dateChoice = e.values[DATE_IDX];
+      
+      // Detect source form and find corresponding sheet
+      const sourceFormId = e.source.getId();
+      const registryEntry = FORM_REGISTRY.find(entry => entry.formId === sourceFormId);
+      if (!registryEntry) {
+        logTS('Form not found in registry: ' + sourceFormId);
+        return;
+      }
+      
+      logTS(`Processing submission from form: ${sourceFormId} -> sheet: ${registryEntry.sheetName}`);
+      
+      // Use namedValues for robust field parsing
+      const lastName = e.namedValues['Last Name'] ? e.namedValues['Last Name'][0] : '';
+      const firstName = e.namedValues['First Name'] ? e.namedValues['First Name'][0] : '';
+      const purok = e.namedValues['Purok'] ? e.namedValues['Purok'][0] : '';
+      const barangay = e.namedValues['Barangay'] ? e.namedValues['Barangay'][0] : '';
+      const dateChoice = e.namedValues['Date of Appointment'] ? e.namedValues['Date of Appointment'][0] : '';
+      
+      if (!dateChoice) {
+        logTS('No date choice found in form submission');
+        return;
+      }
+      
       const dateText = dateChoice.split(' ')[0];
-      const start = new Date(dateText);
+      const start = DateUtils.parseDate(dateText);
+      if (!start) {
+        logTS('onFormSubmit: Invalid date format: ' + dateText);
+        return;
+      }
 
       // Holiday guard: early exit on holidays before any calendar or form logic
       if (HolidayService.isHoliday(dateText)) {
@@ -632,16 +991,10 @@ function onFormSubmit(e) {
         description: `Purok: ${purok} — Barangay: ${barangay}`
       });
 
-      const newLeft = decrementChoiceForDate(dateText);
-      
-      // Color-code the individual booking event based on remaining slots
-      const color = newLeft > 0 ? EVENT_COLOR_AVAILABLE : EVENT_COLOR_FULL;
-      event.setColor(color);
-      
-      // Scheduled sync will handle summary updates to prevent race conditions
-      updateSheetRowForDate(dateText, newLeft);
-      safeCacheRemove(CACHE_KEY); // Invalidate cache after form submit
-      cachedCounts = null;
+      // Immediately update the calendar summary for this booking
+      // remove direct summary update in favor of microSync
+      event.setColor(EVENT_COLOR_AVAILABLE);
+      updateAvailability_thisdateonly(dateText, sourceFormId);
       logTS('onFormSubmit:end');
     } finally {
       lock.releaseLock();
@@ -688,6 +1041,9 @@ function checkCalendarIntegrity() {
       // Remove holiday summaries and appointments within advance window before other cleanup
       const now = new Date();
       removeHolidaySummaries(now, new Date(now.getTime() + MAX_ADVANCE_DAYS * 86400000));
+      // After cleanup, re-add holiday mirror events
+      const holidayEnd = new Date(now.getTime() + MAX_ADVANCE_DAYS * 86400000);
+      getHolidayDates(now, holidayEnd).forEach(dateStr => upsertHolidayMirror(dateStr));
       // Remove past Appointment events
       const yesterdayEnd = getEndOfDay_(new Date(now.getTime() - 24 * 60 * 60 * 1000));
       const pastAppointments = CAL.getEvents(new Date(1970, 0, 1), yesterdayEnd)
@@ -751,15 +1107,23 @@ function checkCalendarIntegrity() {
           }
         });
       }
-      // Prune yesterday from form dropdown
+      // Prune yesterday's date from each form dropdown
       const yesterday = new Date();
       yesterday.setDate(yesterday.getDate() - 1);
       const yStr = formatYMD_(yesterday);
-      const li = getAppointmentListItem_();
-      const allVals = li.getChoices().map(c => c.getValue());
-      const filtered = allVals.filter(v => !v.startsWith(yStr));
-      li.setChoiceValues(filtered);
-      cachedListItem = null;
+      FORM_REGISTRY.forEach(entry => {
+        try {
+          const li = getAppointmentListItem_(entry.formId);
+          const allVals = li.getChoices().map(c => c.getValue());
+          const filtered = allVals.filter(v => !v.startsWith(yStr));
+          li.setChoiceValues(filtered);
+          logTS(`Pruned yesterday (${yStr}) from form: ${entry.formId}`);
+        } catch (e) {
+          logTS(`Error pruning yesterday from form ${entry.formId}: ${e}`);
+        }
+      });
+      // Clear per‐form cache after pruning
+      cachedListItems = {};
       logTS('checkCalendarIntegrity:end');
     } finally {
       lock.releaseLock();
@@ -771,22 +1135,56 @@ function checkCalendarIntegrity() {
   }
 }
 
+/**
+ * Ensures a "Holiday" all-day event exists with TAG_HOLIDAY and green color.
+ * @param {string} dateText - yyyy-MM-dd
+ */
+function upsertHolidayMirror(dateText) {
+  let lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_TIMEOUT_MS)) return;
+  try {
+    if (!HolidayService.isHoliday(dateText)) return;
+    const [y,m,d] = dateText.split('-').map(Number);
+    const day = new Date(y, m - 1, d);
+    // Detect existing holiday mirror events
+    const existing = CAL.getEventsForDay(day)
+      .filter(ev => ev.getDescription() === TAG_HOLIDAY);
+    const title = 'Holiday';
+    const color = EVENT_COLOR_AVAILABLE; // use green
+    if (existing.length > 0) {
+      existing[0].setColor(color);
+      if (existing.length > 1) existing.slice(1).forEach(ev => ev.deleteEvent());
+    } else {
+      CAL.createAllDayEvent(title, day, { description: TAG_HOLIDAY }).setColor(color);
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 /** Private Helpers **/
 
 /**
- * Retrieves the ListItem for "Date of Appointment".
+ * Retrieves the ListItem for "Date of Appointment" from specified form.
+ * @param {string} formId - Optional form ID. Uses first form in registry if not provided.
  * @return {FormListItem} The list item.
  * @throws If the item is not found.
  */
-function getAppointmentListItem_() {
-  if (cachedListItem) {
-    return cachedListItem;
+function getAppointmentListItem_(formId) {
+  // Use first form in registry if no formId provided (for backward compatibility)
+  const targetFormId = formId || FORM_REGISTRY[0].formId;
+  
+  if (cachedListItems[targetFormId]) {
+    return cachedListItems[targetFormId];
   }
-  const item = FORM.getItems(FormApp.ItemType.LIST)
+  
+  const form = FormApp.openById(targetFormId);
+  const item = form.getItems(FormApp.ItemType.LIST)
                    .find(i => i.asListItem().getTitle() === 'Date of Appointment');
-  if (!item) throw new Error('No LIST item titled "Date of Appointment"');
-  cachedListItem = item.asListItem();
-  return cachedListItem;
+  if (!item) throw new Error(`No LIST item titled "Date of Appointment" in form ${targetFormId}`);
+  
+  cachedListItems[targetFormId] = item.asListItem();
+  return cachedListItems[targetFormId];
 }
 
 /**
@@ -801,26 +1199,58 @@ function getEndOfDay_(date) {
 }
 
 /**
- * Reads dates from form response sheet, filters out old entries.
- * @return {string[]} Array of yyyy-MM-dd date strings.
+ * Reads dates from all form response sheets, filters out old entries.
+ * @return {string[]} Array of yyyy-MM-dd date strings from all forms.
  */
 function getResponseDates() {
   logTS('getResponseDates:start');
-  const sheet = SS.getSheetByName(RESP_SHEET_NAME);
-  const lastRow = sheet.getLastRow();
-  const raw = lastRow > 1
-    ? sheet.getRange(`${RESP_DATE_COL}2:${RESP_DATE_COL}`).getValues()
-    : [];
-  const dates = raw.map(([cell]) => {
-    const parsed = safeParseDate_(cell);
-    return parsed;
-  }).filter(Boolean);
+  const allDates = [];
+  
+  FORM_REGISTRY.forEach(entry => {
+    try {
+      const ss = getSpreadsheetForEntry(entry);
+      const sheet = ss.getSheetByName(entry.sheetName);
+      if (!sheet) {
+        logTS(`Sheet not found: ${entry.sheetName}`);
+        return;
+      }
+      
+      const lastRow = sheet.getLastRow();
+      if (lastRow <= 1) {
+        logTS(`No data rows in sheet: ${entry.sheetName}`);
+        return;
+      }
+      
+      // Use dynamic column detection instead of hardcoded RESP_DATE_COL
+      let dateColIdx;
+      try {
+        dateColIdx = detectColumnIndex_(sheet, 'Date of Appointment');
+      } catch (e) {
+        logTS(`Skipping sheet ${entry.sheetName} due to missing 'Date of Appointment' column: ${e}`);
+        return;
+      }
+      
+      const raw = sheet.getRange(2, dateColIdx, lastRow - 1, 1).getValues();
+      
+      const dates = raw.map(([cell]) => {
+        const parsed = safeParseDate_(cell);
+        return parsed;
+      }).filter(Boolean);
+      
+      allDates.push(...dates);
+      logTS(`Collected ${dates.length} dates from ${entry.sheetName}`);
+    } catch (e) {
+      logTS(`Error reading dates from ${entry.sheetName}: ${e}`);
+    }
+  });
+  
   // Filter by retention policy
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - RESPONSE_RETENTION_DAYS);
   const cutoffStr = formatYMD_(cutoff);
-  const filtered = dates.filter(d => d >= cutoffStr);
-  logTS('getResponseDates:end');
+  const filtered = allDates.filter(d => d >= cutoffStr);
+  
+  logTS(`getResponseDates:end - collected ${allDates.length} total, ${filtered.length} after retention filter`);
   return filtered;
 }
 
@@ -895,16 +1325,6 @@ function buildBusinessDays(counts) {
   return { availDates, choices };
 }
 
-/**
- * Updates the form's date choice list.
- * @param {string[]} choices - Array of choice values.
- */
-function batchUpdateForm(choices) {
-  logTS('batchUpdateForm:start');
-  const li = getAppointmentListItem_();
-  li.setChoiceValues(choices);
-  logTS('batchUpdateForm:end');
-}
 
 /**
  * Syncs per-day summary calendar events.
@@ -947,63 +1367,98 @@ function batchSyncCalendarSummaries(availDates, counts) {
 }
 
 /**
- * Writes availability table into the sheet and applies color coding.
+ * Writes availability table into all availability sheets and applies color coding.
  * @param {string[]} availDates - Dates to write.
  * @param {Object.<string,number>} counts - Map of date to booked count.
  */
-function batchWriteAvailabilitySheet(availDates, counts) {
-  logTS('batchWriteAvailabilitySheet:start');
-  const sheet = getOrCreateSheet_('Availability');
-  sheet.clearContents();
-  const rows = [['Date', 'Booked', 'Slots Left']];
-  availDates.forEach(dateStr => {
-    const used = counts[dateStr] || 0;
-    const left = SLOT_CAP - used;
-    rows.push([dateStr, used, left]);
+function batchWriteAvailabilitySheets(availDates, counts) {
+  logTS('batchWriteAvailabilitySheets:start');
+  
+  FORM_REGISTRY.forEach(entry => {
+    try {
+      const ss = getSpreadsheetForEntry(entry);
+      const sheet = getOrCreateSheetInSpreadsheet(ss, entry.availabilitySheetName);
+      
+      sheet.clearContents();
+      const rows = [['Date', 'Booked', 'Slots Left']];
+      availDates.forEach(dateStr => {
+        const used = counts[dateStr] || 0;
+        const left = SLOT_CAP - used;
+        rows.push([dateStr, used, left]);
+      });
+      sheet.getRange(1, 1, rows.length, 3).setValues(rows);
+      colorCodeAvailabilitySheet(sheet);
+      logTS(`Updated availability sheet: ${entry.availabilitySheetName}`);
+    } catch (e) {
+      logTS(`Error updating availability sheet ${entry.availabilitySheetName}: ${e}`);
+    }
   });
-  sheet.getRange(1, 1, rows.length, 3).setValues(rows);
-  colorCodeAvailabilitySheet_();
-  logTS('batchWriteAvailabilitySheet:end');
+  
+  logTS('batchWriteAvailabilitySheets:end');
 }
 
 /**
  * Generates a prefilled form URL for a specific date.
  * @param {string} dateText - Date string yyyy-MM-dd.
  * @param {Object} extraFields - Optional extra fields to prefill by field ID.
+ * @param {string} formId - Optional form ID. Uses first form in registry if not provided.
  * @return {string} Prefilled form URL.
  */
-function generatePrefillUrl(dateText, extraFields) {
+function generatePrefillUrl(dateText, extraFields, formId) {
   logTS('generatePrefillUrl:start');
   try {
-    const d = new Date(dateText);
+    // Use first form in registry if no formId provided
+    const targetFormId = formId || FORM_REGISTRY[0].formId;
+    const form = FormApp.openById(targetFormId);
+    
+    const d = DateUtils.parseDate(dateText);
+    if (!d) {
+      logTS(`generatePrefillUrl: Invalid date format: ${dateText}`);
+      return form.getPublishedUrl();
+    }
     const weekday = Utilities.formatDate(d, TZ, 'EEE');
-    const li = getAppointmentListItem_();
+    const li = getAppointmentListItem_(targetFormId);
     const choices = li.getChoices().map(c => c.getValue());
     
     // Find the matching choice for this date
     const matchingChoice = choices.find(choice => choice.startsWith(dateText));
     if (!matchingChoice) {
       logTS(`generatePrefillUrl: No choice found for date ${dateText}`);
-      return FORM.getPublishedUrl();
+      return form.getPublishedUrl();
     }
     
     // Create a prefilled response
-    const response = FORM.createResponse();
+    const response = form.createResponse();
     const listItemResponse = li.createResponse(matchingChoice);
     response.withItemResponse(listItemResponse);
     
-    // Add extra fields if provided using a fixed field ID map
+    // Add extra fields if provided using dynamically generated field ID map
     if (extraFields) {
-      const fieldMap = {
-        Name: '12345abcdef',
-        Purok: '67890ghijk'
-        // add additional fieldName: itemId mappings here
-      };
+      // Generate fieldMap with actual form item IDs
+      const fieldMap = {};
+      const items = form.getItems();
+      items.forEach(item => {
+        const title = item.getTitle();
+        const itemId = item.getId();
+        
+        // Map common field names to their IDs
+        if (title.toLowerCase().includes('name') && !title.toLowerCase().includes('last') && !title.toLowerCase().includes('first')) {
+          fieldMap['Name'] = itemId;
+        } else if (title.toLowerCase().includes('last name')) {
+          fieldMap['Last Name'] = itemId;
+        } else if (title.toLowerCase().includes('first name')) {
+          fieldMap['First Name'] = itemId;
+        } else if (title.toLowerCase().includes('purok')) {
+          fieldMap['Purok'] = itemId;
+        } else if (title.toLowerCase().includes('barangay')) {
+          fieldMap['Barangay'] = itemId;
+        }
+      });
       Object.entries(extraFields).forEach(([fieldName, value]) => {
         try {
           const itemId = fieldMap[fieldName];
           if (!itemId) return;
-          const item = FORM.getItemById(itemId);
+          const item = form.getItemById(itemId);
           if (!item) return;
           const itemType = item.getType();
           if (itemType === FormApp.ItemType.TEXT) {
@@ -1024,21 +1479,29 @@ function generatePrefillUrl(dateText, extraFields) {
     return prefillUrl;
   } catch (err) {
     logTS('Error in generatePrefillUrl: ' + err);
-    return FORM.getPublishedUrl();
+    const targetFormId = formId || FORM_REGISTRY[0].formId;
+    const form = FormApp.openById(targetFormId);
+    return form.getPublishedUrl();
   }
 }
 
 /**
  * Decrements the form choice count for a given date.
  * @param {string} dateText - Date string yyyy-MM-dd.
+ * @param {string} formId - Optional form ID. Uses first form in registry if not provided.
  * @return {number} Remaining slots left.
  */
-function decrementChoiceForDate(dateText) {
+function decrementChoiceForDate(dateText, formId) {
   logTS('decrementChoiceForDate:start');
   try {
-    const d = new Date(dateText);
+    const d = DateUtils.parseDate(dateText);
+    if (!d) {
+      logTS(`decrementChoiceForDate: Invalid date format: ${dateText}`);
+      cachedListItems = {}; // Clear all cached list items
+      return 0;
+    }
     const weekday = Utilities.formatDate(d, TZ, 'EEE');
-    const li = getAppointmentListItem_();
+    const li = getAppointmentListItem_(formId);
     const raw = li.getChoices().map(c => c.getValue());
     let newLeft = 0;
     let found = false;
@@ -1060,8 +1523,8 @@ function decrementChoiceForDate(dateText) {
     }).filter(val => val !== null);
     
     if (!found) {
-      logTS(`decrementChoiceForDate: Date ${dateText} not found in choices`);
-      cachedListItem = null;
+      logTS(`decrementChoiceForDate: Date ${dateText} not found in choices for form ${formId || 'default'}`);
+      cachedListItems = {}; // Clear all cached list items
       return 0;
     }
     li.setChoiceValues(updated);
@@ -1135,6 +1598,104 @@ function upsertDailySummary(dateText, left) {
 }
 
 /**
+ * Performs a micro sync for a specific date: updates counts, dropdowns, calendar summary, sheet row, and cache.
+ * @param {string} dateText - Date string yyyy-MM-dd.
+ * @param {string} formId - Form ID to update dropdown for.
+ */
+function microSyncForDate(dateText, formId) {
+  logTS(`microSyncForDate:start for ${dateText}`);
+  
+  // Input validation
+  if (!formId || !dateText) {
+    logTS('microSyncForDate: missing required parameters, returning early');
+    return;
+  }
+  
+  if (HolidayService.isHoliday(dateText)) {
+    logTS('microSyncForDate: early exit on holiday ' + dateText);
+    return;
+  }
+  const dates = getResponseDates();
+  const counts = tallyByDate(dates);
+  const used = counts[dateText] || 0;
+  const left = SLOT_CAP - used;
+  const { choices } = buildBusinessDays(counts);
+  updateDateDropdownForForm(formId, choices);
+  upsertDailySummary(dateText, left);
+  updateSheetRowForDate(dateText, left, formId);
+  safeCacheRemove(CACHE_KEY);
+  cachedCounts = null;
+  logTS(`microSyncForDate:end for ${dateText}`);
+}
+
+/**
+ * Updates availability for a single date only: decrements slots, updates summary, sheet row, and dropdown.
+ * @param {string} dateText - Date string yyyy-MM-dd.
+ * @param {string} formId - Form ID to update dropdown for.
+ */
+function updateAvailability_thisdateonly(dateText, formId) {
+  logTS(`updateAvailability_thisdateonly:start for ${dateText}`);
+  
+  // Acquire lock to prevent race conditions
+  let lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+    logTS(`updateAvailability_thisdateonly: Lock busy for ${dateText}, skipping`);
+    return;
+  }
+  
+  try {
+    // Input validation
+    if (!formId || !dateText) {
+      logTS('updateAvailability_thisdateonly: missing required parameters, returning early');
+      return;
+    }
+    
+    // Holiday guard: early exit on holidays
+    if (HolidayService.isHoliday(dateText)) {
+      logTS('updateAvailability_thisdateonly: early exit on holiday ' + dateText);
+      return;
+    }
+    
+    // Validate date format
+    const testDate = DateUtils.parseDate(dateText);
+    if (!testDate) {
+      logTS('updateAvailability_thisdateonly: Invalid date format: ' + dateText);
+      return;
+    }
+    
+    // Count existing appointments for this date directly from calendar
+    const usedCalendar = CAL.getEventsForDay(testDate).filter(ev => ev.getTitle().startsWith(TAG_APPOINTMENT)).length;
+    const left = SLOT_CAP - usedCalendar;
+    
+    // Update calendar summary for this date
+    upsertDailySummary(dateText, left);
+    
+    // Update sheet row for this date
+    updateSheetRowForDate(dateText, left, formId);
+    
+    // Update dropdown for this form with fresh choices based on current counts
+    try {
+      const dates = getResponseDates();
+      const counts = tallyByDate(dates);
+      // Override the count for this specific date with the real-time calendar count
+      counts[dateText] = usedCalendar;
+      const { choices } = buildBusinessDays(counts);
+      updateDateDropdownForForm(formId, choices);
+    } catch (e) {
+      logTS(`updateAvailability_thisdateonly: Error updating dropdown for form ${formId}: ${e}`);
+    }
+    
+    // Clear cache to ensure compatibility with full-sync
+    safeCacheRemove(CACHE_KEY);
+    cachedCounts = null;
+    
+    logTS(`updateAvailability_thisdateonly:end for ${dateText}, ${left} slots left`);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
  * Updates the calendar summary event for a specific date.
  * @deprecated Use upsertDailySummary directly to avoid confusion
  * @param {string} dateText - Date string yyyy-MM-dd.
@@ -1150,23 +1711,59 @@ function updateCalendarSummaryForDate(dateText, left) {
  * Updates a single row in the availability sheet for a given date.
  * @param {string} dateText - Date string yyyy-MM-dd.
  * @param {number} left - Slots left.
+ * @param {string} formId - Form ID to determine which entry's availability sheet to update.
  */
-function updateSheetRowForDate(dateText, left) {
+function updateSheetRowForDate(dateText, left, formId) {
   logTS('updateSheetRowForDate:start');
+  
+  if (!formId) {
+    logTS('updateSheetRowForDate: No formId provided, updating all availability sheets');
+    // Update all availability sheets if no specific form ID
+    FORM_REGISTRY.forEach(entry => {
+      updateSheetRowForEntry(dateText, left, entry);
+    });
+    return;
+  }
+  
   try {
-    const sheet = getOrCreateSheet_('Availability');
-    const lastRow = sheet.getLastRow();
-    if (lastRow < 2) {
-      logTS('updateSheetRowForDate: No data rows found');
+    const entry = FORM_REGISTRY.find(e => e.formId === formId);
+    if (!entry) {
+      logTS(`updateSheetRowForDate: Form ID ${formId} not found in registry`);
       return;
     }
-    const lastColumn = sheet.getLastColumn();
-    const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
-    const dateIdx = headers.indexOf('Date') + 1;
-    const bookedIdx = headers.indexOf('Booked') + 1;
-    const leftIdx = headers.indexOf('Slots Left') + 1;
-    if (dateIdx === 0 || bookedIdx === 0 || leftIdx === 0) {
-      logTS('updateSheetRowForDate: Required headers not found');
+    
+    updateSheetRowForEntry(dateText, left, entry);
+  } catch (err) {
+    logTS('Error in updateSheetRowForDate: ' + err);
+    throw err;
+  }
+  logTS('updateSheetRowForDate:end');
+}
+
+/**
+ * Updates a single row in the availability sheet for a specific entry.
+ * @param {string} dateText - Date string yyyy-MM-dd.
+ * @param {number} left - Slots left.
+ * @param {Object} entry - Registry entry.
+ */
+function updateSheetRowForEntry(dateText, left, entry) {
+  try {
+    const ss = getSpreadsheetForEntry(entry);
+    const sheet = getOrCreateSheetInSpreadsheet(ss, entry.availabilitySheetName);
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) {
+      logTS(`updateSheetRowForEntry: No data rows found in ${entry.availabilitySheetName}`);
+      return;
+    }
+    
+    // Use dynamic column detection instead of hardcoded header lookup
+    let dateIdx, bookedIdx, leftIdx;
+    try {
+      dateIdx = detectColumnIndex_(sheet, 'Date');
+      bookedIdx = detectColumnIndex_(sheet, 'Booked');
+      leftIdx = detectColumnIndex_(sheet, 'Slots Left');
+    } catch (e) {
+      logTS(`updateSheetRowForEntry: Missing required headers in ${entry.availabilitySheetName}: ${e}`);
       return;
     }
     const data = sheet.getRange(2, dateIdx, lastRow - 1, 1).getValues();
@@ -1179,43 +1776,65 @@ function updateSheetRowForDate(dateText, left) {
       }
     }
     sheet.sort({column: dateIdx, ascending: true});
-  } catch (err) {
-    logTS('Error in updateSheetRowForDate: ' + err);
-    throw err;
+    logTS(`Updated row for ${dateText} in ${entry.availabilitySheetName}`);
+  } catch (e) {
+    logTS(`Error updating sheet row for entry ${entry.availabilitySheetName}: ${e}`);
   }
-  logTS('updateSheetRowForDate:end');
 }
 
+
 /**
- * Retrieves or creates a sheet by name.
- * @param {string} name - Sheet name.
- * @return {Sheet} The sheet object.
+ * Detects the 1-based column index for a given header name in a sheet.
+ * @param {Sheet} sheet - The sheet to search in.
+ * @param {string} headerName - The header name to find.
+ * @return {number} 1-based column index, or 0 if not found.
+ * @throws {Error} If header is not found.
  */
-function getOrCreateSheet_(name) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sh = ss.getSheetByName(name);
-  if (!sh) sh = ss.insertSheet(name);
-  return sh;
+function detectColumnIndex_(sheet, headerName) {
+  try {
+    const lastColumn = sheet.getLastColumn();
+    if (lastColumn === 0) {
+      throw new Error(`Sheet "${sheet.getName()}" has no columns`);
+    }
+    
+    const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+    const index = headers.indexOf(headerName);
+    
+    if (index === -1) {
+      throw new Error(`Header "${headerName}" not found in sheet "${sheet.getName()}"`);
+    }
+    
+    return index + 1; // Convert to 1-based index
+  } catch (e) {
+    logTS(`detectColumnIndex_ error for "${headerName}" in sheet "${sheet.getName()}": ${e}`);
+    throw e;
+  }
 }
 
 /**
  * Applies color-coding to availability sheet rows.
  * Red background if no slots left, green if slots available.
- * @private
+ * @param {Sheet} sheet - The sheet to apply color coding to.
  */
-function colorCodeAvailabilitySheet_() {
-  logTS('colorCodeAvailabilitySheet_:start');
-  const sheet = getOrCreateSheet_('Availability');
+function colorCodeAvailabilitySheet(sheet) {
+  logTS('colorCodeAvailabilitySheet:start');
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) {
-    logTS('colorCodeAvailabilitySheet_: No data rows to color');
+    logTS('colorCodeAvailabilitySheet: No data rows to color');
     return;
   }
   const lastCol = sheet.getLastColumn();
   const dataRows = lastRow - 1; // Exclude header row
   
-  // Get all "Slots Left" values at once
-  const slotsLeftValues = sheet.getRange(2, AVAIL_LEFT_COL, dataRows, 1).getValues();
+  // Get all "Slots Left" values at once using dynamic column detection
+  let slotsLeftColIdx;
+  try {
+    slotsLeftColIdx = detectColumnIndex_(sheet, 'Slots Left');
+  } catch (e) {
+    logTS(`colorCodeAvailabilitySheet: Missing 'Slots Left' column: ${e}`);
+    return;
+  }
+  const slotsLeftValues = sheet.getRange(2, slotsLeftColIdx, dataRows, 1).getValues();
   
   // Build 2D color matrix
   const colorsMatrix = [];
@@ -1229,8 +1848,9 @@ function colorCodeAvailabilitySheet_() {
   
   // Apply all background colors in a single batch operation
   sheet.getRange(2, 1, dataRows, lastCol).setBackgrounds(colorsMatrix);
-  logTS('colorCodeAvailabilitySheet_:end');
+  logTS('colorCodeAvailabilitySheet:end');
 }
+
 
 // Optional test stubs for pure utility functions
 function test_safeParseDate_valid() {
@@ -1472,14 +2092,23 @@ function test_holidaysExcluded() {
 function test_holidayGuardOnSubmit() {
   // Simulate a form submission on a holiday and expect early return with no booking or summary event
   const holidayDate = '2025-12-25';
-  const e = { values: [] };
-  // populate minimal values for indices
-  for (let i = 0; i <= DATE_IDX; i++) e.values[i] = '';
-  e.values[LAST_NAME_IDX] = 'LN';
-  e.values[FIRST_NAME_IDX] = 'FN';
-  e.values[PUROK_IDX] = 'P';
-  e.values[BARANGAY_IDX] = 'B';
-  e.values[DATE_IDX] = holidayDate + ' placeholder';
+  
+  // Create proper namedValues structure and mock source
+  const e = {
+    namedValues: {
+      'Last Name': ['TestLastName'],
+      'First Name': ['TestFirstName'],
+      'Purok': ['TestPurok'],
+      'Barangay': ['TestBarangay'],
+      'Date of Appointment': [holidayDate + ' Mon (20 slots left)']
+    },
+    source: {
+      getId: function() {
+        return FORM_REGISTRY[0].formId; // Use first form in registry
+      }
+    }
+  };
+  
   let rejected = false;
   const originalLogTS = logTS;
   logTS = function(msg) {
@@ -1487,8 +2116,10 @@ function test_holidayGuardOnSubmit() {
       rejected = true;
     }
   };
+  
   onFormSubmit(e);
   logTS = originalLogTS;
+  
   if (!rejected) {
     throw new Error('onFormSubmit did not reject booking on holiday');
   }
@@ -1568,6 +2199,90 @@ function test_removeHolidaySummaries() {
   }
 }
 
+function test_colorMappingNormalization() {
+  // Test that all appointment events use the default available color
+  const testColor = EVENT_COLOR_AVAILABLE;
+  if (!Object.values(CalendarApp.EventColor).includes(testColor)) {
+    throw new Error('Invalid default color: ' + testColor);
+  }
+  logTS('test_colorMappingNormalization: verified default color is valid');
+}
+
+function test_updateAvailabilityThisDateOnly() {
+  // Test that updateAvailability_thisdateonly performs targeted updates for a single date
+  const testDate = '2025-01-15';
+  const testFormId = FORM_REGISTRY[0].formId;
+  
+  // Setup: ensure test date has available slots
+  try {
+    const li = getAppointmentListItem_(testFormId);
+    const testChoice = `${testDate} Wed (5 slots left)`;
+    li.setChoiceValues([testChoice]);
+  } catch (e) {
+    logTS('test_updateAvailabilityThisDateOnly: setup failed: ' + e);
+    return;
+  }
+  
+  // Record initial state
+  const initialChoices = getAppointmentListItem_(testFormId).getChoices().map(c => c.getValue());
+  const initialSlots = initialChoices.find(c => c.startsWith(testDate));
+  const initialSlotsMatch = initialSlots ? initialSlots.match(/\((\d+)\s+slots?\s+left\)/) : null;
+  const initialSlotsLeft = initialSlotsMatch ? parseInt(initialSlotsMatch[1], 10) : 0;
+  
+  if (initialSlotsLeft === 0) {
+    logTS('test_updateAvailabilityThisDateOnly: test date has no slots, skipping');
+    return;
+  }
+  
+  // Call the function
+  updateAvailability_thisdateonly(testDate, testFormId);
+  
+  // Verify slot decrement in dropdown
+  const updatedChoices = getAppointmentListItem_(testFormId).getChoices().map(c => c.getValue());
+  const updatedSlots = updatedChoices.find(c => c.startsWith(testDate));
+  
+  if (initialSlotsLeft > 1) {
+    // Should still have choices but with decremented count
+    if (!updatedSlots) {
+      throw new Error('test_updateAvailabilityThisDateOnly: choice disappeared when slots should remain');
+    }
+    const updatedSlotsMatch = updatedSlots.match(/\((\d+)\s+slots?\s+left\)/);
+    const updatedSlotsLeft = updatedSlotsMatch ? parseInt(updatedSlotsMatch[1], 10) : 0;
+    if (updatedSlotsLeft !== initialSlotsLeft - 1) {
+      throw new Error(`test_updateAvailabilityThisDateOnly: expected ${initialSlotsLeft - 1} slots, got ${updatedSlotsLeft}`);
+    }
+  } else {
+    // Should remove choice when fully booked
+    if (updatedSlots) {
+      throw new Error('test_updateAvailabilityThisDateOnly: choice should be removed when fully booked');
+    }
+  }
+  
+  // Verify summary event was updated
+  const [y, m, d] = testDate.split('-').map(Number);
+  const dayDate = new Date(y, m - 1, d);
+  const summaries = CAL.getEventsForDay(dayDate)
+    .filter(ev => ev.getDescription().indexOf(FULL_SUMMARY_TAG) === 0);
+  
+  if (summaries.length !== 1) {
+    throw new Error(`test_updateAvailabilityThisDateOnly: expected 1 summary event, found ${summaries.length}`);
+  }
+  
+  const expectedSlotsLeft = Math.max(0, initialSlotsLeft - 1);
+  const summaryTitle = summaries[0].getTitle();
+  if (expectedSlotsLeft > 0) {
+    if (!summaryTitle.includes(`${expectedSlotsLeft} Slots left`)) {
+      throw new Error(`test_updateAvailabilityThisDateOnly: summary title incorrect: ${summaryTitle}`);
+    }
+  } else {
+    if (!summaryTitle.includes('Fully booked')) {
+      throw new Error(`test_updateAvailabilityThisDateOnly: summary should show fully booked: ${summaryTitle}`);
+    }
+  }
+  
+  logTS('test_updateAvailabilityThisDateOnly: verified targeted date-only updates work correctly');
+}
+
 /**
  * Runs all test functions and logs results.
  */
@@ -1588,7 +2303,9 @@ function runTests() {
     { name: 'test_HolidayService_calendarFallback', fn: test_HolidayService_calendarFallback },
     { name: 'test_HolidayService_manualRules', fn: test_HolidayService_manualRules },
     { name: 'test_DateUtils_buildAndFormat', fn: test_DateUtils_buildAndFormat },
-    { name: 'test_HolidayService_cacheKeys', fn: test_HolidayService_cacheKeys }
+    { name: 'test_HolidayService_cacheKeys', fn: test_HolidayService_cacheKeys },
+    { name: 'test_colorMappingNormalization', fn: test_colorMappingNormalization },
+    { name: 'test_updateAvailabilityThisDateOnly', fn: test_updateAvailabilityThisDateOnly }
   ];
   
   testFunctions.forEach(test => {
@@ -1630,12 +2347,57 @@ function ensureTestTriggerExists() {
 }
 
 /**
+ * Ensures time-based triggers exist for sync functions.
+ * Creates daily trigger for updateAvailability_everywhere and hourly trigger for checkCalendarIntegrity.
+ */
+function ensureSyncTriggersExists() {
+  try {
+    const triggers = ScriptApp.getProjectTriggers();
+    
+    // Check for existing updateAvailability_everywhere trigger
+    const existingDailySync = triggers.find(trigger => 
+      trigger.getHandlerFunction() === 'updateAvailability_everywhere' &&
+      trigger.getEventType() === ScriptApp.EventType.CLOCK
+    );
+    
+    if (!existingDailySync) {
+      ScriptApp.newTrigger('updateAvailability_everywhere')
+        .timeBased()
+        .everyDays(1)
+        .create();
+      logTS('Created daily trigger for updateAvailability_everywhere');
+    } else {
+      logTS('Daily trigger for updateAvailability_everywhere already exists');
+    }
+    
+    // Check for existing checkCalendarIntegrity trigger
+    const existingHourlyIntegrity = triggers.find(trigger => 
+      trigger.getHandlerFunction() === 'checkCalendarIntegrity' &&
+      trigger.getEventType() === ScriptApp.EventType.CLOCK
+    );
+    
+    if (!existingHourlyIntegrity) {
+      ScriptApp.newTrigger('checkCalendarIntegrity')
+        .timeBased()
+        .everyHours(1)
+        .create();
+      logTS('Created hourly trigger for checkCalendarIntegrity');
+    } else {
+      logTS('Hourly trigger for checkCalendarIntegrity already exists');
+    }
+  } catch (e) {
+    logTS('Error in ensureSyncTriggersExists: ' + e);
+  }
+}
+
+/**
  * Install hook to set up triggers when the script is installed.
  * @param {Object} e - Install event object.
  */
 function onInstall(e) {
-  HolidayService.initHolidayCalendar();
+  runSetup();
   ensureTestTriggerExists();
+  ensureSyncTriggersExists();
 }
 
 /**
@@ -1643,6 +2405,7 @@ function onInstall(e) {
  * @param {Object} e - Open event object.
  */
 function onOpen(e) {
-  HolidayService.initHolidayCalendar();
+  runSetup();
   ensureTestTriggerExists();
+  ensureSyncTriggersExists();
 }

@@ -842,6 +842,32 @@
     <link rel="shortlink" href="index.html" />
      <meta name="generator" content="Elementor 3.28.1; features: additional_custom_breakpoints, e_local_google_fonts; settings: css_print_method-external, google_font-enabled, font_display-auto" />
     <link rel="stylesheet" href="menu.css" type="text/css" media="all">
+    <style>
+      #loadingOverlay { 
+        position: fixed; 
+        top: 0; 
+        left: 0; 
+        width: 100%; 
+        height: 100%; 
+        background: rgba(0,0,0,0.5); 
+        display: flex; 
+        align-items: center; 
+        justify-content: center; 
+        flex-direction: column; 
+        opacity: 0; 
+        pointer-events: none; 
+        transition: opacity 0.2s ease; 
+        z-index: 9999;
+      }
+      #loadingOverlay.visible { 
+        opacity: 1; 
+        pointer-events: all; 
+      }
+      @keyframes spin { 
+        from { transform: rotate(0deg); } 
+        to { transform: rotate(360deg); } 
+      }
+    </style>
   </head>
   <body class="home page-template page-template-elementor_header_footer page page-id-250 current_page_item no-js jet-desktop-menu-active elementor-default elementor-template-full-width elementor-kit-3750 elementor-page elementor-page-250 jupiterx-header-fixed jupiterx-header-overlapped jupiterx-header-overlapped-tablet jupiterx-header-overlapped-mobile main-page" itemscope="itemscope" itemtype="http://schema.org/WebPage">
     <div class="jupiterx-site">
@@ -1338,12 +1364,12 @@
 
 
                                                         <!-- wrap for responsiveness -->
-                                                        <div style="max-width: 800px; margin: 0 auto; padding: 1rem;">
+ <!--                                                       <div style="max-width: 800px; margin: 0 auto; padding: 1rem;">
                                                           <iframe
                                                             id="calendarIframe"
-                                                            src="https://calendar.google.com/calendar/embed?height=600&wkst=1&ctz=Asia%2FManila&showPrint=0&showTitle=0&src=c29nb2R3YXRlcndvcmtzMjAyNUBnbWFpbC5jb20&src=ZW4ucGhpbGlwcGluZXMjaG9saWRheUBncm91cC52LmNhbGVuZGFyLmdvb2dsZS5jb20&color=%23039be5&color=%23039be5"
+                                                            src="https://calendar.google.com/calendar/embed?src=sogodwaterworks2025%40gmail.com&ctz=Asia%2FManila"
                                                             width="100%"
-                                                            height="800"
+                                                            height="1100"
                                                             frameborder="0"
                                                             marginheight="0"
                                                             marginwidth="0"
@@ -1352,7 +1378,7 @@
                                                           </iframe>
                                                         </div>
 
- <!--                                                       <script>
+                                                        <script>
                                                           // every 10 seconds, reset the iframe src to itself
                                                           const calIframe = document.getElementById('calendarIframe');
                                                           setInterval(() => {
@@ -1367,156 +1393,100 @@
 
 
                                                         <!-- wrap for responsiveness -->
- <!--                                                       <div style="max-width: 800px; margin: 0 auto; padding: 1rem;">
-                                                          <iframe
-                                                            id="myGoogleForm" 
-                                                            src="https://docs.google.com/forms/d/e/1FAIpQLScO5tMXW546nmElzrAlrMU_L3g219xtNl_9f2ZqvW9ofNurWg/viewform?embedded=true"
-                                                            width="100%"
-                                                            height="1080"
-                                                            frameborder="0"
-                                                            marginheight="0"
-                                                            marginwidth="0"
-                                                            scrolling="no"
-                                                          >
-                                                            Loading…
-                                                          </iframe>
-                                                        </div>
+<!-- Your Google Form iframe -->
+<iframe
+  id="myGoogleForm"
+  src="https://docs.google.com/forms/d/e/1FAIpQLSfGpOLIiVOh85JJr7ni2XLbTMYlZbI3jtZfBLTiSDl5G3K3tQ/viewform?embedded=true"
+  width="100%"
+  height="1480"
+  frameborder="0"
+  marginheight="0"
+  marginwidth="0"
+  scrolling="no">
+  Loading…
+</iframe>
 
-                                                      -->
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<!-- 
-To resize the dialog box, adjust the scale by dividing or multiplying all size-related properties (padding, font-size, width, etc.) accordingly.
-
-For example:
-- To make it x2 size, multiply every `px` value by 2.
-- To make it x0.5 size, divide every `px` value by 2.
-- Current size is reduced by x1.5, so all values below have been divided by 1.5.
-
-You can automate this by using a CSS preprocessor or manually adjusting each value.
--->
-
-<div id="welcome-dialog" style="
-  display: none;
-  position: fixed;
-  top: 10%;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 63.33%;
-  max-width: 666.67px;
-  background: white;
-  border-radius: 16px;
-  padding: 40px 33.33px;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
-  font-family: 'Segoe UI', sans-serif;
-  animation: fadeIn 0.2s ease-out;
-  z-index: 9999;
-">
-  <h2 id="welcome-title" style="font-size: 32px; margin-bottom: 20px; color: #222;"></h2>
-  <p id="welcome-body" style="font-size: 24px; line-height: 1.8; color: #444;"></p>
-  <div style="margin-top: 26.67px; text-align: right;">
-    <button id="welcome-ok" style="
-      background-color: #4CAF50;
-      color: white;
-      padding: 13.33px 24px;
-      border: none;
-      border-radius: 6.67px;
-      font-size: 18.67px;
-      cursor: pointer;
-    ">Okay</button>
-<!--    <button id="welcome-close" style="
-      margin-left: 13.33px;
-      background-color: #f44336;
-      color: white;
-      padding: 13.33px 24px;
-      border: none;
-      border-radius: 6.67px;
-      font-size: 18.67px;
-      cursor: pointer;
-    ">Close</button>    -->
-  </div>
+<!-- Loading Overlay -->
+<div id="loadingOverlay">
+  <div style="
+    width: 50px; height: 50px;
+    border: 5px solid #f3f3f3;
+    border-top: 5px solid #3498db;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+  "></div>
+  <p style="color: white; margin-top: 1rem; font-size: 1.2rem;">
+    Booking your appointment! Please wait.
+  </p>
 </div>
 
+<!-- Overlay CSS -->
+<style>
+  #loadingOverlay {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    background: rgba(0,0,0,0.5);
+    display: flex; align-items: center; justify-content: center; flex-direction: column;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+    z-index: 9999;
+  }
+  #loadingOverlay.visible {
+    opacity: 1;
+    pointer-events: all;
+  }
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+  }
+</style>
 
-
-
-
+<!-- Script to toggle overlay only on form submit -->
 <script>
-  const sheetURL = 'https://script.google.com/macros/s/AKfycby4pAKdOaXuBIkMxZ1dAniULmIzOKX9p6U-amfdKxYTfOX_j7oGGjc4YBHmiBIjCnpG2Q/exec'; // your web app URL
+  document.addEventListener('DOMContentLoaded', function() {
+    const overlay = document.getElementById('loadingOverlay');
+    const iframe  = document.getElementById('myGoogleForm');
+    let initialLoad = true;
 
-  let messageQueue = [], currentIndex = 0;
-
-  function showNextMessage() {
-    if (currentIndex >= messageQueue.length) return;
-
-    const msg = messageQueue[currentIndex];
-    const dialog = document.getElementById('welcome-dialog');
-
-    // Fill content
-    document.getElementById('welcome-title').textContent = msg.title;
-    document.getElementById('welcome-body').textContent = msg.body;
-    document.getElementById('welcome-ok').textContent = msg.button;
-
-    // Show dialog with fade-in animation
-    dialog.style.display = 'block';
-    dialog.style.animation = 'fadeIn 0.5s ease';
-
-    // Auto-dismiss after 80 seconds
-    setTimeout(closeDialog, 80000);
-  }
-
-  function closeDialog() {
-    const dialog = document.getElementById('welcome-dialog');
-    dialog.style.display = 'none';
-    dialog.style.animation = ''; // Reset animation for next time
-    currentIndex++;
-    setTimeout(showNextMessage, 300);
-  }
-
-  // Button listeners
-  document.getElementById('welcome-ok').onclick = closeDialog;
-  //document.getElementById('welcome-close').onclick = closeDialog;
-
-  // Fetch welcome messages from Google Apps Script
-  document.addEventListener('DOMContentLoaded', function () {
-    fetch(sheetURL)
-      .then(response => response.json())
-      .then(data => {
-        if (Array.isArray(data) && data.length > 0) {
-          messageQueue = data;
-          showNextMessage();
-        }
-      })
-      .catch(err => {
-        console.error('Failed to load welcome messages:', err);
-      });
+    iframe.addEventListener('load', function() {
+      if (initialLoad) {
+        initialLoad = false;  // Skip the initial load of the form
+        return;
+      }
+      // On second load (after submission):
+      overlay.classList.add('visible');
+      // Give overlay a moment to appear, then redirect
+      setTimeout(() => {
+        window.location.href = 'index.html';
+      }, 10000); // Adjust time as needed
+    });
   });
-
-  // Inject fadeIn animation keyframes early
-  const style = document.createElement('style');
-  style.textContent = `
-    @keyframes fadeIn {
-      from { opacity: 0; transform: translateY(-10px); }
-      to { opacity: 1; transform: translateY(0); }
-    }
-  `;
-  document.head.appendChild(style);
 </script>
 
 
+
+
+                      <!-- Main Content Should be Placed Here -->
+                                             <!-- Main Content Should be Placed Here -->
+                                                                    <!-- Main Content Should be Placed Here -->
+                                                                                           <!-- Main Content Should be Placed Here -->
+
+
+
+
+
+
+
+
+
+
+
+                      <!-- Main Content Should be Placed Here -->
+                                             <!-- Main Content Should be Placed Here -->
+                                                                    <!-- Main Content Should be Placed Here -->
+                                                                                           <!-- Main Content Should be Placed Here -->
 
 
 
@@ -1526,292 +1496,18 @@ You can automate this by using a CSS preprocessor or manually adjusting each val
 
 
 
-
-
-                          <div class="container" style="display: flex; justify-content: center; align-items: center; width: 100%; margin-top: 10px;">
-                            <a href="form.html" style="
-                              display: inline-block;
-                              background-color: #4CAF50;
-                              color: white;
-                              text-decoration: none;
-                              padding: 18px 18px;
-                              border-radius: 12px;
-                              font-size: 24px;
-                              font-family: 'Segoe UI', sans-serif;
-                              font-weight: bold;
-                              text-align: center;
-                              box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-                              transition: background-color 0.3s ease;
-                            " 
-                            onmouseover="this.style.backgroundColor='#45a049'" 
-                            onmouseout="this.style.backgroundColor='#4CAF50'">
-                              BOOK AN APPOINTMENT
-                            </a>
-                          </div>
-
-
-
-                          <div class="container" style="display: flex; justify-content: center; align-items: center; width: 100%; margin-top: 10px;">
-                            <a href="connection.html" style="
-                              display: inline-block;
-                              background-color: #4CAF50;
-                              color: white;
-                              text-decoration: none;
-                              padding: 16px 16px;
-                              border-radius: 12px;
-                              font-size: 24px;
-                              font-family: 'Segoe UI', sans-serif;
-                              font-weight: bold;
-                              text-align: center;
-                              box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-                              transition: background-color 0.3s ease;
-                            " 
-                            onmouseover="this.style.backgroundColor='#45a049'" 
-                            onmouseout="this.style.backgroundColor='#4CAF50'">
-                              BOOK AN APPOINTMENT FOR CONNECTION
-                            </a>
-                          </div>
-
-
-
-
-
-                          <div class="container" style="display: flex; justify-content: center; align-items: center; width: 100%; margin-top: 10px;">
-                            <a href="connection.html" style="
-                              display: inline-block;
-                              background-color: #4CAF50;
-                              color: white;
-                              text-decoration: none;
-                              padding: 18px 36px;
-                              border-radius: 12px;
-                              font-size: 24px;
-                              font-family: 'Segoe UI', sans-serif;
-                              font-weight: bold;
-                              text-align: center;
-                              box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-                              transition: background-color 0.3s ease;
-                            " 
-                            onmouseover="this.style.backgroundColor='#45a049'" 
-                            onmouseout="this.style.backgroundColor='#4CAF50'">
-                              BOOK AN APPOINTMENT FOR DISCONNECTION
-                            </a>
-                          </div>
-
-
-
-
-
-
-                          <div class="container" style="display: flex; justify-content: center; align-items: center; width: 100%; margin-top: 10px;">
-                            <a href="reconnection.html" style="
-                              display: inline-block;
-                              background-color: #4CAF50;
-                              color: white;
-                              text-decoration: none;
-                              padding: 18px 36px;
-                              border-radius: 12px;
-                              font-size: 24px;
-                              font-family: 'Segoe UI', sans-serif;
-                              font-weight: bold;
-                              text-align: center;
-                              box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-                              transition: background-color 0.3s ease;
-                            " 
-                            onmouseover="this.style.backgroundColor='#45a049'" 
-                            onmouseout="this.style.backgroundColor='#4CAF50'">
-                              BOOK AN APPOINTMENT FOR RECONNECTION
-                            </a>
-                          </div>
-
-
-
-
-
-
-
-
-                          <div class="container" style="display: flex; justify-content: center; align-items: center; width: 100%; margin-top: 10px;">
-                            <a href="repairandmaintenance.html" style="
-                              display: inline-block;
-                              background-color: #4CAF50;
-                              color: white;
-                              text-decoration: none;
-                              padding: 18px 36px;
-                              border-radius: 12px;
-                              font-size: 24px;
-                              font-family: 'Segoe UI', sans-serif;
-                              font-weight: bold;
-                              text-align: center;
-                              box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-                              transition: background-color 0.3s ease;
-                            " 
-                            onmouseover="this.style.backgroundColor='#45a049'" 
-                            onmouseout="this.style.backgroundColor='#4CAF50'">
-                              BOOK AN APPOINTMENT FOR REPAIR AND MAINTENANCE
-                            </a>
-                          </div>
-
-
-
-
-
-
-
-
-
-                          <div class="container" style="display: flex; justify-content: center; align-items: center; width: 100%; margin-top: 10px;">
-                            <a href="otherconcerns.html" style="
-                              display: inline-block;
-                              background-color: #4CAF50;
-                              color: white;
-                              text-decoration: none;
-                              padding: 18px 36px;
-                              border-radius: 12px;
-                              font-size: 24px;
-                              font-family: 'Segoe UI', sans-serif;
-                              font-weight: bold;
-                              text-align: center;
-                              box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-                              transition: background-color 0.3s ease;
-                            " 
-                            onmouseover="this.style.backgroundColor='#45a049'" 
-                            onmouseout="this.style.backgroundColor='#4CAF50'">
-                              BOOK AN APPOINTMENT FOR OTHER CONCERNS
-                            </a>
-                          </div>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<!--
+ 
                               <div class="container grid-layout">
                                 <div class="text-content">
                                   <div class="learn-more-container">
-                                    <a class="elementor-button elementor-button-link elementor-size-sm" href="form.html" style="font-size: 20px; padding: 14px 28px;">
+                                    <a class="elementor-button elementor-button-link elementor-size-sm" href="index.html" style="font-size: 20px; padding: 14px 28px;">
                                       <span class="elementor-button-content-wrapper">
-                                        <span class="elementor-button-text" style="font-size: 25px;">BOOK AN APPOINTMENT</span>
+                                        <span class="elementor-button-text" style="font-size: 25px;">GO BACK TO BOOKING CALENDAR</span>
                                       </span>
                                     </a>
                                   </div>
                                 </div>
                               </div>
-
-
-
-
-
-
-
-
-                              <div class="container grid-layout">
-                                <div class="text-content">
-                                  <div class="learn-more-container">
-                                    <a class="elementor-button elementor-button-link elementor-size-sm" href="connection.html" style="font-size: 20px; padding: 14px 28px;">
-                                      <span class="elementor-button-content-wrapper">
-                                        <span class="elementor-button-text" style="font-size: 25px;">BOOK AN APPOINTMENT FOR CONNECTION</span>
-                                      </span>
-                                    </a>
-                                  </div>
-                                </div>
-                              </div>
-
-
-
-
-                              <div class="container grid-layout">
-                                <div class="text-content">
-                                  <div class="learn-more-container">
-                                    <a class="elementor-button elementor-button-link elementor-size-sm" href="disconnection.html" style="font-size: 20px; padding: 14px 28px;">
-                                      <span class="elementor-button-content-wrapper">
-                                        <span class="elementor-button-text" style="font-size: 25px;">BOOK AN APPOINTMENT FOR DISCONNECTION</span>
-                                      </span>
-                                    </a>
-                                  </div>
-                                </div>
-                              </div>
-
-
-
-                              <div class="container grid-layout">
-                                <div class="text-content">
-                                  <div class="learn-more-container">
-                                    <a class="elementor-button elementor-button-link elementor-size-sm" href="reconnection.html" style="font-size: 20px; padding: 14px 28px;">
-                                      <span class="elementor-button-content-wrapper">
-                                        <span class="elementor-button-text" style="font-size: 25px;">BOOK AN APPOINTMENT FOR RECONNECTION</span>
-                                      </span>
-                                    </a>
-                                  </div>
-                                </div>
-                              </div>
-
-
-                              <div class="container grid-layout">
-                                <div class="text-content">
-                                  <div class="learn-more-container">
-                                    <a class="elementor-button elementor-button-link elementor-size-sm" href="repairandmaintenance.html" style="font-size: 20px; padding: 14px 28px;">
-                                      <span class="elementor-button-content-wrapper">
-                                        <span class="elementor-button-text" style="font-size: 25px;">BOOK AN APPOINTMENT FOR REPAIR AND MAINTENANCE</span>
-                                      </span>
-                                    </a>
-                                  </div>
-                                </div>
-                              </div>
-
-
-
-                              <div class="container grid-layout">
-                                <div class="text-content">
-                                  <div class="learn-more-container">
-                                    <a class="elementor-button elementor-button-link elementor-size-sm" href="otherconcerns.html" style="font-size: 20px; padding: 14px 28px;">
-                                      <span class="elementor-button-content-wrapper">
-                                        <span class="elementor-button-text" style="font-size: 25px;">BOOK AN APPOINTMENT FOR OTHER CONCERNS</span>
-                                      </span>
-                                    </a>
-                                  </div>
-                                </div>
-                              </div>
-
-
-
-
-
--->
-
-
-
-
-
-
 
 
 
@@ -2205,5 +1901,23 @@ You can automate this by using a CSS preprocessor or manually adjusting each val
         });
       </script>
     </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
   </body>
 </html>

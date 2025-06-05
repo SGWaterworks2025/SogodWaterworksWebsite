@@ -1,0 +1,3044 @@
+/**
+ * Main worker: 
+ *  • Reads form responses (coercing values into Dates),
+ *  • Updates the Form’s "Date of Appointment" dropdown,
+ *  • Syncs per-day summary events on Calendar,
+ *  • Writes an Availability table into a sheet.
+ * Retention Policy: filters out form responses older than RESPONSE_RETENTION_DAYS days.
+ * Constants:
+ *  • SLOT_CAP: maximum appointments per day.
+ *  • RESPONSE_RETENTION_DAYS: days to retain form responses.
+ *  • FULL_SUMMARY_TAG: combined tag for identifying summary events.
+ *  • CACHE counts entries expire after 300 seconds (5 minutes).
+ * Testing: verify cap reached edge cases and color-coding.
+ * Holidays excluded via `HOLIDAY_CAL_ID`.
+ */
+const SCRIPT_VERSION = 'v2';
+const CACHE_KEY = SCRIPT_VERSION + '_counts';
+const SUBMIT_COUNT_KEY = SCRIPT_VERSION + '_submit_counter';
+const IS_DEV = false;
+const FORM_REGISTRY = [
+  {
+    formId: '1a7K-SKOU5n3mYlCMM7y0bUqvaO_u5LHtDDS3eLq3mhs',
+    sheetName: 'Form Responses 1',
+    spreadsheetId: '1SZqf77i655xHA1FI6YzeZ332E6M4Y_dpFmz_h1tM6xQ',
+    availabilitySheetName: 'Availability_Form1'
+  },
+  {
+    formId: '1AGsTaMbhv-aCR_B7fEJZ534jwdcHhxB4HcreOfj6Dq0',
+    sheetName: 'ForConnection',
+    spreadsheetId: '1SZqf77i655xHA1FI6YzeZ332E6M4Y_dpFmz_h1tM6xQ',
+    availabilitySheetName: 'Availability_Connection'
+  },
+  {
+    formId: '1sCsIcymP-cIJK7ziMPA_tjWph5ER62n5nscJl3qyEo4',
+    sheetName: 'ForDisconnection',
+    spreadsheetId: '1SZqf77i655xHA1FI6YzeZ332E6M4Y_dpFmz_h1tM6xQ',
+    availabilitySheetName: 'Availability_Disconnection'
+  },
+  {
+    formId: '1lfrpxChZ6K1vvO4-v--ww7nWzT5yIyXqeX2PYr5aBpg',
+    sheetName: 'ForReconnection',
+    spreadsheetId: '1SZqf77i655xHA1FI6YzeZ332E6M4Y_dpFmz_h1tM6xQ',
+    availabilitySheetName: 'Availability_Reconnection'
+  },
+  {
+    formId: '16pTBxWONNrs4jUb_EXmXKyLkglSjYT7I6S2BZaPIPu4',
+    sheetName: 'ForRepairandMaintenance',
+    spreadsheetId: '1SZqf77i655xHA1FI6YzeZ332E6M4Y_dpFmz_h1tM6xQ',
+    availabilitySheetName: 'Availability_Repair'
+  },
+  {
+    formId: '19acXAZfOnMunLOg9enl9JrSJCfzjqbqwn45_QD9vX4g',
+    sheetName: 'ForOtherConcerns',
+    spreadsheetId: '1SZqf77i655xHA1FI6YzeZ332E6M4Y_dpFmz_h1tM6xQ',
+    availabilitySheetName: 'Availability_Other'
+  }
+];
+if (!Array.isArray(FORM_REGISTRY) || FORM_REGISTRY.some(r => !r.formId || !r.spreadsheetId)) {
+  throw new Error('FORM_REGISTRY entries must all have formId and spreadsheetId');
+}
+const SLOT_CAP = 20;
+const RESPONSE_RETENTION_DAYS = 90;
+const TZ = Session.getScriptTimeZone();
+const THROTTLE_INTERVAL_MS = 60000;
+const LOCK_TIMEOUT_MS = 30000;
+const TAG_APPOINTMENT = 'Appointment:';
+const TAG_HOLIDAY = '[AUTO_HOLIDAY]';
+const CAL = CalendarApp.getDefaultCalendar();
+
+const LAST_NAME_QUESTION_TITLE = 'Last Name';
+const FIRST_NAME_QUESTION_TITLE = 'First Name';
+const PUROK_QUESTION_TITLE = 'Purok';
+const BARANGAY_QUESTION_TITLE = 'Barangay';
+const DATE_QUESTION_TITLE = 'Date of Appointment';
+
+// Mapping question titles to real form item IDs
+const FIELD_ID_MAP = {
+  [LAST_NAME_QUESTION_TITLE]: '1111111111111111111',
+  [FIRST_NAME_QUESTION_TITLE]: '2222222222222222222',
+  [PUROK_QUESTION_TITLE]: '3333333333333333333',
+  [BARANGAY_QUESTION_TITLE]: '4444444444444444444',
+  [DATE_QUESTION_TITLE]: '5555555555555555555'
+};
+
+const RESP_DATE_COL = 6; // Column F = 6th column (1-based)
+const AVAIL_BOOKED_COL = 2;
+const AVAIL_LEFT_COL = 3;
+
+const MAX_ADVANCE_DAYS = 60;
+const BUSINESS_DAYS_WINDOW = 60;
+const EMAIL_THROTTLE_MS = 24 * 60 * 60 * 1000;
+const FULL_SUMMARY_TAG = '[DAILY_SUMMARY]';
+const CHUNK_SIZE = 50;
+const CACHE = CacheService.getScriptCache();
+
+const EVENT_COLOR_AVAILABLE = CalendarApp.EventColor.GREEN;
+const EVENT_COLOR_FULL      = CalendarApp.EventColor.RED;
+const HOLIDAY_CAL_ID = 'en.philippines#holiday@group.v.calendar.google.com';
+const HOLIDAY_CACHE_KEY = SCRIPT_VERSION + '_holidays';
+const HOLIDAY_CACHE_TTL = 12 * 60 * 60;
+
+/**
+ * Service to manage creation, deletion, and validation of triggers.
+ */
+const TriggerService = {
+  listAllTriggers() {
+    return ScriptApp.getProjectTriggers();
+  },
+  removeSpreadsheetBoundFormSubmitTriggers() {
+    const triggers = ScriptApp.getProjectTriggers();
+    triggers.forEach(trigger => {
+      try {
+        if (trigger.getEventType() === ScriptApp.EventType.ON_FORM_SUBMIT &&
+            trigger.getTriggerSource() === ScriptApp.TriggerSource.SPREADSHEETS) {
+          ScriptApp.deleteTrigger(trigger);
+          logTS('TriggerService: removed spreadsheet trigger ' + trigger.getUniqueId());
+        }
+      } catch (e) {
+        logTS('TriggerService: error removing trigger: ' + e);
+        sendThrottledError('TriggerService.removeSpreadsheetBoundFormSubmitTriggers', e);
+      }
+    });
+  },
+  triggerExists({handlerFunction, eventType, source, sourceId}) {
+    return ScriptApp.getProjectTriggers().some(trigger => {
+      if (handlerFunction && trigger.getHandlerFunction() !== handlerFunction) return false;
+      if (eventType && trigger.getEventType() !== eventType) return false;
+      if (source && trigger.getTriggerSource() !== source) return false;
+      if (sourceId && trigger.getTriggerSourceId() !== sourceId) return false;
+      return true;
+    });
+  },
+  createFormSubmitTrigger(formId) {
+    try {
+      const form = FormApp.openById(formId);
+      ScriptApp.newTrigger('onFormSubmit')
+        .forForm(form)
+        .onFormSubmit()
+        .create();
+      logTS('TriggerService: created form submit trigger for ' + formId);
+    } catch (e) {
+      logTS('TriggerService: error creating form submit trigger for ' + formId + ': ' + e);
+      sendThrottledError('TriggerService.createFormSubmitTrigger-' + formId, e);
+    }
+  },
+  ensureTimeTriggers() {
+    const existing = ScriptApp.getProjectTriggers();
+    // Daily purgeOldResponsesAll at midnight
+    if (!this.triggerExists({handlerFunction: 'purgeOldResponsesAll', eventType: ScriptApp.EventType.CLOCK})) {
+      ScriptApp.newTrigger('purgeOldResponsesAll')
+        .timeBased()
+        .everyDays(1)
+        .atHour(0)
+        .create();
+      logTS('TriggerService: created daily purgeOldResponsesAll trigger');
+    }
+    // Hourly rebuildAllFormDropdowns
+    if (!this.triggerExists({handlerFunction: 'rebuildAllFormDropdowns', eventType: ScriptApp.EventType.CLOCK})) {
+      ScriptApp.newTrigger('rebuildAllFormDropdowns')
+        .timeBased()
+        .everyHours(1)
+        .create();
+      logTS('TriggerService: created hourly rebuildAllFormDropdowns trigger');
+    }
+    // 30-minute updateAvailability_everywhere
+    if (!this.triggerExists({handlerFunction: 'updateAvailability_everywhere', eventType: ScriptApp.EventType.CLOCK})) {
+      ScriptApp.newTrigger('updateAvailability_everywhere')
+        .timeBased()
+        .everyMinutes(30)
+        .create();
+      logTS('TriggerService: created 30-min updateAvailability_everywhere trigger');
+    }
+    // Remove extraneous clock triggers
+    existing.forEach(trigger => {
+      try {
+        if (trigger.getEventType() === ScriptApp.EventType.CLOCK &&
+            ['purgeOldResponsesAll', 'rebuildAllFormDropdowns', 'updateAvailability_everywhere']
+              .indexOf(trigger.getHandlerFunction()) === -1) {
+          ScriptApp.deleteTrigger(trigger);
+          logTS('TriggerService: removed extraneous clock trigger for ' + trigger.getHandlerFunction());
+        }
+      } catch (e) {
+        logTS('TriggerService: error removing extraneous trigger: ' + e);
+      }
+    });
+  }
+};
+
+/**
+ * Helper to open the correct spreadsheet for a registry entry.
+ * @param {Object} registryEntry - Registry entry with spreadsheetId.
+ * @return {Spreadsheet} Opened spreadsheet.
+ */
+function getSpreadsheet_(registryEntry) {
+  if (!registryEntry || typeof registryEntry.spreadsheetId !== 'string') {
+    sendThrottledError('getSpreadsheet_', new Error('Invalid registryEntry'));
+    throw new Error('Invalid registryEntry');
+  }
+  try {
+    return SpreadsheetApp.openById(registryEntry.spreadsheetId);
+  } catch (err) {
+    sendThrottledError('getSpreadsheet_', err);
+    throw err;
+  }
+}
+
+/**
+ * Rebuilds all appointment events by deleting existing ones and recreating from form response sheets.
+ * Ensures appointment events always mirror the current sheet data.
+ */
+function rebuildAppointmentEventsAllForms() {
+  logTS('rebuildAppointmentEventsAllForms:start');
+  
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+    logTS('rebuildAppointmentEventsAllForms: Lock busy, skipping');
+    return;
+  }
+  
+  try {
+    // 1. Compute date range for appointment events
+    const startDate = new Date();
+    const endDate = new Date(startDate.getTime() + MAX_ADVANCE_DAYS * 86400000);
+    
+    // 2. Delete all existing appointment events in the range
+    logTS('rebuildAppointmentEventsAllForms: Deleting existing appointment events');
+    try {
+      const existingEvents = CAL.getEvents(startDate, endDate);
+      const appointmentEvents = existingEvents.filter(ev => ev.getTitle().startsWith(TAG_APPOINTMENT));
+      
+      // Delete in chunks to avoid timeout
+      chunkArray(appointmentEvents, CHUNK_SIZE).forEach(chunk => {
+        try {
+          chunk.forEach(ev => ev.deleteEvent());
+          logTS(`rebuildAppointmentEventsAllForms: Deleted ${chunk.length} appointment events`);
+        } catch (e) {
+          logTS('rebuildAppointmentEventsAllForms: Error deleting chunk: ' + e);
+          sendThrottledError('rebuildAppointmentEventsAllForms-deleteChunk', e);
+        }
+      });
+      
+      logTS(`rebuildAppointmentEventsAllForms: Deleted total of ${appointmentEvents.length} appointment events`);
+    } catch (e) {
+      logTS('rebuildAppointmentEventsAllForms: Error fetching/deleting events: ' + e);
+      sendThrottledError('rebuildAppointmentEventsAllForms-deleteEvents', e);
+    }
+    
+    // 3. Recreate appointment events from all form response sheets
+    logTS('rebuildAppointmentEventsAllForms: Recreating appointment events from response sheets');
+    
+    FORM_REGISTRY.forEach(entry => {
+      try {
+        logTS(`rebuildAppointmentEventsAllForms: Processing ${entry.sheetName}`);
+        
+        // Open the response sheet
+        const sheet = getSpreadsheet_(entry).getSheetByName(entry.sheetName);
+        if (!sheet) {
+          logTS(`rebuildAppointmentEventsAllForms: Sheet not found: ${entry.sheetName}`);
+          return;
+        }
+        
+        const lastRow = sheet.getLastRow();
+        if (lastRow <= 1) {
+          logTS(`rebuildAppointmentEventsAllForms: No data rows in ${entry.sheetName}`);
+          return;
+        }
+        
+        // Read all response data from row 2 onward
+        const responseData = sheet.getRange(2, 2, lastRow - 1, 5).getValues();
+        let eventsCreated = 0;
+        
+        responseData.forEach((row, index) => {
+          try {
+            const [lastName, firstName, purok, barangay, dateChoice] = row;
+            
+            // Skip rows with missing or invalid data
+            if (!dateChoice || typeof dateChoice !== 'string') {
+              return;
+            }
+            
+            // Extract date from dateChoice (format: "yyyy-MM-dd Day (X slots left)")
+            const dateMatch = dateChoice.match(/^(\d{4}-\d{2}-\d{2})/);
+            if (!dateMatch) {
+              return;
+            }
+            
+            const dateString = dateMatch[1];
+            const appointmentDate = DateUtils.parseDate(dateString);
+            if (!appointmentDate) {
+              return;
+            }
+            
+            // Skip dates outside our range
+            if (appointmentDate < startDate || appointmentDate > endDate) {
+              return;
+            }
+            
+            // Skip holidays
+            if (HolidayService.isHoliday(dateString)) {
+              return;
+            }
+            
+            // Create appointment event
+            createCalendarEventFromResponse_(
+              { lastName, firstName, purok, barangay },
+              entry,
+              appointmentDate
+            );
+            
+            eventsCreated++;
+            
+          } catch (rowErr) {
+            logTS(`rebuildAppointmentEventsAllForms: Error processing row ${index + 2} in ${entry.sheetName}: ${rowErr}`);
+            sendThrottledError(`rebuildAppointmentEventsAllForms-processRow-${entry.sheetName}`, rowErr);
+          }
+        });
+        
+        logTS(`rebuildAppointmentEventsAllForms: Created ${eventsCreated} events for ${entry.sheetName}`);
+        
+      } catch (entryErr) {
+        logTS(`rebuildAppointmentEventsAllForms: Error processing ${entry.sheetName}: ${entryErr}`);
+        sendThrottledError(`rebuildAppointmentEventsAllForms-processEntry-${entry.sheetName}`, entryErr);
+      }
+    });
+    
+    logTS('rebuildAppointmentEventsAllForms:end');
+    
+  } catch (err) {
+    logTS('rebuildAppointmentEventsAllForms: Error: ' + err);
+    sendThrottledError('rebuildAppointmentEventsAllForms', err);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Retrieves the registry entry for a given form ID or spreadsheet ID.
+ * @param {string} formId - The form ID or spreadsheet ID to look up.
+ * @return {Object} Registry entry {formId, sheetName, availabilitySheetName}.
+ * @throws {Error} If form not found in registry.
+ */
+function getRegistryEntry_(formId) {
+  if (!formId || typeof formId !== 'string') {
+    throw new Error('Invalid formId');
+  }
+  let registryEntry = FORM_REGISTRY.find(f => f.formId === formId);
+  if (!registryEntry) {
+    registryEntry = FORM_REGISTRY.find(f => f.spreadsheetId === formId);
+  }
+  if (!registryEntry) {
+    throw new Error('Form not found in registry: ' + formId);
+  }
+  return registryEntry;
+}
+
+// Module-level throttle state
+const propsEmail = PropertiesService.getScriptProperties();
+
+// Module-level cache for form list item
+let cachedListItem = null;
+let cachedCounts = null;
+
+/**
+ * Centralized holiday service with fallback mechanisms
+ */
+const HolidayService = {
+  _holidayCalendar: null,
+  _initialized: false,
+  _calendarAvailable: false,
+  _manualHolidays: [
+    { month: 1, day: 1, name: "New Year's Day" },       // New Year's Day
+    { month: 4, day: 9, name: 'Araw ng Kagitingan' },   // Araw ng Kagitingan
+    { month: 5, day: 1, name: 'Labor Day' },             // Labor Day
+    { month: 6, day: 12, name: 'Independence Day' },    // Independence Day
+    { month: 8, day: 21, name: 'Ninoy Aquino Day' },    // Ninoy Aquino Day
+    { month: 11, day: 1, name: "All Saints' Day" },      // All Saints' Day
+    { month: 11, day: 2, name: "All Souls' Day" },      // All Souls' Day
+    { month: 11, day: 30, name: 'Bonifacio Day' },      // Bonifacio Day
+    { month: 12, day: 8, name: 'Feast of the Immaculate Conception' },  // Feast of the Immaculate Conception
+    { month: 12, day: 25, name: 'Christmas Day' },      // Christmas Day
+    { month: 12, day: 30, name: 'Rizal Day' },          // Rizal Day
+    { month: 12, day: 31, name: "New Year's Eve" }      // New Year's Eve
+  ],
+
+  /**
+   * Calculate National Heroes Day (last Monday of August)
+   * @param {number} year - The year to calculate for
+   * @return {Date} The National Heroes Day date
+   */
+  getNationalHeroesDay(year) {
+    // Start from August 31 and work backwards to find the last Monday
+    let date = new Date(year, 7, 31); // August 31 (month is 0-indexed)
+    while (date.getDay() !== 1) { // 1 = Monday
+      date.setDate(date.getDate() - 1);
+    }
+    return date;
+  },
+
+  /**
+   * Initialize the holiday calendar instance and test access
+   */
+  initHolidayCalendar() {
+    if (this._initialized) return;
+    
+    try {
+      this._holidayCalendar = CalendarApp.getCalendarById(HOLIDAY_CAL_ID);
+      // Test access by trying to get events for a small range
+      const testStart = new Date();
+      const testEnd = new Date(testStart.getTime() + 86400000); // +1 day
+      this._holidayCalendar.getEvents(testStart, testEnd);
+      this._calendarAvailable = true;
+      logTS('HolidayService: Calendar access verified');
+    } catch (e) {
+      this._calendarAvailable = false;
+      logTS('HolidayService: Calendar access failed, will use fallbacks: ' + e);
+    }
+    
+    this._initialized = true;
+  },
+
+  /**
+   * Fetch holiday dates and titles for a range with fallback mechanisms
+   * @param {Date} startDate - Start date
+   * @param {Date} endDate - End date
+   * @return {Array<{date:string, title:string}>} Array of holiday records
+   */
+  fetchRange(startDate, endDate) {
+    this.initHolidayCalendar();
+    
+    const startStr = DateUtils.formatYMD(startDate);
+    const endStr = DateUtils.formatYMD(endDate);
+    const cacheKey = `${SCRIPT_VERSION}_holidays_${startStr}_${endStr}`;
+    
+    // Check cache first
+    const cached = safeCacheGet(cacheKey);
+    if (cached) {
+      try {
+        const records = JSON.parse(cached);
+        logTS(`HolidayService: cache hit for range ${startStr} to ${endStr}`);
+        return records;
+      } catch (e) {
+        logTS('HolidayService: cache parse error: ' + e);
+      }
+    }
+    
+    let records = [];
+    
+    // Try CalendarApp first
+    if (this._calendarAvailable) {
+      try {
+        const events = this._holidayCalendar.getEvents(startDate, endDate);
+        records = events.map(ev => ({
+          date: DateUtils.formatYMD(ev.getStartTime()),
+          title: ev.getTitle()
+        }));
+        logTS(`HolidayService: CalendarApp fetched ${records.length} holidays`);
+      } catch (e) {
+        logTS('HolidayService: CalendarApp fetch failed: ' + e);
+        this._calendarAvailable = false;
+        records = [];
+      }
+    }
+    
+    // Fallback to ICS feed if CalendarApp failed
+    if (records.length === 0 && !this._calendarAvailable) {
+      try {
+        const icsUrl = 'https://calendar.google.com/calendar/ical/en.philippines%23holiday%40group.v.calendar.google.com/public/basic.ics';
+        const response = UrlFetchApp.fetch(icsUrl);
+        const icsContent = response.getContentText();
+        const vevents = icsContent.split('BEGIN:VEVENT').slice(1);
+        const icsRecords = [];
+        vevents.forEach(block => {
+          const text = 'BEGIN:VEVENT' + block;
+          const summaryMatch = text.match(/SUMMARY:(.+)/);
+          const dtMatch = text.match(/DTSTART;VALUE=DATE:(\d{4})(\d{2})(\d{2})/);
+          if (summaryMatch && dtMatch) {
+            const year = parseInt(dtMatch[1], 10);
+            const month = parseInt(dtMatch[2], 10);
+            const day = parseInt(dtMatch[3], 10);
+            const holidayDate = DateUtils.buildDate(year, month, day);
+            if (holidayDate >= startDate && holidayDate <= endDate) {
+              icsRecords.push({
+                date: DateUtils.formatYMD(holidayDate),
+                title: summaryMatch[1]
+              });
+            }
+          }
+        });
+        records = icsRecords;
+        logTS(`HolidayService: ICS fallback fetched ${records.length} holidays`);
+      } catch (e) {
+        logTS('HolidayService: ICS fallback failed: ' + e);
+        records = [];
+      }
+    }
+    
+    // Final fallback to manual recurring rules
+    if (records.length === 0) {
+      const manualRecords = [];
+      const startYear = startDate.getFullYear();
+      const endYear = endDate.getFullYear();
+      for (let year = startYear; year <= endYear; year++) {
+        this._manualHolidays.forEach(holiday => {
+          const holidayDate = DateUtils.buildDate(year, holiday.month, holiday.day);
+          if (holidayDate >= startDate && holidayDate <= endDate) {
+            manualRecords.push({
+              date: DateUtils.formatYMD(holidayDate),
+              title: holiday.name
+            });
+          }
+        });
+        const nhd = this.getNationalHeroesDay(year);
+        if (nhd >= startDate && nhd <= endDate) {
+          manualRecords.push({
+            date: DateUtils.formatYMD(nhd),
+            title: 'National Heroes Day'
+          });
+        }
+      }
+      records = manualRecords;
+      logTS(`HolidayService: Manual rules generated ${records.length} holidays`);
+    }
+    
+    // Cache the results
+    safeCachePut(cacheKey, JSON.stringify(records), HOLIDAY_CACHE_TTL);
+    return records;
+  },
+
+  /**
+   * Upsert holiday events for a given date range.
+   * Ensures one all-day event per holiday with correct title and description TAG_HOLIDAY.
+   * @param {Date} startDate - Start date
+   * @param {Date} endDate - End date
+   */
+  upsertHolidayEvents(startDate, endDate) {
+    logTS(`HolidayService.upsertHolidayEvents:start ${DateUtils.formatYMD(startDate)} to ${DateUtils.formatYMD(endDate)}`);
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+      logTS('HolidayService.upsertHolidayEvents: Lock busy, skipping');
+      return;
+    }
+    try {
+      const records = this.fetchRange(startDate, endDate);
+      records.forEach(record => {
+        try {
+          const dayDate = DateUtils.parseDate(record.date);
+          if (!dayDate) return;
+          const dayEvents = CAL.getEventsForDay(dayDate);
+          const holidayEvents = dayEvents.filter(ev => ev.getDescription().indexOf(TAG_HOLIDAY) === 0);
+          // Delete duplicates
+          if (holidayEvents.length > 1) {
+            for (let i = 1; i < holidayEvents.length; i++) {
+              holidayEvents[i].deleteEvent();
+            }
+          }
+          if (holidayEvents.length >= 1) {
+            const ev = holidayEvents[0];
+            ev.setTitle(record.title);
+          } else {
+            CAL.createAllDayEvent(record.title, dayDate, { description: TAG_HOLIDAY });
+          }
+        } catch (e) {
+          logTS('HolidayService.upsertHolidayEvents: error for date ' + record.date + ': ' + e);
+          sendThrottledError('HolidayService.upsertHolidayEvents', e);
+        }
+      });
+    } finally {
+      lock.releaseLock();
+      logTS('HolidayService.upsertHolidayEvents:end');
+    }
+  },
+
+  /**
+   * Check if a specific date is a holiday
+   * @param {string|Date} dateInput - Date string in yyyy-MM-dd format or Date object
+   * @return {boolean} True if holiday, false otherwise (defaults to true on error)
+   */
+  isHoliday(dateInput) {
+    try {
+      this.initHolidayCalendar();
+      
+      let date;
+      if (dateInput instanceof Date) {
+        date = dateInput;
+      } else {
+        date = DateUtils.parseDate(dateInput);
+        if (!date) {
+          logTS('HolidayService.isHoliday: Invalid date: ' + dateInput);
+          return true; // Assume holiday on invalid date
+        }
+      }
+      
+      // Try calendar first if available
+      if (this._calendarAvailable) {
+        try {
+          const events = this._holidayCalendar.getEventsForDay(date);
+          if (events.length > 0) {
+            logTS('HolidayService.isHoliday: confirmed holiday via calendar ' + DateUtils.formatYMD(date));
+            return true;
+          }
+        } catch (e) {
+          logTS('HolidayService.isHoliday: calendar error, falling back to manual: ' + e);
+          this._calendarAvailable = false;
+        }
+      }
+      
+      // Fallback to manual holiday checks
+      const month = date.getMonth() + 1; // Convert to 1-12
+      const day = date.getDate();
+      const year = date.getFullYear();
+      
+      // Check fixed holidays
+      for (const holiday of this._manualHolidays) {
+        if (holiday.month === month && holiday.day === day) {
+          logTS('HolidayService.isHoliday: confirmed fixed holiday ' + DateUtils.formatYMD(date));
+          return true;
+        }
+      }
+      
+      // Check National Heroes Day (last Monday of August)
+      const nationalHeroesDay = this.getNationalHeroesDay(year);
+      if (date.getTime() === nationalHeroesDay.getTime()) {
+        logTS('HolidayService.isHoliday: confirmed National Heroes Day ' + DateUtils.formatYMD(date));
+        return true;
+      }
+      
+      return false;
+    } catch (e) {
+      logTS('HolidayService.isHoliday: error checking ' + dateInput + ': ' + e);
+      return true; // Assume holiday on error to be safe
+    }
+  }
+};
+
+/**
+ * Creates a calendar event for a form submission and handles rollback on failure.
+ * @param {Object} responseData - Object containing form response data {lastName, firstName, purok, barangay}.
+ * @param {Object} registry - Registry entry {formId, sheetName, availabilitySheetName, spreadsheetId}.
+ * @param {Date} chosenDateObj - The appointment date object.
+ */
+function createCalendarEventFromResponse_(responseData, registry, chosenDateObj) {
+  try {
+    const lastName = responseData.lastName || 'User';
+    const firstName = responseData.firstName || 'Unknown';
+    const purok = responseData.purok || '';
+    const barangay = responseData.barangay || '';
+
+    const title = `${registry.sheetName}:${lastName}, ${firstName} ${purok}, ${barangay}`;
+    const description =
+      `Last Name: ${lastName}\n` +
+      `First Name: ${firstName}\n` +
+      `Purok: ${purok}\n` +
+      `Barangay: ${barangay}`;
+
+    const event = CAL.createAllDayEvent(title, chosenDateObj, {
+      description: description
+    });
+
+    // Color-code based on remaining availability
+    const dateString = DateUtils.formatYMD(chosenDateObj);
+    const sheet = getSpreadsheet_(registry).getSheetByName(registry.availabilitySheetName);
+    if (sheet) {
+      const dataRange = sheet.getDataRange();
+      const values = dataRange.getValues();
+      let slotsLeft = SLOT_CAP;
+
+      for (let i = 1; i < values.length; i++) {
+        const cellDate = safeParseDate_(values[i][0]);
+        if (cellDate === dateString) {
+          slotsLeft = typeof values[i][AVAIL_LEFT_COL - 1] === 'number' ? values[i][AVAIL_LEFT_COL - 1] : SLOT_CAP;
+          break;
+        }
+      }
+
+      const color = slotsLeft > 0 ? EVENT_COLOR_AVAILABLE : EVENT_COLOR_FULL;
+      event.setColor(color);
+    }
+
+    logTS('createCalendarEventFromResponse_: Created appointment event for ' + dateString);
+    return event;
+  } catch (err) {
+    logTS('createCalendarEventFromResponse_: Calendar error, reverting availability: ' + err);
+    try {
+      revertAvailabilityForDate_(registry, chosenDateObj);
+    } catch (revertErr) {
+      logTS('createCalendarEventFromResponse_: Revert failed: ' + revertErr);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Reverts availability for a date by decrementing booked count and incrementing slots left.
+ * @param {Object} registry - Registry entry {formId, sheetName, availabilitySheetName, spreadsheetId}.
+ * @param {Date} dateObj - The date to revert availability for.
+ */
+function revertAvailabilityForDate_(registry, dateObj) {
+  try {
+    const dateString = DateUtils.formatYMD(dateObj);
+    const sheet = getSpreadsheet_(registry).getSheetByName(registry.availabilitySheetName);
+    if (!sheet) {
+      logTS('revertAvailabilityForDate_: Sheet not found: ' + registry.availabilitySheetName);
+      return;
+    }
+
+    const dataRange = sheet.getDataRange();
+    const values = dataRange.getValues();
+
+    for (let i = 1; i < values.length; i++) {
+      const cellDate = safeParseDate_(values[i][0]);
+      if (cellDate === dateString) {
+        const targetRow = i + 1;
+        const currentBooked = typeof values[i][AVAIL_BOOKED_COL - 1] === 'number' ? values[i][AVAIL_BOOKED_COL - 1] : 0;
+        const currentLeft = typeof values[i][AVAIL_LEFT_COL - 1] === 'number' ? values[i][AVAIL_LEFT_COL - 1] : SLOT_CAP;
+
+        const newBooked = Math.max(0, currentBooked - 1);
+        const newLeft = Math.min(SLOT_CAP, currentLeft + 1);
+
+        sheet.getRange(targetRow, AVAIL_BOOKED_COL).setValue(newBooked);
+        sheet.getRange(targetRow, AVAIL_LEFT_COL).setValue(newLeft);
+
+        logTS('revertAvailabilityForDate_: Reverted availability for ' + dateString + ' to ' + newBooked + '/' + SLOT_CAP);
+        return;
+      }
+    }
+
+    logTS('revertAvailabilityForDate_: Date not found in availability sheet: ' + dateString);
+  } catch (err) {
+    logTS('revertAvailabilityForDate_: Error reverting availability: ' + err);
+    sendThrottledError('revertAvailabilityForDate_', err);
+  }
+}
+
+/**
+ * Updates the form's date dropdown by reading availability sheet and filtering available dates.
+ * @param {Object} registry - Registry entry {formId, sheetName, availabilitySheetName, spreadsheetId}.
+ */
+function updateFormDateDropdown_(registry) {
+  try {
+    logTS('updateFormDateDropdown_: start for ' + registry.formId);
+    
+    const form = FormApp.openById(registry.formId);
+    const li = getAppointmentListItem_(form);
+    const sheet = getSpreadsheet_(registry).getSheetByName(registry.availabilitySheetName);
+    
+    if (!sheet) {
+      logTS('updateFormDateDropdown_: Availability sheet not found: ' + registry.availabilitySheetName);
+      return;
+    }
+    
+    const dataRange = sheet.getDataRange();
+    const values = dataRange.getValues();
+    const choices = [];
+    const today = new Date();
+    const maxDate = new Date(today.getTime() + MAX_ADVANCE_DAYS * 86400000);
+    
+    for (let i = 1; i < values.length; i++) {
+      const dateString = safeParseDate_(values[i][0]);
+      if (!dateString) continue;
+      
+      const date = DateUtils.parseDate(dateString);
+      if (!date || date < today || date > maxDate) continue;
+      
+      // Skip holidays
+      if (HolidayService.isHoliday(dateString)) continue;
+      
+      // Skip weekends
+      const dayOfWeek = date.getDay();
+      if (dayOfWeek === 0 || dayOfWeek === 6) continue;
+      
+      const slotsLeft = typeof values[i][AVAIL_LEFT_COL - 1] === 'number' ? values[i][AVAIL_LEFT_COL - 1] : SLOT_CAP;
+      
+      // Only include dates with available slots
+      if (slotsLeft > 0) {
+        const weekday = Utilities.formatDate(date, TZ, 'EEE');
+        const label = `${dateString} ${weekday} (${slotsLeft} slot${slotsLeft === 1 ? '' : 's'} left)`;
+        choices.push(label);
+      }
+    }
+    
+    // Sort choices by date
+    choices.sort((a, b) => {
+      const dateA = a.split(' ')[0];
+      const dateB = b.split(' ')[0];
+      return dateA.localeCompare(dateB);
+    });
+    
+    li.setChoiceValues(choices);
+    cachedListItem = null; // Invalidate cache
+    
+    logTS('updateFormDateDropdown_: Updated ' + choices.length + ' choices for ' + registry.formId);
+  } catch (err) {
+    logTS('updateFormDateDropdown_: Error updating form dropdown: ' + err);
+    sendThrottledError('updateFormDateDropdown_', err);
+  }
+}
+
+/**
+ * Ensures all forms in the registry have submit triggers.
+ */
+function ensureAllFormTriggersExist() {
+  try {
+    if (!Array.isArray(FORM_REGISTRY) || FORM_REGISTRY.length === 0 ||
+        new Set(FORM_REGISTRY.map(r => r.formId)).size !== FORM_REGISTRY.length) {
+      throw new Error('FORM_REGISTRY must be a non-empty array of unique formIds');
+    }
+    TriggerService.removeSpreadsheetBoundFormSubmitTriggers();
+    logTS('ensureAllFormTriggersExist: cleaned up spreadsheet triggers');
+    const existingTriggers = TriggerService.listAllTriggers();
+    const created = [];
+    const skipped = [];
+    FORM_REGISTRY.forEach(entry => {
+      try {
+        const formId = entry.formId;
+        if (!formId || typeof formId !== 'string') {
+          throw new Error('Invalid formId in registry');
+        }
+        const exists = TriggerService.triggerExists({
+          handlerFunction: 'onFormSubmit',
+          eventType: ScriptApp.EventType.ON_FORM_SUBMIT,
+          source: ScriptApp.TriggerSource.FORMS,
+          sourceId: formId
+        });
+        if (exists) {
+          skipped.push(formId);
+        } else {
+          TriggerService.createFormSubmitTrigger(formId);
+          created.push(formId);
+        }
+      } catch (formErr) {
+        sendThrottledError('ensureAllFormTriggersExist-form-' + entry.formId, formErr);
+      }
+    });
+    logTS(`ensureAllFormTriggersExist: Created triggers for: ${JSON.stringify(created)}`);
+    logTS(`ensureAllFormTriggersExist: Skipped (already existed): ${JSON.stringify(skipped)}`);
+  } catch (err) {
+    sendThrottledError('ensureAllFormTriggersExist', err);
+    throw err;
+  }
+}
+
+/**
+ * Removes any existing spreadsheet-bound form submit triggers to prevent conflicts.
+ * @deprecated Use TriggerService.removeSpreadsheetBoundFormSubmitTriggers instead.
+ */
+function removeSpreadsheetTriggers() {
+  TriggerService.removeSpreadsheetBoundFormSubmitTriggers();
+}
+
+/**
+ * Sets up time-driven triggers for daily cleanup and form dropdown rebuilds.
+ */
+function setupTimeDrivenTriggers() {
+  try {
+    TriggerService.ensureTimeTriggers();
+  } catch (err) {
+    sendThrottledError('setupTimeDrivenTriggers', err);
+    throw err;
+  }
+}
+
+/**
+ * Rebuilds all form dropdowns by reading availability sheets.
+ */
+function rebuildAllFormDropdowns() {
+  try {
+    logTS('rebuildAllFormDropdowns: start');
+    
+    let lock = LockService.getScriptLock();
+    if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+      logTS('rebuildAllFormDropdowns: Lock busy, skipping');
+      return;
+    }
+    
+    try {
+      FORM_REGISTRY.forEach(entry => {
+        try {
+          updateFormDateDropdown_(entry);
+        } catch (err) {
+          logTS('rebuildAllFormDropdowns: Error updating form ' + entry.formId + ': ' + err);
+          sendThrottledError('rebuildAllFormDropdowns-' + entry.formId, err);
+        }
+      });
+      
+      logTS('rebuildAllFormDropdowns: end');
+    } finally {
+      lock.releaseLock();
+    }
+  } catch (err) {
+    logTS('rebuildAllFormDropdowns: Error: ' + err);
+    sendThrottledError('rebuildAllFormDropdowns', err);
+  }
+}
+
+/**
+ * Centralized date utilities for timezone-safe operations
+ */
+const DateUtils = {
+  /**
+   * Build a Date object from year, month, day components
+   * @param {number} year - Full year
+   * @param {number} month - Month (1-12)
+   * @param {number} day - Day of month
+   * @return {Date} Date object
+   */
+  buildDate(year, month, day) {
+    return new Date(year, month - 1, day);
+  },
+
+  /**
+   * Format a Date object as yyyy-MM-dd using script timezone
+   * @param {Date} date - Date to format
+   * @return {string} Formatted date string
+   */
+  formatYMD(date) {
+    return Utilities.formatDate(date, TZ, 'yyyy-MM-dd');
+  },
+
+  /**
+   * Parse a date string into a Date object
+   * @param {string} dateText - Date string in yyyy-MM-dd format
+   * @return {Date|null} Date object or null if invalid
+   */
+  parseDate(dateText) {
+    try {
+      const match = dateText.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (!match) return null;
+      
+      const year = parseInt(match[1], 10);
+      const month = parseInt(match[2], 10);
+      const day = parseInt(match[3], 10);
+      
+      const date = this.buildDate(year, month, day);
+      return isNaN(date) ? null : date;
+    } catch (e) {
+      return null;
+    }
+  }
+};
+
+/**
+ * Checks if a given date is a holiday.
+ * @param {string} dateText - Date string in yyyy-MM-dd format.
+ * @return {boolean} True if the date is a holiday, false otherwise.
+ */
+function isHoliday_(dateText) {
+  try {
+    return HolidayService.isHoliday(dateText);
+  } catch (e) {
+    logTS('isHoliday_: error delegating to HolidayService: ' + e);
+    return true; // Assume holiday on error to be safe
+  }
+}
+
+/**
+ * Safely parses a cell value into a date string.
+ * @param {*} cell - The cell value to parse.
+ * @return {string|null} Date string in yyyy-MM-dd format or null if invalid.
+ */
+function safeParseDate_(cell) {
+  try {
+    if (cell instanceof Date && !isNaN(cell)) {
+      return DateUtils.formatYMD(cell);
+    }
+    const s = String(cell);
+    const m = s.match(/(\d{4}-\d{2}-\d{2})/);
+    if (m) {
+      const testDate = DateUtils.parseDate(m[1]);
+      if (testDate) {
+        return m[1];
+      }
+    }
+    return null;
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
+ * Splits an array into chunks of specified size.
+ * @param {Array} arr - Array to chunk.
+ * @param {number} size - Chunk size.
+ * @return {Array[]} Array of chunks.
+ */
+function chunkArray(arr, size) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
+}
+
+/**
+ * Logs a timestamped message to the Logger.
+ * @param {string} label - The message to log.
+ */
+function logTS(label) {
+  Logger.log(`[${new Date().toISOString()}] ${label}`);
+}
+
+/**
+ * Formats a Date object as yyyy-MM-dd.
+ * @param {Date} date - The date to format.
+ * @return {string} Formatted date string.
+ */
+function formatYMD_(date) {
+  return DateUtils.formatYMD(date);
+}
+
+/**
+ * Safely puts a value into cache with error handling.
+ * @param {string} key - Cache key.
+ * @param {string} value - Value to cache.
+ * @param {number} ttl - Time to live in seconds.
+ */
+function safeCachePut(key, value, ttl) {
+  try {
+    CACHE.put(key, value, ttl);
+  } catch (e) {
+    logTS('safeCachePut error: ' + e);
+  }
+}
+
+/**
+ * Safely gets a value from cache with error handling and logging.
+ * @param {string} key - Cache key.
+ * @return {string|null} Cached value or null if not found/error.
+ */
+function safeCacheGet(key) {
+  try {
+    const value = CACHE.get(key);
+    if (value) {
+      logTS('cache hit: ' + key);
+      return value;
+    } else {
+      logTS('cache miss: ' + key);
+        return null;
+    }
+  } catch (e) {
+    logTS('safeCacheGet error: ' + e);
+    return null;
+  }
+}
+
+/**
+ * Safely removes a value from cache with error handling.
+ * @param {string} key - Cache key to remove.
+ */
+function safeCacheRemove(key) {
+  try {
+    CACHE.remove(key);
+    logTS('cache removed: ' + key);
+  } catch (e) {
+    logTS('safeCacheRemove error: ' + e);
+  }
+}
+
+/**
+ * Reads the "Slots Left" value directly from the availability sheet for a given date.
+ * @param {Object} registryEntry - Registry entry {formId, sheetName, availabilitySheetName, spreadsheetId}.
+ * @param {string} dateStr - Date string in yyyy-MM-dd format.
+ * @return {number} Number of slots left, or 0 if not found/error.
+ */
+function getLeftFromSheet(registryEntry, dateStr) {
+  try {
+    const sheet = getSpreadsheet_(registryEntry).getSheetByName(registryEntry.availabilitySheetName);
+    if (!sheet) {
+      logTS('getLeftFromSheet: Sheet not found: ' + registryEntry.availabilitySheetName);
+      return 0;
+    }
+    
+    const dataRange = sheet.getDataRange();
+    const values = dataRange.getValues();
+    
+    // Search for the date in the sheet rows
+    for (let i = 1; i < values.length; i++) {
+      const cellDate = safeParseDate_(values[i][0]);
+      if (cellDate === dateStr) {
+        const slotsLeft = typeof values[i][AVAIL_LEFT_COL - 1] === 'number' ? values[i][AVAIL_LEFT_COL - 1] : 0;
+        return slotsLeft;
+      }
+    }
+    
+    // Date not found in sheet
+    return 0;
+  } catch (err) {
+    logTS('getLeftFromSheet: Error reading sheet: ' + err);
+    sendThrottledError('getLeftFromSheet', err);
+    return 0;
+  }
+}
+
+/**
+ * Decrements slots across all availability categories for a given date.
+ * @param {Date} dateObj - The appointment date object.
+ * @return {number[]} Array of newLeft values from each sheet, or empty array if failed.
+ */
+function decrementSlotAllCategories_(dateObj) {
+  logTS('decrementSlotAllCategories_:start for ' + DateUtils.formatYMD(dateObj));
+  
+  const dateString = DateUtils.formatYMD(dateObj);
+  
+  // Holiday guard: early exit on holidays
+  if (HolidayService.isHoliday(dateString)) {
+    logTS('decrementSlotAllCategories_: booking on holiday rejected: ' + dateString);
+    return [];
+  }
+  
+  // 1. Acquire script lock
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+    logTS('decrementSlotAllCategories_: Lock busy, skipping for ' + dateString);
+    return [];
+  }
+  
+  try {
+    const allLeftValues = [];
+    
+    // 2. Group registry entries by spreadsheetId
+    const spreadsheetGroups = {};
+    FORM_REGISTRY.forEach(entry => {
+      if (!spreadsheetGroups[entry.spreadsheetId]) {
+        spreadsheetGroups[entry.spreadsheetId] = [];
+      }
+      spreadsheetGroups[entry.spreadsheetId].push(entry);
+    });
+    
+    // 3. Process each spreadsheet group
+    Object.keys(spreadsheetGroups).forEach(spreadsheetId => {
+      try {
+        const entries = spreadsheetGroups[spreadsheetId];
+        logTS('decrementSlotAllCategories_: Processing spreadsheet ' + spreadsheetId + ' with ' + entries.length + ' sheets');
+        
+        // Open the spreadsheet
+        let spreadsheet;
+        try {
+          spreadsheet = SpreadsheetApp.openById(spreadsheetId);
+        } catch (err) {
+          logTS('decrementSlotAllCategories_: Error opening spreadsheet ' + spreadsheetId + ': ' + err);
+          sendThrottledError('decrementSlotAllCategories_-openSpreadsheet', err);
+          return;
+        }
+        
+        // 4. Loop through each availability sheet in this spreadsheet
+        entries.forEach(entry => {
+          try {
+            const sheetName = entry.availabilitySheetName;
+            const sheet = spreadsheet.getSheetByName(sheetName);
+            if (!sheet) {
+              logTS('decrementSlotAllCategories_: Sheet not found: ' + sheetName);
+              allLeftValues.push(0); // Add 0 for missing sheet
+              return;
+            }
+            
+            // Read sheet data and find the matching date row
+            const dataRange = sheet.getDataRange();
+            const values = dataRange.getValues();
+            
+            let targetRow = -1;
+            let currentBooked = 0;
+            let currentLeft = SLOT_CAP;
+            
+            // Search for existing row with this date
+            for (let i = 1; i < values.length; i++) {
+              const cellDate = safeParseDate_(values[i][0]);
+              if (cellDate === dateString) {
+                targetRow = i + 1; // +1 because sheet rows are 1-indexed
+                currentBooked = typeof values[i][AVAIL_BOOKED_COL - 1] === 'number' ? values[i][AVAIL_BOOKED_COL - 1] : 0;
+                currentLeft = typeof values[i][AVAIL_LEFT_COL - 1] === 'number' ? values[i][AVAIL_LEFT_COL - 1] : SLOT_CAP;
+                break;
+              }
+            }
+            
+            // If no existing row found, create new row
+            if (targetRow === -1) {
+              try {
+                // Ensure headers exist
+                if (values.length === 0) {
+                  sheet.getRange(1, 1, 1, 3).setValues([['Date', 'Booked', 'Slots Left']]);
+                }
+                targetRow = sheet.getLastRow() + 1;
+                sheet.getRange(targetRow, 1, 1, 3).setValues([[dateString, 0, SLOT_CAP]]);
+                currentBooked = 0;
+                currentLeft = SLOT_CAP;
+              } catch (err) {
+                logTS('decrementSlotAllCategories_: Error creating row in ' + sheetName + ': ' + err);
+                sendThrottledError('decrementSlotAllCategories_-createRow-' + sheetName, err);
+                allLeftValues.push(0);
+                return;
+              }
+            }
+            
+            // 5. Guard against overbooking (left >= 0)
+            if (currentLeft <= 0) {
+              logTS('decrementSlotAllCategories_: overbook attempt for ' + dateString + ' in ' + sheetName);
+              allLeftValues.push(0);
+              return;
+            }
+            
+            // 6. Decrement and write back
+            const newBooked = currentBooked + 1;
+            const newLeft = Math.max(0, currentLeft - 1);
+            
+            try {
+              sheet.getRange(targetRow, AVAIL_BOOKED_COL).setValue(newBooked);
+              sheet.getRange(targetRow, AVAIL_LEFT_COL).setValue(newLeft);
+              
+              logTS('decrementSlotAllCategories_: Successfully updated ' + sheetName + ' for ' + dateString + ': ' + currentLeft + '→' + newLeft);
+              allLeftValues.push(newLeft);
+            } catch (err) {
+              logTS('decrementSlotAllCategories_: Error writing to ' + sheetName + ': ' + err);
+              sendThrottledError('decrementSlotAllCategories_-writeSheet-' + sheetName, err);
+              allLeftValues.push(0);
+            }
+            
+          } catch (err) {
+            logTS('decrementSlotAllCategories_: Error processing sheet ' + entry.availabilitySheetName + ': ' + err);
+            sendThrottledError('decrementSlotAllCategories_-processSheet-' + entry.availabilitySheetName, err);
+            allLeftValues.push(0);
+          }
+        });
+        
+      } catch (err) {
+        logTS('decrementSlotAllCategories_: Error processing spreadsheet group ' + spreadsheetId + ': ' + err);
+        sendThrottledError('decrementSlotAllCategories_-processGroup-' + spreadsheetId, err);
+      }
+    });
+    
+    logTS('decrementSlotAllCategories_:end for ' + dateString + ' with results: ' + JSON.stringify(allLeftValues));
+    return allLeftValues;
+    
+  } catch (err) {
+    logTS('Error in decrementSlotAllCategories_: ' + err);
+    sendThrottledError('decrementSlotAllCategories_', err);
+    return [];
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Retrieves holiday dates between two dates (inclusive) and caches them.
+ * @param {Date} startDate - Start date.
+ * @param {Date} endDate - End date.
+ * @return {Set<string>} Set of holiday date strings in yyyy-MM-dd format.
+ */
+function getHolidayDates(startDate, endDate) {
+  return HolidayService.fetchRange(startDate, endDate);
+}
+
+/**
+ * Removes summary events and appointment events that fall on holiday dates within the specified range.
+ * @param {Date} startDate - Start date for the range.
+ * @param {Date} endDate - End date for the range.
+ */
+function removeHolidaySummaries(startDate, endDate) {
+  logTS('removeHolidaySummaries:start');
+  const holidaySet = getHolidayDates(startDate, endDate);
+  const summariesToDelete = [];
+  const appointmentsToDelete = [];
+  
+  holidaySet.forEach(dateText => {
+    const [y, m, d] = dateText.split('-').map(Number);
+    const dayDate = new Date(y, m - 1, d);
+    const dayEvents = CAL.getEventsForDay(dayDate);
+    
+    // Collect summary events on holidays
+    const summaries = dayEvents.filter(ev => ev.getDescription().indexOf(FULL_SUMMARY_TAG) === 0);
+    summariesToDelete.push(...summaries);
+    
+    // Collect appointment events on holidays
+    const appointments = dayEvents.filter(ev => ev.getTitle().startsWith(TAG_APPOINTMENT));
+    appointmentsToDelete.push(...appointments);
+  });
+  
+  // Delete summary events in chunks
+  chunkArray(summariesToDelete, CHUNK_SIZE).forEach(chunk => {
+    try { 
+      chunk.forEach(ev => ev.deleteEvent()); 
+      logTS(`Deleted ${chunk.length} holiday summary events`);
+    }
+    catch(e){ 
+      logTS('Chunk delete error in removeHolidaySummaries (summaries): '+e); 
+    }
+  });
+  
+  // Delete appointment events in chunks
+  chunkArray(appointmentsToDelete, CHUNK_SIZE).forEach(chunk => {
+    try { 
+      chunk.forEach(ev => ev.deleteEvent()); 
+      logTS(`Deleted ${chunk.length} holiday appointment events`);
+    }
+    catch(e){ 
+      logTS('Chunk delete error in removeHolidaySummaries (appointments): '+e); 
+    }
+  });
+  
+  logTS('removeHolidaySummaries:end');
+}
+
+/**
+ * Sends throttled error emails to avoid spam.
+ * @param {string} functionName - Name of the function that errored.
+ * @param {*} err - The error object or message.
+ */
+function sendThrottledError(functionName, err) {
+  try {
+    if (IS_DEV) {
+      FormApp.getUi().alert(String(err));
+    } else {
+      const lastEmail = parseInt(propsEmail.getProperty('LAST_ERROR_EMAIL_TS')||'0',10);
+      const now = Date.now();
+      if(now - lastEmail >= EMAIL_THROTTLE_MS) {
+        propsEmail.setProperty('LAST_ERROR_EMAIL_TS',String(now));
+        const subject = `Error @ ${new Date().toISOString()} - ${functionName}`;
+        MailApp.sendEmail(Session.getEffectiveUser().getEmail(), subject, String(err));
+      }
+    }
+  } catch (e) {
+    logTS('sendThrottledError failed: ' + e);
+  }
+}
+
+/**
+ * Rebuilds slot counters by tallying form responses and updating all availability sheets.
+ * @return {Object} Map of sheetName to {date: {booked, left}} with logs and error handling.
+ */
+function rebuildSlotCounters() {
+  logTS('rebuildSlotCounters:start');
+  
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+    logTS('rebuildSlotCounters: Lock busy, skipping');
+    return {};
+  }
+  
+  try {
+    const results = {};
+    
+    // 1. Iterate each registry entry
+    FORM_REGISTRY.forEach(entry => {
+      try {
+        logTS('rebuildSlotCounters: Processing ' + entry.sheetName);
+        
+        // 2. Tally submissions per date from Form Responses sheet
+        const dates = getResponseDates(entry);
+        const counts = tallyByDate(dates);
+        
+        // 3. Update availability sheet with tallied counts
+        const sheet = getOrCreateSheet_(entry);
+        
+        // Clear existing data and write headers
+        sheet.clearContents();
+        sheet.getRange(1, 1, 1, 3).setValues([['Date', 'Booked', 'Slots Left']]);
+        
+        // Build rows for each date with counts
+        const rows = [];
+        const sheetResults = {};
+        
+        Object.keys(counts).forEach(dateStr => {
+          const booked = counts[dateStr] || 0;
+          const left = SLOT_CAP - booked;
+          rows.push([dateStr, booked, left]);
+          sheetResults[dateStr] = { booked, left };
+        });
+        
+        // Write all rows at once if we have data
+        if (rows.length > 0) {
+          sheet.getRange(2, 1, rows.length, 3).setValues(rows);
+        }
+        
+        results[entry.availabilitySheetName] = sheetResults;
+        logTS('rebuildSlotCounters: Completed ' + entry.sheetName + ' with ' + rows.length + ' dates');
+        
+      } catch (err) {
+        logTS('rebuildSlotCounters: Error processing ' + entry.sheetName + ': ' + err);
+        sendThrottledError('rebuildSlotCounters-' + entry.sheetName, err);
+        results[entry.availabilitySheetName] = {};
+      }
+    });
+    
+    logTS('rebuildSlotCounters:end');
+    return results;
+    
+  } catch (err) {
+    logTS('Error in rebuildSlotCounters: ' + err);
+    sendThrottledError('rebuildSlotCounters', err);
+    return {};
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Performs full availability sync for all registered forms.
+ * Reads live values from availability sheets, aggregates minimums across categories,
+ * and drives calendar summaries and form dropdown updates from aggregated values.
+ */
+function updateAvailability_everywhere() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+    logTS('updateAvailability_everywhere: Lock busy, skipping');
+    return;
+  }
+  try {
+    logTS('updateAvailability_everywhere:start');
+    const today = new Date();
+    
+    // 1. Build map allLeftsByDate = {}
+    const allLeftsByDate = {};
+    
+    FORM_REGISTRY.forEach(entry => {
+      try {
+        // Validate entry
+        if (!entry.spreadsheetId || !entry.availabilitySheetName) {
+          logTS('updateAvailability_everywhere: Invalid registry entry: missing spreadsheetId or availabilitySheetName');
+          return;
+        }
+
+        // Open spreadsheet and sheet
+        const ss = SpreadsheetApp.openById(entry.spreadsheetId);
+        const sheet = ss.getSheetByName(entry.availabilitySheetName);
+        if (!sheet) {
+          logTS('updateAvailability_everywhere: Sheet missing: ' + entry.availabilitySheetName);
+          return;
+        }
+        
+        // Read all data from sheet
+        const data = sheet.getDataRange().getValues();
+        if (data.length <= 1) {
+          logTS('updateAvailability_everywhere: No data rows in sheet: ' + entry.availabilitySheetName);
+          return;
+        }
+
+        // Read sheet rows into [{dateStr, left}]
+        for (let i = 1; i < data.length; i++) {
+          const row = data[i];
+          
+          // Parse date from row[0]
+          const dateStr = safeParseDate_(row[0]);
+          if (!dateStr) continue;
+          
+          const dateObj = DateUtils.parseDate(dateStr);
+          if (!dateObj) continue;
+          
+          // Skip past dates
+          if (dateObj < today) continue;
+          
+          // Skip holidays
+          if (HolidayService.isHoliday(dateStr)) continue;
+
+          // Extract left directly from sheet columns
+          const left = Number(row[AVAIL_LEFT_COL - 1]) || 0;
+          
+          // Add to allLeftsByDate map
+          if (!allLeftsByDate[dateStr]) {
+            allLeftsByDate[dateStr] = [];
+          }
+          allLeftsByDate[dateStr].push(left);
+        }
+      } catch (e) {
+        logTS('updateAvailability_everywhere: Error reading ' + entry.availabilitySheetName + ': ' + e);
+        sendThrottledError('updateAvailability_everywhere-read-' + entry.formId, e);
+      }
+    });
+    
+    // 2. For each dateStr in map: compute minLeft and update calendar/forms
+    Object.keys(allLeftsByDate).forEach(dateStr => {
+      try {
+        const dateObj = DateUtils.parseDate(dateStr);
+        if (!dateObj) return;
+        
+        const leftValues = allLeftsByDate[dateStr];
+        const minLeft = Math.min(...leftValues);
+        
+        logTS('updateAvailability_everywhere: Processing ' + dateStr + ' with minLeft=' + minLeft + ' from values: ' + JSON.stringify(leftValues));
+        
+        // Update calendar summary event with minimum availability
+        try {
+          // Use first registry entry as representative for calendar events
+          const anyEntry = FORM_REGISTRY[0];
+          upsertDailySummaryEvent(dateObj, undefined, minLeft, anyEntry);
+        } catch (e) {
+          sendThrottledError('updateAvailability_everywhere-upsert-' + dateStr, e);
+        }
+
+        // Update form dropdown for each registry entry with minimum availability
+        FORM_REGISTRY.forEach(registryEntry => {
+          try {
+            updateFormDropdownForDate_(registryEntry, dateObj, minLeft);
+          } catch (e) {
+            sendThrottledError('updateAvailability_everywhere-updateForm-' + registryEntry.formId + '-' + dateStr, e);
+          }
+        });
+        
+      } catch (e) {
+        logTS('updateAvailability_everywhere: Error processing date ' + dateStr + ': ' + e);
+        sendThrottledError('updateAvailability_everywhere-processDate-' + dateStr, e);
+      }
+    });
+    
+    // Rebuild appointment events to ensure they mirror sheet data
+    rebuildAppointmentEventsAllForms();
+    
+    logTS('updateAvailability_everywhere:end');
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Synchronizes a single form: reads responses, updates form, calendar, and sheet.
+ * @param {Object} entry - Registry entry {formId, sheetName, availabilitySheetName, spreadsheetId}.
+ */
+function syncOneForm(entry) {
+  try {
+    let lock = LockService.getScriptLock();
+    if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+      logTS('Lock busy, skipping syncOneForm for ' + entry.formId);
+      return;
+    }
+    try {
+      // Throttle full sync to once per minute per script
+      const propsSync = PropertiesService.getScriptProperties();
+      const nowSync = Date.now();
+      const lastSync = parseInt(propsSync.getProperty('LAST_FULL_SYNC_TS') || '0', 10);
+      if (nowSync - lastSync < THROTTLE_INTERVAL_MS) {
+        logTS('Skipping syncOneForm due to throttle for ' + entry.formId);
+        return;
+      }
+      propsSync.setProperty('LAST_FULL_SYNC_TS', String(nowSync));
+
+      logTS('syncOneForm:start for ' + entry.formId);
+      const form = FormApp.openById(entry.formId);
+      const dates = getResponseDates(entry);
+      let counts = safeCacheGet(CACHE_KEY + '_' + entry.formId);
+      if (counts) {
+        counts = JSON.parse(counts);
+      } else {
+        counts = tallyByDate(dates);
+        safeCachePut(CACHE_KEY + '_' + entry.formId, JSON.stringify(counts), 300);
+      }
+      const { availDates, choices } = buildBusinessDays(counts);
+      
+      // Filter out any holidays that might have slipped through
+      const nonHolidayDates = availDates.filter(dateStr => {
+        if (HolidayService.isHoliday(dateStr)) {
+          logTS('syncOneForm: filtering out holiday ' + dateStr);
+          return false;
+        }
+        return true;
+      });
+      
+      batchUpdateForm(choices, form);
+      batchSyncCalendarSummaries(nonHolidayDates, counts);
+      batchWriteAvailabilitySheet(entry, nonHolidayDates, counts);
+      safeCacheRemove(CACHE_KEY + '_' + entry.formId); // Invalidate cache after full sync
+      cachedCounts = null;
+      logTS('syncOneForm:end for ' + entry.formId);
+    } finally {
+      lock.releaseLock();
+    }
+  } catch (err) {
+    Logger.log('Error in syncOneForm for ' + entry.formId + ': ' + err);
+    sendThrottledError('syncOneForm', err);
+    throw err;
+  }
+}
+
+/**
+ * Handles Form submit event: streamlined handler with isolated steps.
+ * @param {Object} e - Spreadsheet onFormSubmit event object.
+ */
+function onFormSubmit(e) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+    logTS('onFormSubmit: Lock busy, skipping');
+    return;
+  }
+  try {
+    logTS('onFormSubmit:start');
+    // Identify sheet and row
+    if (!e || !e.range || !e.range.getSheet) {
+      logTS('onFormSubmit: invalid event object');
+      return;
+    }
+    const sheet = e.range.getSheet();
+    const row = e.range.getRow();
+    const rowValues = sheet.getRange(row, 2, 1, 5).getValues();
+    if (!rowValues || !rowValues[0]) {
+      logTS('onFormSubmit: unable to read row values');
+      return;
+    }
+    const [lastName, firstName, purok, barangay, dateChoice] = rowValues[0];
+    if (typeof dateChoice !== 'string' || !/^\d{4}-\d{2}-\d{2}/.test(dateChoice)) {
+      logTS('onFormSubmit: invalid dateChoice format: ' + dateChoice);
+      return;
+    }
+    const dateString = dateChoice.split(' ')[0];
+    const dateObj = new Date(dateString);
+    if (isNaN(dateObj)) {
+      logTS('onFormSubmit: Invalid dateChoice parsed ' + dateChoice);
+      return;
+    }
+    // Lookup registry entry by spreadsheet ID
+    const registryEntry = FORM_REGISTRY.find(r => r.spreadsheetId === sheet.getParent().getId());
+    if (!registryEntry) {
+      logTS('onFormSubmit: registry lookup failed for spreadsheet: ' + sheet.getParent().getId());
+      return;
+    }
+    // Update availability using new multi-category approach
+    let primary;
+    try {
+      primary = decrementSingleCategory_(registryEntry, dateObj);
+    } catch (err) {
+      logTS('onFormSubmit: Error in decrementSingleCategory_: ' + err);
+      sendThrottledError('decrementSingleCategory_', err);
+    }
+    if (!primary || primary.newLeft < 0) {
+      logTS('onFormSubmit: no availability for ' + dateString + ' in primary category');
+      return;
+    }
+    
+    // Decrement across all categories and get minimum left
+    let allLefts;
+    try {
+      allLefts = decrementSlotAllCategories_(dateObj);
+    } catch (err) {
+      logTS('onFormSubmit: Error in decrementSlotAllCategories_: ' + err);
+      sendThrottledError('decrementSlotAllCategories_', err);
+      allLefts = [];
+    }
+    
+    if (!allLefts || allLefts.length === 0) {
+      logTS('onFormSubmit: no availability data from decrementSlotAllCategories_');
+      return;
+    }
+    
+    const aggregateLeft = Math.min(...allLefts);
+    if (aggregateLeft < 0) {
+      logTS('onFormSubmit: aggregate availability exhausted for ' + dateString);
+      return;
+    }
+    
+    // Upsert summary event with aggregate availability
+    try {
+      upsertDailySummaryEvent(dateObj, primary.newBooked, aggregateLeft, registryEntry);
+    } catch (err) {
+      logTS('onFormSubmit: Error in upsertDailySummaryEvent: ' + err);
+      sendThrottledError('upsertDailySummaryEvent', err);
+    }
+    // Create appointment event
+    try {
+      createCalendarEventFromResponse_(
+        { lastName, firstName, purok, barangay },
+        registryEntry,
+        dateObj
+      );
+    } catch (err) {
+      logTS('onFormSubmit: Error in createCalendarEventFromResponse_: ' + err);
+      sendThrottledError('createCalendarEventFromResponse_', err);
+    }
+    // Update form dropdown for that date using aggregate availability
+    try {
+      updateFormDropdownForDate_(registryEntry, dateObj, aggregateLeft);
+    } catch (err) {
+      logTS('onFormSubmit: Error in updateFormDropdownForDate_: ' + err);
+      sendThrottledError('updateFormDropdownForDate_', err);
+    }
+    // Purge old responses for this form
+    try {
+      purgeOldResponses(registryEntry);
+    } catch (err) {
+      logTS('onFormSubmit: Error in purgeOldResponses: ' + err);
+      sendThrottledError('purgeOldResponses', err);
+    }
+    // Increment submit counter and schedule fallback if needed
+    try {
+      const props = PropertiesService.getScriptProperties();
+      let count = parseInt(props.getProperty(SUBMIT_COUNT_KEY) || '0', 10) + 1;
+      props.setProperty(SUBMIT_COUNT_KEY, String(count));
+      if (count >= 10) {
+        ScriptApp.newTrigger('updateAvailability_everywhere')
+          .timeBased()
+          .after(1000)
+          .create();
+        logTS('onFormSubmit: Scheduled fallback sync after 10 submissions');
+        props.setProperty(SUBMIT_COUNT_KEY, '0');
+      }
+    } catch (err) {
+      logTS('onFormSubmit: Error incrementing submit counter: ' + err);
+      sendThrottledError('onFormSubmit-counter', err);
+    }
+    logTS('onFormSubmit:end');
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Returns timezone offset string for the script's timezone.
+ * @return {string} Timezone offset in ±HH:mm format.
+ */
+function getTZOffsetString_() {
+    try {
+      const now = new Date();
+      const end = new Date(now.getTime() + MAX_ADVANCE_DAYS * 86400000);
+      const local = new Date(utc.toLocaleString('en-US', { timeZone: TZ }));
+      const offsetMs = local.getTime() - utc.getTime();
+      const offsetHours = Math.floor(Math.abs(offsetMs) / (1000 * 60 * 60));
+      const offsetMinutes = Math.floor((Math.abs(offsetMs) % (1000 * 60 * 60)) / (1000 * 60));
+      const sign = offsetMs >= 0 ? '+' : '-';
+      return sign + String(offsetHours).padStart(2, '0') + ':' + String(offsetMinutes).padStart(2, '0');
+      HolidayService.upsertHolidayEvents(now, end);
+    } catch (err) {
+    logTS('Error in getTZOffsetString_: ' + err);
+    return '+08:00'; // Default to Philippine timezone
+  }
+}
+
+/**
+ * Decrements availability for a single category/sheet only.
+ * @param {Object} registry - Registry entry {formId, sheetName, availabilitySheetName, spreadsheetId}.
+ * @param {Date} dateObj - The appointment date object.
+ * @return {Object|null} {newBooked, newLeft} or null if failed/unavailable.
+ */
+function decrementSingleCategory_(registry, dateObj) {
+  logTS('decrementSingleCategory_:start for ' + DateUtils.formatYMD(dateObj));
+  
+  const dateString = DateUtils.formatYMD(dateObj);
+  
+  // Holiday guard: early exit on holidays
+  if (HolidayService.isHoliday(dateString)) {
+    logTS('decrementSingleCategory_: booking on holiday rejected: ' + dateString);
+    return null;
+  }
+  
+  // 1. Acquire script lock
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+    logTS('decrementSingleCategory_: Lock busy, skipping for ' + dateString);
+    return null;
+  }
+  
+  try {
+    // 2. Fetch the sheet via getSpreadsheet_
+    let sheet;
+    try {
+      sheet = getSpreadsheet_(registry).getSheetByName(registry.availabilitySheetName);
+      if (!sheet) {
+        throw new Error('Availability sheet not found: ' + registry.availabilitySheetName);
+      }
+    } catch (err) {
+      sendThrottledError('decrementSingleCategory_-getSheet', err);
+      throw err;
+    }
+    
+    // 3. Read sheet data and search for dateString in column A
+    let dataRange, values;
+    try {
+      dataRange = sheet.getDataRange();
+      values = dataRange.getValues();
+    } catch (err) {
+      sendThrottledError('decrementSingleCategory_-getValues', err);
+      throw err;
+    }
+    
+    let targetRow = -1;
+    let currentBooked = 0;
+    let currentLeft = SLOT_CAP;
+    
+    // Search for existing row with this date
+    for (let i = 1; i < values.length; i++) { // Start from row 1 (skip header)
+      const cellDate = safeParseDate_(values[i][0]);
+      if (cellDate === dateString) {
+        targetRow = i + 1; // +1 because sheet rows are 1-indexed
+        currentBooked = typeof values[i][AVAIL_BOOKED_COL - 1] === 'number' ? values[i][AVAIL_BOOKED_COL - 1] : 0;
+        currentLeft = typeof values[i][AVAIL_LEFT_COL - 1] === 'number' ? values[i][AVAIL_LEFT_COL - 1] : SLOT_CAP;
+        break;
+      }
+    }
+    
+    // If no existing row found, append new row
+    if (targetRow === -1) {
+      try {
+        // Ensure headers exist
+        if (values.length === 0) {
+          sheet.getRange(1, 1, 1, 3).setValues([['Date', 'Booked', 'Slots Left']]);
+        }
+        targetRow = sheet.getLastRow() + 1;
+        sheet.getRange(targetRow, 1, 1, 3).setValues([[dateString, 0, SLOT_CAP]]);
+        currentBooked = 0;
+        currentLeft = SLOT_CAP;
+      } catch (err) {
+        sendThrottledError('decrementSingleCategory_-createRow', err);
+        throw err;
+      }
+    }
+    
+    // 4. Fetch currentBooked and currentLeft via column indices
+    try {
+      currentBooked = sheet.getRange(targetRow, AVAIL_BOOKED_COL).getValue();
+      currentLeft = sheet.getRange(targetRow, AVAIL_LEFT_COL).getValue();
+      currentBooked = typeof currentBooked === 'number' ? currentBooked : 0;
+      currentLeft = typeof currentLeft === 'number' ? currentLeft : SLOT_CAP;
+    } catch (err) {
+      sendThrottledError('decrementSingleCategory_-getCurrentValues', err);
+      throw err;
+    }
+    
+    // 5. Check for overbooking
+    if (currentLeft <= 0) {
+      logTS('decrementSingleCategory_: overbook attempt for ' + dateString);
+      return null;
+    }
+    
+    // 6. Increment booked, recalc left, write back to sheet
+    const newBooked = currentBooked + 1;
+    const newLeft = Math.max(0, currentLeft - 1);
+    
+    logTS(`decrementSingleCategory_: Booking ${dateString}: ${currentBooked}→${newBooked}, ${currentLeft}→${newLeft}`);
+    
+    try {
+      sheet.getRange(targetRow, AVAIL_BOOKED_COL).setValue(newBooked);
+      sheet.getRange(targetRow, AVAIL_LEFT_COL).setValue(newLeft);
+    } catch (err) {
+      sendThrottledError('decrementSingleCategory_-updateSheet', err);
+      throw err;
+    }
+    
+    logTS('decrementSingleCategory_:end for ' + dateString);
+    return { newBooked, newLeft };
+  } catch (err) {
+    logTS('Error in decrementSingleCategory_: ' + err);
+    sendThrottledError('decrementSingleCategory_', err);
+    throw err;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Detects the column index for a given header name in a sheet.
+ * @param {Sheet} sheet - The sheet to search in.
+ * @param {string} headerName - The header name to find.
+ * @return {number} 1-based column index, or -1 if not found.
+ */
+function detectColumnIndex_(sheet, headerName) {
+  try {
+    const lastColumn = sheet.getLastColumn();
+    if (lastColumn === 0) return -1;
+    
+    const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+    const index = headers.indexOf(headerName);
+    return index === -1 ? -1 : index + 1; // Convert to 1-based index
+  } catch (err) {
+    logTS('detectColumnIndex_ error: ' + err);
+    return -1;
+  }
+}
+
+/**
+ * Lightweight helper that reads the updated row from the availability sheet for a single date
+ * and invokes upsertDailySummaryEvent with the correct counts.
+ * @param {Object} registryEntry - Registry entry {formId, sheetName, availabilitySheetName, spreadsheetId}.
+ * @param {Date} dateObj - The appointment date object.
+ */
+function miniSyncCalendarSummaryForDate_(registryEntry, dateObj) {
+  try {
+    logTS('miniSyncCalendarSummaryForDate_:start for ' + DateUtils.formatYMD(dateObj));
+    
+    const dateString = DateUtils.formatYMD(dateObj);
+    
+    // Holiday guard: early exit on holidays
+    if (HolidayService.isHoliday(dateString)) {
+      logTS('miniSyncCalendarSummaryForDate_: skipping holiday ' + dateString);
+      return;
+    }
+    
+    // 1. Open the sheet
+    const sheet = getSpreadsheet_(registryEntry).getSheetByName(registryEntry.availabilitySheetName);
+    if (!sheet) {
+      logTS('miniSyncCalendarSummaryForDate_: Sheet not found: ' + registryEntry.availabilitySheetName);
+      return;
+    }
+    
+    // 2. Detect the "Date" column index
+    const dateColIndex = detectColumnIndex_(sheet, 'Date');
+    if (dateColIndex === -1) {
+      logTS('miniSyncCalendarSummaryForDate_: Date column not found');
+      return;
+    }
+    
+    // 3. Read the data range and find the matching row
+    const dataRange = sheet.getDataRange();
+    const values = dataRange.getValues();
+    
+    let booked = 0;
+    let left = SLOT_CAP;
+    let found = false;
+    
+    for (let i = 1; i < values.length; i++) { // Start from row 1 (skip header)
+      const cellDate = safeParseDate_(values[i][dateColIndex - 1]); // Convert to 0-based index
+      if (cellDate === dateString) {
+        // 4. Extract booked and slots-left values
+        booked = typeof values[i][AVAIL_BOOKED_COL - 1] === 'number' ? values[i][AVAIL_BOOKED_COL - 1] : 0;
+        left = typeof values[i][AVAIL_LEFT_COL - 1] === 'number' ? values[i][AVAIL_LEFT_COL - 1] : SLOT_CAP;
+        found = true;
+        break;
+      }
+    }
+    
+    if (!found) {
+      logTS('miniSyncCalendarSummaryForDate_: Date not found in availability sheet: ' + dateString);
+      return;
+    }
+    
+    // 5. Call upsertDailySummaryEvent with the correct counts
+    upsertDailySummaryEvent(dateObj, booked, left, registryEntry);
+    
+    logTS('miniSyncCalendarSummaryForDate_:end for ' + dateString);
+  } catch (err) {
+    logTS('miniSyncCalendarSummaryForDate_: Error: ' + err);
+    sendThrottledError('miniSyncCalendarSummaryForDate_', err);
+  }
+}
+
+/**
+ * Ensures a daily summary event exists or is updated for a given appointment date.
+ * Creates or updates a calendar event with correct title and color.
+ * @param {Date} appointmentDate - Date object for the appointment.
+ * @param {number} bookedCount - Number of bookings made for the date.
+ * @param {number} leftCount - Number of slots left for the date.
+ * @param {Object} registryEntry - Registry entry {formId, sheetName, availabilitySheetName, spreadsheetId}.
+ */
+function upsertDailySummaryEvent(appointmentDate, bookedCount, leftCount, registryEntry) {
+  const dateString = Utilities.formatDate(appointmentDate, TZ, 'yyyy-MM-dd');
+
+  // Holiday guard: immediately return if holiday
+  if (HolidayService.isHoliday(dateString)) {
+    logTS('upsertDailySummaryEvent: early exit on holiday ' + dateString);
+    return;
+  }
+
+  // Input validation
+  if (!(appointmentDate instanceof Date) || isNaN(appointmentDate)) {
+    logTS('upsertDailySummaryEvent: invalid appointmentDate: ' + appointmentDate);
+    return;
+  }
+  if (typeof bookedCount !== 'number' || typeof leftCount !== 'number') {
+    logTS('upsertDailySummaryEvent: invalid counts: ' + bookedCount + ', ' + leftCount);
+    return;
+  }
+  if (!registryEntry || typeof registryEntry !== 'object') {
+    logTS('upsertDailySummaryEvent: invalid registryEntry');
+    return;
+  }
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+    logTS('upsertDailySummaryEvent: Lock busy, skipping for ' + dateString);
+    return;
+  }
+
+  try {
+    const cal = registryEntry.calendarId
+      ? CalendarApp.getCalendarById(registryEntry.calendarId)
+      : CalendarApp.getDefaultCalendar();
+
+    const events = cal.getEventsForDay(appointmentDate, { search: FULL_SUMMARY_TAG });
+
+    // Delete duplicates if any
+    if (events.length > 1) {
+      for (let i = 1; i < events.length; i++) {
+        try {
+          events[i].deleteEvent();
+        } catch (e) {
+          logTS('upsertDailySummaryEvent: error deleting duplicate event: ' + e);
+          sendThrottledError('upsertDailySummaryEvent-deleteDuplicate', e);
+        }
+      }
+    }
+
+    const title = `${leftCount} slots left (${SLOT_CAP} total) ${FULL_SUMMARY_TAG}`;
+    const color = leftCount > 0 ? EVENT_COLOR_AVAILABLE : EVENT_COLOR_FULL;
+
+    if (events.length >= 1) {
+      try {
+        const ev = events[0];
+        ev.setTitle(title);
+        ev.setColor(color);
+        logTS(`upsertDailySummaryEvent: Updated event for ${dateString}`);
+      } catch (e) {
+        logTS('upsertDailySummaryEvent: error updating event: ' + e);
+        sendThrottledError('upsertDailySummaryEvent-updateEvent', e);
+      }
+    } else {
+      try {
+        const ev = cal.createAllDayEvent(title, appointmentDate, { description: FULL_SUMMARY_TAG });
+        ev.setColor(color);
+        logTS(`upsertDailySummaryEvent: Created event for ${dateString}`);
+      } catch (e) {
+        logTS('upsertDailySummaryEvent: error creating event: ' + e);
+        sendThrottledError('upsertDailySummaryEvent-createEvent', e);
+      }
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Purges old responses from the form response sheet based on retention policy.
+ * @param {Object} registryEntry - Registry entry {formId, sheetName, availabilitySheetName, spreadsheetId}.
+ */
+function purgeOldResponses(registryEntry) {
+  logTS('purgeOldResponses:start for ' + registryEntry.sheetName);
+  
+  try {
+    // 1. Open the response sheet
+    let sheet;
+    try {
+      sheet = getSpreadsheet_(registryEntry).getSheetByName(registryEntry.sheetName);
+      if (!sheet) {
+        logTS('purgeOldResponses: sheet not found: ' + registryEntry.sheetName);
+        return;
+      }
+    } catch (err) {
+      sendThrottledError('purgeOldResponses-getSheet', err);
+      return;
+    }
+    
+    let lastRow;
+    try {
+      lastRow = sheet.getLastRow();
+      if (lastRow <= 1) {
+        logTS('purgeOldResponses: no data rows to process');
+        return;
+      }
+    } catch (err) {
+      sendThrottledError('purgeOldResponses-getLastRow', err);
+      return;
+    }
+    
+    // 2. Read timestamps using RESP_DATE_COL constant (now numeric)
+    let timestampColumn;
+    try {
+      // Guard against invalid column index
+      const maxColumns = sheet.getMaxColumns();
+      if (RESP_DATE_COL > maxColumns) {
+        logTS(`purgeOldResponses: RESP_DATE_COL (${RESP_DATE_COL}) exceeds max columns (${maxColumns})`);
+        return;
+      }
+      timestampColumn = sheet.getRange(2, RESP_DATE_COL, lastRow - 1, 1).getValues();
+    } catch (err) {
+      sendThrottledError('purgeOldResponses-getRange', err);
+      return;
+    }
+    
+    // Calculate cutoff date
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - RESPONSE_RETENTION_DAYS);
+    
+    // 3. Delete rows older than RESPONSE_RETENTION_DAYS
+    const rowsToDelete = [];
+    
+    for (let i = 0; i < timestampColumn.length; i++) {
+      const cellValue = timestampColumn[i][0];
+      let rowDate = null;
+      
+      if (cellValue instanceof Date) {
+        rowDate = cellValue;
+      } else if (typeof cellValue === 'string') {
+        rowDate = new Date(cellValue);
+      }
+      
+      if (rowDate && !isNaN(rowDate) && rowDate < cutoffDate) {
+        rowsToDelete.push(i + 2); // +2 because we started from row 2 and i is 0-based
+      }
+    }
+    
+    // Delete rows in reverse order to maintain row indices
+    rowsToDelete.reverse().forEach(rowIndex => {
+      try {
+        sheet.deleteRow(rowIndex);
+        logTS('purgeOldResponses: deleted row ' + rowIndex);
+      } catch (err) {
+        logTS('purgeOldResponses: error deleting row ' + rowIndex + ': ' + err);
+        sendThrottledError('purgeOldResponses-deleteRow', err);
+      }
+    });
+    
+    if (rowsToDelete.length > 0) {
+      logTS('purgeOldResponses: deleted ' + rowsToDelete.length + ' old responses');
+    } else {
+      logTS('purgeOldResponses: no old responses to delete');
+    }
+    
+    logTS('purgeOldResponses:end for ' + registryEntry.sheetName);
+  } catch (err) {
+    logTS('Error in purgeOldResponses: ' + err);
+    sendThrottledError('purgeOldResponses', err);
+    throw err;
+  }
+}
+
+/**
+ * Purges old responses for all forms in the registry.
+ */
+function purgeOldResponsesAll() {
+  FORM_REGISTRY.forEach(entry => purgeOldResponses(entry));
+}
+
+/**
+ * Rebuilds all availability sheets and calendar summary events for all registered forms.
+ * Clears existing data and recreates from current form responses.
+ */
+function rebuildAllAvailabilityAndCalendar() {
+  logTS('rebuildAllAvailabilityAndCalendar:start');
+  
+  try {
+    let lock = LockService.getScriptLock();
+    if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+      logTS('Lock busy, skipping rebuildAllAvailabilityAndCalendar');
+      return;
+    }
+    
+    try {
+      FORM_REGISTRY.forEach(entry => {
+        logTS('rebuildAllAvailabilityAndCalendar: processing ' + entry.sheetName);
+        
+        // 1. Fetch response dates and tally counts
+        const dates = getResponseDates(entry);
+        const counts = tallyByDate(dates);
+        
+        // 2. Clear or create availability sheet
+        const sheet = getOrCreateSheet_(entry);
+        sheet.clearContents();
+        
+        // 3. Write header row
+        sheet.getRange(1, 1, 1, 3).setValues([['Date', 'Booked', 'Slots Left']]);
+        
+        // 4. Build rows for each date with counts
+        const rows = [];
+        Object.keys(counts).forEach(dateString => {
+          const booked = counts[dateString] || 0;
+          const left = SLOT_CAP - booked;
+          rows.push([dateString, booked, left]);
+        });
+        
+        // Write all rows at once if we have data
+        if (rows.length > 0) {
+          sheet.getRange(2, 1, rows.length, 3).setValues(rows);
+        }
+        
+        // 5. Purge existing calendar events for this form
+        purgeCalendarEventsForForm(entry);
+        
+        // 6. Recreate summary events for each date
+        Object.keys(counts).forEach(dateString => {
+          const booked = counts[dateString] || 0;
+          const left = getLeftFromSheet(entry, dateString);
+          const [y, m, d] = dateString.split('-').map(Number);
+          const appointmentDate = new Date(y, m - 1, d);
+          upsertDailySummaryEvent(appointmentDate, booked, left, entry);
+        });
+        
+        logTS('rebuildAllAvailabilityAndCalendar: completed ' + entry.sheetName);
+      });
+      
+      logTS('rebuildAllAvailabilityAndCalendar:end');
+    } finally {
+      lock.releaseLock();
+    }
+  } catch (err) {
+    logTS('Error in rebuildAllAvailabilityAndCalendar: ' + err);
+    sendThrottledError('rebuildAllAvailabilityAndCalendar', err);
+    throw err;
+  }
+}
+
+/**
+ * Purges all calendar summary events for a specific form within a ±1 year window.
+ * @param {Object} registryEntry - Registry entry {formId, sheetName, availabilitySheetName, spreadsheetId}.
+ */
+function purgeCalendarEventsForForm(registryEntry) {
+  if (!registryEntry || typeof registryEntry.sheetName !== 'string') {
+    logTS('purgeCalendarEventsForForm: invalid registryEntry');
+    return;
+  }
+  logTS('purgeCalendarEventsForForm:start for ' + registryEntry.sheetName);
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+    logTS('purgeCalendarEventsForForm: lock busy, skipping for ' + registryEntry.sheetName);
+    return;
+  }
+  try {
+    // Compute ±1 year window
+    const now = new Date();
+    const oneYearAgo = new Date(now.getFullYear() - 1, now.getMonth(), now.getDate());
+    const oneYearFuture = new Date(now.getFullYear() + 1, now.getMonth(), now.getDate());
+    
+    // Fetch all summary events in the window
+    const allSummaryEvents = CAL.getEvents(oneYearAgo, oneYearFuture, { search: FULL_SUMMARY_TAG });
+    
+    // Filter events for this specific form
+    const formEvents = allSummaryEvents.filter(ev => {
+      const description = ev.getDescription();
+      return description.includes(`[form=${registryEntry.sheetName}]`);
+    });
+    
+    logTS(`purgeCalendarEventsForForm: found ${formEvents.length} events for ${registryEntry.sheetName}`);
+    
+    // Delete events in chunks
+    chunkArray(formEvents, CHUNK_SIZE).forEach(chunk => {
+      try {
+        chunk.forEach(ev => ev.deleteEvent());
+        logTS(`purgeCalendarEventsForForm: deleted ${chunk.length} events for ${registryEntry.sheetName}`);
+      } catch (e) {
+        logTS('purgeCalendarEventsForForm: chunk delete error: ' + e);
+      }
+    });
+    
+    logTS('purgeCalendarEventsForForm:end for ' + registryEntry.sheetName);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Integrity Checker: cleans up old events and form options regularly.
+ */
+function checkCalendarIntegrity() {
+  try {
+    let lock = LockService.getScriptLock();
+    if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+      logTS('Lock busy, skipping checkCalendarIntegrity');
+      return;
+    }
+    try {
+      // Throttle integrity check to once per minute
+      const propsInt = PropertiesService.getScriptProperties();
+      const nowInt = Date.now();
+      const lastInt = parseInt(propsInt.getProperty('LAST_INTEGRITY_TS') || '0', 10);
+      if (nowInt - lastInt < THROTTLE_INTERVAL_MS) {
+        logTS('Skipping checkCalendarIntegrity due to throttle');
+        return;
+      }
+      propsInt.setProperty('LAST_INTEGRITY_TS', String(nowInt));
+      
+      logTS('checkCalendarIntegrity:start');
+      // Using first form in registry for form dropdown cleanup
+      const primaryEntry = FORM_REGISTRY[0];
+      const dates = getResponseDates(primaryEntry);
+      const respCount = dates.length;
+      const props = PropertiesService.getScriptProperties();
+      const lastCount = props.getProperty('LAST_RESPONSE_COUNT');
+      if (lastCount && parseInt(lastCount, 10) === respCount) {
+        logTS('checkCalendarIntegrity:end');
+        return;
+      }
+      props.setProperty('LAST_RESPONSE_COUNT', String(respCount));
+      
+      // Remove holiday summaries and appointments within advance window before other cleanup
+      const now = new Date();
+      const holidayEnd = new Date(now.getTime() + MAX_ADVANCE_DAYS * 86400000);
+      removeHolidaySummaries(now, holidayEnd);
+      // Upsert holiday events back
+      try {
+        HolidayService.upsertHolidayEvents(now, holidayEnd);
+      } catch (err) {
+        logTS('checkCalendarIntegrity: error upserting holiday events: ' + err);
+        sendThrottledError('checkCalendarIntegrity-upsertHolidayEvents', err);
+      }
+      // Remove past Appointment events
+      const yesterdayEnd = getEndOfDay_(new Date(now.getTime() - 24 * 60 * 60 * 1000));
+      let pastAppointments = [];
+      try {
+        pastAppointments = CAL.getEvents(new Date(1970, 0, 1), yesterdayEnd)
+          .filter(ev => ev.getTitle().startsWith(TAG_APPOINTMENT));
+      } catch (calErr) {
+        sendThrottledError('checkCalendarIntegrity-getPastAppointments', calErr);
+      }
+      chunkArray(pastAppointments, CHUNK_SIZE).forEach(chunk => {
+        try { chunk.forEach(ev => ev.deleteEvent()); }
+        catch(e){ 
+          logTS('Chunk delete error: '+e); 
+          sendThrottledError('checkCalendarIntegrity-deletePastAppointments', e);
+        }
+      });
+      // Remove past summary events
+      let pastSummaries = [];
+      try {
+        pastSummaries = CAL.getEvents(new Date(1970, 0, 1), yesterdayEnd)
+          .filter(ev => ev.getDescription().indexOf(FULL_SUMMARY_TAG) === 0);
+      } catch (calErr) {
+        sendThrottledError('checkCalendarIntegrity-getPastSummaries', calErr);
+      }
+      chunkArray(pastSummaries, CHUNK_SIZE).forEach(chunk => {
+        try { chunk.forEach(ev => ev.deleteEvent()); }
+        catch(e){ 
+          logTS('Chunk delete error: '+e); 
+          sendThrottledError('checkCalendarIntegrity-deletePastSummaries', e);
+        }
+      });
+      // Delete orphaned upcoming appointments
+      const validDates = new Set(dates);
+      const rangeEnd = new Date(now);
+      rangeEnd.setDate(now.getDate() + 30);
+      let upcoming = [];
+      try {
+        upcoming = CAL.getEvents(now, rangeEnd);
+      } catch (calErr) {
+        sendThrottledError('checkCalendarIntegrity-getUpcomingEvents', calErr);
+      }
+      const orphanedEvents = [];
+      upcoming.forEach(ev => {
+        try {
+          const title = ev.getTitle();
+          if (!title.startsWith(TAG_APPOINTMENT)) return;
+          const evDate = formatYMD_(ev.getStartTime());
+          if (!validDates.has(evDate)) {
+            orphanedEvents.push(ev);
+          }
+        } catch (evErr) {
+          sendThrottledError('checkCalendarIntegrity-processEvent', evErr);
+        }
+      });
+      chunkArray(orphanedEvents, CHUNK_SIZE).forEach(chunk => {
+        try { chunk.forEach(ev => ev.deleteEvent()); }
+        catch(e){ 
+          logTS('Chunk delete error: '+e); 
+          sendThrottledError('checkCalendarIntegrity-deleteOrphanedEvents', e);
+        }
+      });
+      const deletedCount = orphanedEvents.length;
+      if (deletedCount > 0) {
+        // Instead of full sync, just refresh summaries for affected dates
+        const affectedDates = new Set();
+        orphanedEvents.forEach(ev => {
+          const evDate = formatYMD_(ev.getStartTime());
+          affectedDates.add(evDate);
+        });
+        
+        // Refresh summaries for affected dates only (within business days window)
+        const currentCounts = cachedCounts || tallyByDate(getResponseDates(primaryEntry));
+        const { availDates } = buildBusinessDays(currentCounts);
+        const availDatesSet = new Set(availDates);
+        
+        affectedDates.forEach(dateStr => {
+          // Early exit on holidays before any summary creation
+          if (HolidayService.isHoliday(dateStr)) {
+            logTS('checkCalendarIntegrity: skipping holiday ' + dateStr);
+            return;
+          }
+          // Only update summaries for dates within the business days window
+          if (availDatesSet.has(dateStr)) {
+            const used = currentCounts[dateStr] || 0;
+            const left = getLeftFromSheet(primaryEntry, dateStr);
+            if (left > 0) { // Only update if date still has availability
+              try {
+                const appointmentDate = DateUtils.parseDate(dateStr);
+                if (appointmentDate) {
+                  upsertDailySummaryEvent(appointmentDate, used, left, primaryEntry);
+                }
+              } catch (err) {
+                sendThrottledError('checkCalendarIntegrity-upsertSummary', err);
+              }
+            }
+          }
+        });
+      }
+      // Prune yesterday from form dropdown
+      try {
+        const yesterday = new Date();
+        yesterday.setDate(yesterday.getDate() - 1);
+        const yStr = formatYMD_(yesterday);
+        const form = FormApp.openById(primaryEntry.formId);
+        const li = getAppointmentListItem_(form);
+        const allVals = li.getChoices().map(c => c.getValue());
+        const filtered = allVals.filter(v => !v.startsWith(yStr));
+        li.setChoiceValues(filtered);
+        cachedListItem = null;
+      } catch (formErr) {
+        sendThrottledError('checkCalendarIntegrity-pruneFormDropdown', formErr);
+      }
+      logTS('checkCalendarIntegrity:end');
+    } finally {
+      lock.releaseLock();
+    }
+  } catch (err) {
+    Logger.log('Error in checkCalendarIntegrity: ' + err);
+    sendThrottledError('checkCalendarIntegrity', err);
+    throw err;
+  }
+}
+
+/** Private Helpers **/
+
+/**
+ * Retrieves the ListItem for "Date of Appointment" from a specific form.
+ * @param {Form} form - FormApp Form instance.
+ * @return {FormListItem} The list item.
+ * @throws If the item is not found.
+ */
+function getAppointmentListItem_(form) {
+  if (cachedListItem && cachedListItem.getParentFormId && cachedListItem.getParentFormId() === form.getId()) {
+    return cachedListItem;
+  }
+  const item = form.getItems(FormApp.ItemType.LIST)
+                   .find(i => i.asListItem().getTitle() === 'Date of Appointment');
+  if (!item) throw new Error('No LIST item titled "Date of Appointment"');
+  const listItem = item.asListItem();
+  listItem.getParentFormId = () => form.getId();
+  cachedListItem = listItem;
+  return listItem;
+}
+
+/**
+ * Returns a Date set to the end of the given day.
+ * @param {Date} date - Base date.
+ * @return {Date} Date at 23:59:59.999 of the same day.
+ */
+function getEndOfDay_(date) {
+  const endOfDay = new Date(date);
+  endOfDay.setHours(23, 59, 59, 999);
+  return endOfDay;
+}
+
+/**
+ * Reads dates from form response sheet, filters out old entries.
+ * @param {Object} registryEntry - Registry entry {formId, sheetName, availabilitySheetName, spreadsheetId}.
+ * @return {string[]} Array of yyyy-MM-dd date strings.
+ */
+function getResponseDates(registryEntry) {
+  logTS('getResponseDates:start for ' + registryEntry.sheetName);
+  
+  let sheet;
+  try {
+    sheet = getSpreadsheet_(registryEntry).getSheetByName(registryEntry.sheetName);
+    if (!sheet) {
+      logTS('getResponseDates: sheet not found: ' + registryEntry.sheetName);
+      return [];
+    }
+  } catch (err) {
+    sendThrottledError('getResponseDates-getSheet', err);
+    return [];
+  }
+  
+  let lastRow;
+  try {
+    lastRow = sheet.getLastRow();
+  } catch (err) {
+    sendThrottledError('getResponseDates-getLastRow', err);
+    return [];
+  }
+  
+  let raw = [];
+  if (lastRow > 1) {
+    try {
+      // Guard against invalid column index
+      const maxColumns = sheet.getMaxColumns();
+      if (RESP_DATE_COL > maxColumns) {
+        logTS(`getResponseDates: RESP_DATE_COL (${RESP_DATE_COL}) exceeds max columns (${maxColumns})`);
+        return [];
+      }
+      raw = sheet.getRange(2, RESP_DATE_COL, lastRow - 1, 1).getValues();
+    } catch (err) {
+      sendThrottledError('getResponseDates-getRange', err);
+      return [];
+    }
+  }
+  
+  const dates = raw.map(([cell]) => {
+    const parsed = safeParseDate_(cell);
+    return parsed;
+  }).filter(Boolean);
+  
+  // Filter by retention policy
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - RESPONSE_RETENTION_DAYS);
+  const cutoffStr = formatYMD_(cutoff);
+  const filtered = dates.filter(d => d >= cutoffStr);
+  logTS('getResponseDates:end for ' + registryEntry.sheetName);
+  return filtered;
+}
+
+/**
+ * Tallies count of entries per date.
+ * @param {string[]} dates - Array of date strings.
+ * @return {Object.<string,number>} Map of date to count.
+ */
+function tallyByDate(dates) {
+  logTS('tallyByDate:start');
+  const counts = dates.reduce((m, d) => {
+    m[d] = (m[d] || 0) + 1;
+    return m;
+  }, {});
+  safeCachePut(CACHE_KEY, JSON.stringify(counts), 300);
+  logTS('tallyByDate:end');
+  return counts;
+}
+
+/**
+ * Builds list of business days and form choice strings.
+ * Limited to BUSINESS_DAYS_WINDOW actual business days (Mon-Fri).
+ * @param {Object.<string,number>} counts - Map of date to booked count.
+ * @return {{availDates:string[],choices:string[]}} Available dates and choice labels.
+ */
+function buildBusinessDays(counts) {
+  logTS('buildBusinessDays:start');
+  const items = [];
+  const today = new Date();
+  let businessDaysFound = 0;
+  let dayOffset = 0;
+  
+  // Count actual business days up to BUSINESS_DAYS_WINDOW
+  while (businessDaysFound < BUSINESS_DAYS_WINDOW) {
+    const d = new Date(today);
+    d.setDate(today.getDate() + dayOffset);
+    const wd = d.getDay();
+    
+    // Skip weekends
+    if (wd !== 0 && wd !== 6) {
+      const key = DateUtils.formatYMD(d);
+      // Skip holidays - prevent holiday dates from ever appearing in items
+      if (HolidayService.isHoliday(key)) {
+        logTS('buildBusinessDays: skipping holiday ' + key);
+        dayOffset++;
+        continue;
+      }
+      const used = counts[key] || 0;
+      const left = SLOT_CAP - used;
+      const weekday = Utilities.formatDate(d, TZ, 'EEE');
+      
+      // Only include dates with available slots
+      if (left > 0) {
+        const label = `${key} ${weekday} (${left} slot${left === 1 ? '' : 's'} left)`;
+        items.push({ date: key, label: label, left: left });
+      }
+      
+      businessDaysFound++;
+    }
+    
+    dayOffset++;
+    
+    // Safety break to prevent infinite loop
+    if (dayOffset > 100) break;
+  }
+  
+  items.sort((a, b) => new Date(a.date) - new Date(b.date));
+  const availDates = items.map(item => item.date);
+  const choices = items.map(item => item.label);
+  
+  logTS('buildBusinessDays:end');
+  return { availDates, choices };
+}
+
+/**
+ * Updates the form's date choice list.
+ * @param {string[]} choices - Array of choice values.
+ * @param {Form} form - FormApp Form instance.
+ */
+function batchUpdateForm(choices, form) {
+  logTS('batchUpdateForm:start for ' + form.getId());
+  const li = getAppointmentListItem_(form);
+  li.setChoiceValues(choices);
+  logTS('batchUpdateForm:end for ' + form.getId());
+}
+
+/**
+ * Syncs per-day summary calendar events.
+ * @param {string[]} availDates - Dates to summarize.
+ * @param {Object.<string,number>} counts - Map of date to booked count.
+ */
+function batchSyncCalendarSummaries(availDates, counts) {
+  logTS('batchSyncCalendarSummaries:start');
+  if (!availDates.length) {
+    logTS('batchSyncCalendarSummaries:end');
+    return;
+  }
+  
+  // Use ONLY upsert helper for each date to ensure exactly one summary per date
+  availDates.forEach(dateStr => {
+    // Early exit on holidays before any summary creation
+    if (HolidayService.isHoliday(dateStr)) {
+      logTS('batchSyncCalendarSummaries: skipping holiday ' + dateStr);
+      return;
+    }
+    const used = counts[dateStr] || 0;
+    const left = getLeftFromSheet(FORM_REGISTRY[0], dateStr);
+    
+    try {
+      const [y, m, d] = dateStr.split('-').map(Number);
+      const appointmentDate = new Date(y, m - 1, d);
+      // Use first form entry as default for legacy calls
+      const entry = FORM_REGISTRY[0];
+      upsertDailySummaryEvent(appointmentDate, used, left, entry);
+    } catch (err) {
+      sendThrottledError('batchSyncCalendarSummaries-upsert', err);
+    }
+  });
+  
+  // Validation: check for duplicate summaries and log anomalies
+  availDates.forEach(dateStr => {
+    try {
+      const [y, m, d] = dateStr.split('-').map(Number);
+      const dayDate = new Date(y, m - 1, d);
+      let summaries;
+      try {
+        summaries = CAL.getEventsForDay(dayDate)
+          .filter(ev => ev.getDescription().indexOf(FULL_SUMMARY_TAG) === 0);
+      } catch (calErr) {
+        sendThrottledError('batchSyncCalendarSummaries-getEventsForDay', calErr);
+        return;
+      }
+      
+      if (summaries.length > 1) {
+        logTS(`ANOMALY: Found ${summaries.length} summary events for ${dateStr}`);
+      } else if (summaries.length === 0) {
+        logTS(`ANOMALY: No summary event found for ${dateStr}`);
+      }
+    } catch (err) {
+      sendThrottledError('batchSyncCalendarSummaries-validation', err);
+    }
+  });
+  
+  logTS('batchSyncCalendarSummaries:end');
+}
+
+/**
+ * Writes availability table into the sheet and applies color coding.
+ * @param {Object} registryEntry - Registry entry {formId, sheetName, availabilitySheetName, spreadsheetId}.
+ * @param {string[]} availDates - Dates to write.
+ * @param {Object.<string,number>} counts - Map of date to booked count.
+ */
+function batchWriteAvailabilitySheet(registryEntry, availDates, counts) {
+  logTS('batchWriteAvailabilitySheet:start for ' + registryEntry.availabilitySheetName);
+  const sheet = getOrCreateSheet_(registryEntry);
+  sheet.clearContents();
+  const rows = [['Date', 'Booked', 'Slots Left']];
+  availDates.forEach(dateStr => {
+    const used = counts[dateStr] || 0;
+    const left = SLOT_CAP - used;
+    rows.push([dateStr, used, left]);
+  });
+  sheet.getRange(1, 1, rows.length, 3).setValues(rows);
+  colorCodeAvailabilitySheet_(registryEntry);
+  logTS('batchWriteAvailabilitySheet:end for ' + registryEntry.availabilitySheetName);
+}
+
+/**
+ * Generates a prefilled form URL for a specific date.
+ * @param {string} dateText - Date string yyyy-MM-dd.
+ * @param {Object} extraFields - Optional extra fields to prefill by field ID.
+ * @return {string} Prefilled form URL.
+ */
+function generatePrefillUrl(dateText, extraFields) {
+  logTS('generatePrefillUrl:start');
+  try {
+    const d = new Date(dateText);
+    const weekday = Utilities.formatDate(d, TZ, 'EEE');
+    // Use first form for demonstration
+    const form = FormApp.openById(FORM_REGISTRY[0].formId);
+    const li = getAppointmentListItem_(form);
+    const choices = li.getChoices().map(c => c.getValue());
+    
+    // Find the matching choice for this date
+    const matchingChoice = choices.find(choice => choice.startsWith(dateText));
+    if (!matchingChoice) {
+      logTS(`generatePrefillUrl: No choice found for date ${dateText}`);
+      return form.getPublishedUrl();
+    }
+    
+    // Create a prefilled response
+    const response = form.createResponse();
+    const listItemResponse = li.createResponse(matchingChoice);
+    response.withItemResponse(listItemResponse);
+    
+    // Add extra fields if provided using FIELD_ID_MAP
+    if (extraFields) {
+      Object.entries(extraFields).forEach(([fieldName, value]) => {
+        try {
+          const itemId = FIELD_ID_MAP[fieldName];
+          if (!itemId) return;
+          const item = form.getItemById(itemId);
+          if (!item) return;
+          const itemType = item.getType();
+          if (itemType === FormApp.ItemType.TEXT) {
+            response.withItemResponse(item.asTextItem().createResponse(value));
+          } else if (itemType === FormApp.ItemType.LIST) {
+            response.withItemResponse(item.asListItem().createResponse(value));
+          } else if (itemType === FormApp.ItemType.MULTIPLE_CHOICE) {
+            response.withItemResponse(item.asMultipleChoiceItem().createResponse(value));
+          }
+        } catch (e) {
+          logTS(`Error prefilling field ${fieldName}: ${e}`);
+        }
+      });
+    }
+    
+    const prefillUrl = response.toPrefilledUrl();
+    logTS('generatePrefillUrl:end');
+    return prefillUrl;
+  } catch (err) {
+    logTS('Error in generatePrefillUrl: ' + err);
+    return FormApp.openById(FORM_REGISTRY[0].formId).getPublishedUrl();
+  }
+}
+
+/**
+ * Decrements the form choice count for a given date.
+ * @param {string} dateText - Date string yyyy-MM-dd.
+ * @param {string} formId - Form ID to target.
+ * @return {number} Remaining slots left.
+ */
+function decrementChoiceForDate(dateText, formId) {
+  logTS('decrementChoiceForDate:start for ' + formId);
+  try {
+    const d = new Date(dateText);
+    const weekday = Utilities.formatDate(d, TZ, 'EEE');
+    const form = FormApp.openById(formId);
+    const li = getAppointmentListItem_(form);
+    const raw = li.getChoices().map(c => c.getValue());
+    let newLeft = 0;
+    let found = false;
+    const updated = raw.map(val => {
+      if (val.startsWith(dateText)) {
+        found = true;
+        const m = val.match(/\((\d+)\s+slots?\s+left\)/);
+        let left = m ? parseInt(m[1], 10) - 1 : SLOT_CAP - 1;
+        if (left < 0) left = 0;
+        newLeft = left;
+        if (left > 0) {
+          return `${dateText} ${weekday} (${left} slot${left === 1 ? '' : 's'} left)`;
+        } else {
+          // Remove fully booked dates from choices
+          return null;
+        }
+      }
+      return val;
+    }).filter(val => val !== null);
+    
+    if (!found) {
+      logTS(`decrementChoiceForDate: Date ${dateText} not found in choices`);
+      cachedListItem = null;
+      return 0;
+    }
+    li.setChoiceValues(updated);
+    logTS('decrementChoiceForDate:end for ' + formId);
+    return newLeft;
+  } catch (err) {
+    logTS('Error in decrementChoiceForDate: ' + err);
+    return 0;
+  }
+}
+
+/**
+ * Ensures exactly one summary event exists for a given date with correct title and color.
+ * This is the SOLE function responsible for creating/updating summary events.
+ * Updates existing event or creates new one if missing. Deletes any duplicates.
+ * Uses script lock to prevent race conditions from parallel execution.
+ * @deprecated Use upsertDailySummaryEvent instead for consistency
+ * @param {string} dateText - Date string yyyy-MM-dd.
+ * @param {number} left - Slots left.
+ */
+function upsertDailySummary(dateText, left) {
+  logTS(`upsertDailySummary:start (deprecated - use upsertDailySummaryEvent) for ${dateText}, ${left} slots left`);
+  
+  // Holiday guard: immediately return if holiday - prevent any event creation/modification
+  if (HolidayService.isHoliday(dateText)) {
+    logTS('upsertDailySummary: early exit on holiday ' + dateText);
+    return;
+  }
+  
+  // Acquire lock to prevent race conditions
+  let lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+    logTS(`upsertDailySummary: Lock busy for ${dateText}, skipping`);
+    return;
+  }
+  
+  try {
+    const [y, m, d] = dateText.split('-').map(Number);
+    const start = new Date(y, m - 1, d);
+    
+    // Fetch all existing summary events for this day
+    let summaries;
+    try {
+      summaries = CAL.getEventsForDay(start)
+         .filter(ev => ev.getDescription().indexOf(FULL_SUMMARY_TAG) === 0);
+    } catch (err) {
+      sendThrottledError('upsertDailySummary-getEvents', err);
+      throw err;
+    }
+    
+    const title = left > 0 ? `${left} Slots left (${SLOT_CAP} total)` : `Fully booked`;
+    const color = left > 0 ? EVENT_COLOR_AVAILABLE : EVENT_COLOR_FULL;
+    
+    if (summaries.length > 0) {
+      try {
+        // Update the first existing summary
+        summaries[0].setTitle(title);
+        summaries[0].setColor(color);
+        logTS(`Updated existing summary for ${dateText}`);
+        
+        // Delete any additional summaries to enforce uniqueness
+        if (summaries.length > 1) {
+          logTS(`Removing ${summaries.length - 1} duplicate summaries for ${dateText}`);
+          for (let i = 1; i < summaries.length; i++) {
+            summaries[i].deleteEvent();
+          }
+        }
+      } catch (err) {
+        sendThrottledError('upsertDailySummary-updateEvent', err);
+        throw err;
+      }
+    } else {
+      try {
+        // Create new summary if none exists - this is the ONLY place summaries are created
+        const ev = CAL.createAllDayEvent(title, start, { description: FULL_SUMMARY_TAG });
+        ev.setColor(color);
+        logTS(`Created new summary for ${dateText}`);
+      } catch (err) {
+        sendThrottledError('upsertDailySummary-createEvent', err);
+        throw err;
+      }
+    }
+  } finally {
+    lock.releaseLock();
+  }
+  
+  logTS(`upsertDailySummary:end for ${dateText}`);
+}
+
+/**
+ * Updates a single row in the availability sheet for a given date.
+ * @param {Object} registryEntry - Registry entry {formId, sheetName, availabilitySheetName, spreadsheetId}.
+ * @param {string} dateText - Date string yyyy-MM-dd.
+ * @param {number} left - Slots left.
+ */
+function updateSheetRowForDate(registryEntry, dateText, left) {
+  logTS('updateSheetRowForDate:start for ' + registryEntry.availabilitySheetName);
+  try {
+    const sheet = getOrCreateSheet_(registryEntry);
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) {
+      logTS('updateSheetRowForDate: No data rows found');
+      return;
+    }
+    const lastColumn = sheet.getLastColumn();
+    const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+    const dateIdx = headers.indexOf('Date') + 1;
+    const bookedIdx = headers.indexOf('Booked') + 1;
+    const leftIdx = headers.indexOf('Slots Left') + 1;
+    if (dateIdx === 0 || bookedIdx === 0 || leftIdx === 0) {
+      logTS('updateSheetRowForDate: Required headers not found');
+      return;
+    }
+    const data = sheet.getRange(2, dateIdx, lastRow - 1, 1).getValues();
+    for (let i = 0; i < data.length; i++) {
+      if (data[i][0] === dateText) {
+        const rowNum = i + 2;
+        sheet.getRange(rowNum, bookedIdx).setValue(SLOT_CAP - left);
+        sheet.getRange(rowNum, leftIdx).setValue(left);
+        break;
+      }
+    }
+    sheet.sort({column: dateIdx, ascending: true});
+  } catch (err) {
+    logTS('Error in updateSheetRowForDate: ' + err);
+    throw err;
+  }
+  logTS('updateSheetRowForDate:end for ' + registryEntry.availabilitySheetName);
+}
+
+/**
+ * Retrieves or creates a sheet by name in the registry's spreadsheet.
+ * @param {Object} registryEntry - Registry entry {formId, sheetName, availabilitySheetName, spreadsheetId}.
+ * @return {Sheet} The sheet object.
+ */
+function getOrCreateSheet_(registryEntry) {
+  try {
+    const ss = getSpreadsheet_(registryEntry);
+    let sh = ss.getSheetByName(registryEntry.availabilitySheetName);
+    if (!sh) sh = ss.insertSheet(registryEntry.availabilitySheetName);
+    return sh;
+  } catch (err) {
+    sendThrottledError('getOrCreateSheet_', err);
+    throw err;
+  }
+}
+
+/**
+ * Applies color-coding to availability sheet rows.
+ * Red background if no slots left, green if slots available.
+ * @param {Object} registryEntry - Registry entry {formId, sheetName, availabilitySheetName, spreadsheetId}.
+ * @private
+ */
+function colorCodeAvailabilitySheet_(registryEntry) {
+  logTS('colorCodeAvailabilitySheet_:start for ' + registryEntry.availabilitySheetName);
+  try {
+    const sheet = getOrCreateSheet_(registryEntry);
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) {
+      logTS('colorCodeAvailabilitySheet_: No data rows to color');
+      return;
+    }
+    const lastCol = sheet.getLastColumn();
+    const dataRows = lastRow - 1; // Exclude header row
+    
+    // Get all "Slots Left" values at once
+    const slotsLeftValues = sheet.getRange(2, AVAIL_LEFT_COL, dataRows, 1).getValues();
+    
+    // Build 2D color matrix
+    const colorsMatrix = [];
+    for (let i = 0; i < dataRows; i++) {
+      const left = slotsLeftValues[i][0];
+      const color = left === 0 ? '#f4cccc' : '#d9ead3'; // Red if full, green if available
+      // Create row array with same color for all columns
+      const rowColors = new Array(lastCol).fill(color);
+      colorsMatrix.push(rowColors);
+    }
+    
+    // Apply all background colors in a single batch operation
+    sheet.getRange(2, 1, dataRows, lastCol).setBackgrounds(colorsMatrix);
+    logTS('colorCodeAvailabilitySheet_:end for ' + registryEntry.availabilitySheetName);
+  } catch (err) {
+    sendThrottledError('colorCodeAvailabilitySheet_', err);
+    throw err;
+  }
+}
+
+/**
+ * Updates the form dropdown for a single date without rebuilding the entire dropdown.
+ * @param {Object} registryEntry - Registry entry {formId, sheetName, availabilitySheetName, spreadsheetId}.
+ * @param {Date} dateObj - The appointment date object.
+ * @param {number} slotsLeft - Number of slots remaining for this date.
+ */
+function updateFormDropdownForDate_(registryEntry, dateObj, slotsLeft) {
+  try {
+    logTS('updateFormDropdownForDate_: start for ' + registryEntry.formId + ' date ' + DateUtils.formatYMD(dateObj));
+    
+    const form = FormApp.openById(registryEntry.formId);
+    const li = getAppointmentListItem_(form);
+    const dateString = DateUtils.formatYMD(dateObj);
+    
+    // Get current choice values
+    const currentChoices = li.getChoices().map(c => c.getValue());
+    
+    // Find and update the choice for this specific date
+    const updatedChoices = currentChoices.map(choice => {
+      if (choice.startsWith(dateString)) {
+        if (slotsLeft > 0) {
+          // Update the slot count in the choice text
+          const weekday = Utilities.formatDate(dateObj, TZ, 'EEE');
+          return `${dateString} ${weekday} (${slotsLeft} slot${slotsLeft === 1 ? '' : 's'} left)`;
+        } else {
+          // Remove fully booked dates by returning null
+          return null;
+        }
+      }
+      return choice;
+    }).filter(choice => choice !== null); // Remove null entries (fully booked dates)
+    
+    // Update the form dropdown
+    li.setChoiceValues(updatedChoices);
+    cachedListItem = null; // Invalidate cache
+    
+    logTS('updateFormDropdownForDate_: Updated choice for ' + dateString + ' with ' + slotsLeft + ' slots left');
+  } catch (err) {
+    logTS('updateFormDropdownForDate_: Error updating form dropdown for single date: ' + err);
+    sendThrottledError('updateFormDropdownForDate_', err);
+  }
+}
+
+/**
+ * Processes availability sheet by reading live values and updating calendar/form dropdowns.
+ * @param {Object} registryEntry - Registry entry {formId, sheetName, availabilitySheetName, spreadsheetId}.
+ */
+function processAvailabilitySheet_(registryEntry) {
+  try {
+    logTS('processAvailabilitySheet_: start for ' + registryEntry.availabilitySheetName);
+    
+    // Open spreadsheet and availability sheet
+    const sheet = getSpreadsheet_(registryEntry).getSheetByName(registryEntry.availabilitySheetName);
+    if (!sheet) {
+      logTS('processAvailabilitySheet_: Sheet not found: ' + registryEntry.availabilitySheetName);
+      return;
+    }
+    
+    // Read all rows from the sheet
+    const dataRange = sheet.getDataRange();
+    const values = dataRange.getValues();
+    
+    if (values.length <= 1) {
+      logTS('processAvailabilitySheet_: No data rows found in sheet');
+      return;
+    }
+    
+    const today = new Date();
+    
+    // Process each row (skip header row)
+    for (let i = 1; i < values.length; i++) {
+      const row = values[i];
+      
+      // Parse date from column A using safeParseDate_
+      const dateString = safeParseDate_(row[0]);
+      if (!dateString) continue;
+      
+      const dateObj = DateUtils.parseDate(dateString);
+      if (!dateObj) continue;
+      
+      // Skip past dates
+      if (dateObj < today) continue;
+      
+      // Skip holidays
+      if (HolidayService.isHoliday(dateString)) continue;
+      
+      // Read booked count from column B and slots left from column C
+      const bookedCount = typeof row[AVAIL_BOOKED_COL - 1] === 'number' ? row[AVAIL_BOOKED_COL - 1] : 0;
+      const slotsLeft = typeof row[AVAIL_LEFT_COL - 1] === 'number' ? row[AVAIL_LEFT_COL - 1] : SLOT_CAP;
+      
+      // Update calendar summary event
+      try {
+        upsertDailySummaryEvent(dateObj, bookedCount, slotsLeft, registryEntry);
+      } catch (e) {
+        sendThrottledError('processAvailabilitySheet_-upsertDailySummaryEvent', e);
+      }
+      
+      // Update form dropdown for this date
+      try {
+        updateFormDropdownForDate_(registryEntry, dateObj, slotsLeft);
+      } catch (e) {
+        sendThrottledError('processAvailabilitySheet_-updateFormDropdownForDate_', e);
+      }
+    }
+    
+    logTS('processAvailabilitySheet_: end for ' + registryEntry.availabilitySheetName);
+  } catch (err) {
+    logTS('processAvailabilitySheet_: Error: ' + err);
+    sendThrottledError('processAvailabilitySheet_', err);
+  }
+}
