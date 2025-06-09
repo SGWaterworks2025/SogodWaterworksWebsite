@@ -13,11 +13,19 @@
  * Testing: verify cap reached edge cases and color-coding.
  * Holidays excluded via `HOLIDAY_CAL_ID`.
  */
-const SCRIPT_VERSION = 'v2';
-const CACHE_KEY = SCRIPT_VERSION + '_counts';
-const SUBMIT_COUNT_KEY = SCRIPT_VERSION + '_submit_counter';
-const IS_DEV = false;
-const FORM_REGISTRY = [
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// Versioning & keys
+const SCRIPT_VERSION = 'v2'; // used by: CalendarQuotaManager, HolidayService, safeCacheGet, safeCachePut; tweak: increment when deploying major changes
+const CACHE_KEY = SCRIPT_VERSION + '_counts'; // used by: syncOneForm, tallyByDate; tweak: change suffix to reset cache namespace
+const SUBMIT_COUNT_KEY = SCRIPT_VERSION + '_submit_counter'; // used by: onFormSubmit; tweak: change suffix to reset submit counter
+const IS_DEV = false; // used by: sendThrottledError; tweak: set true for development alerts
+
+// Form registry
+const FORM_REGISTRY = [ // used by: ensureAllFormTriggersExist, updateAvailability_everywhere, onFormSubmit, rebuildAllFormDropdowns; tweak: add/remove forms to expand service coverage
   {
     formId: '1a7K-SKOU5n3mYlCMM7y0bUqvaO_u5LHtDDS3eLq3mhs',
     sheetName: 'Form Responses 1',
@@ -58,46 +66,491 @@ const FORM_REGISTRY = [
 if (!Array.isArray(FORM_REGISTRY) || FORM_REGISTRY.some(r => !r.formId || !r.spreadsheetId)) {
   throw new Error('FORM_REGISTRY entries must all have formId and spreadsheetId');
 }
-const SLOT_CAP = 20;
-const RESPONSE_RETENTION_DAYS = 90;
-const TZ = Session.getScriptTimeZone();
-const THROTTLE_INTERVAL_MS = 60000;
-const LOCK_TIMEOUT_MS = 30000;
-const TAG_APPOINTMENT = 'Appointment:';
-const TAG_HOLIDAY = '[AUTO_HOLIDAY]';
-const CAL = CalendarApp.getDefaultCalendar();
 
-const LAST_NAME_QUESTION_TITLE = 'Last Name';
-const FIRST_NAME_QUESTION_TITLE = 'First Name';
-const PUROK_QUESTION_TITLE = 'Purok';
-const BARANGAY_QUESTION_TITLE = 'Barangay';
-const DATE_QUESTION_TITLE = 'Date of Appointment';
+// Business logic
+const SLOT_CAP = 20; // used by: decrementSlotAllCategories_, updateFormDropdownForDate_, upsertDailySummaryEvent, buildBusinessDays; tweak: increase to allow more daily bookings
+const FUTURE_DAYS = 30; // used by: AvailabilityService.seedAvailabilityWindow; tweak: increase to seed more future dates
+const RESPONSE_RETENTION_DAYS = 90; // used by: purgeOldResponses, getResponseDates; tweak: increase to retain form responses longer
 
-// Mapping question titles to real form item IDs
-const FIELD_ID_MAP = {
-  [LAST_NAME_QUESTION_TITLE]: '1111111111111111111',
-  [FIRST_NAME_QUESTION_TITLE]: '2222222222222222222',
-  [PUROK_QUESTION_TITLE]: '3333333333333333333',
-  [BARANGAY_QUESTION_TITLE]: '4444444444444444444',
-  [DATE_QUESTION_TITLE]: '5555555555555555555'
+// Sheet columns
+const RESP_DATE_COL = 6; // used by: getResponseDates, purgeOldResponses; tweak: change if form response timestamp moves to different column
+const AVAIL_BOOKED_COL = 2; // used by: decrementSlotAllCategories_, decrementSingleCategory_, revertAvailabilityForDate_; tweak: change if availability sheet structure changes
+const AVAIL_LEFT_COL = 3; // used by: decrementSlotAllCategories_, decrementSingleCategory_, updateAvailability_everywhere; tweak: change if availability sheet structure changes
+
+// Sync windows & throttling
+const MAX_ADVANCE_DAYS = 60; // used by: rebuildAppointmentEventsAllForms, updateFormDateDropdown_, checkCalendarIntegrity; tweak: increase to allow booking further in advance
+const BUSINESS_DAYS_WINDOW = 60; // used by: buildBusinessDays; tweak: increase to show more future dates in form dropdown
+const THROTTLE_INTERVAL_MS = 60000; // used by: syncOneForm; tweak: decrease for more frequent syncing
+const LOCK_TIMEOUT_MS = 30000; // used by: decrementSlotAllCategories_, upsertDailySummaryEvent, rebuildAllAvailabilityAndCalendar; tweak: increase if operations need more time
+const BATCH_DAYS_WINDOW = 30; // used by: updateAvailability_everywhere; tweak: increase to process more days in batch operations
+const EMAIL_THROTTLE_MS = 24 * 60 * 60 * 1000; // used by: sendThrottledError; tweak: decrease to receive error emails more frequently
+
+// Calendar quotas
+const CALENDAR_API_CALL_LIMIT_PER_RUN = 20; // used by: CalendarQuotaManager; tweak: increase if single execution needs more calendar calls
+const CALENDAR_API_CALL_LIMIT_PER_DAY = 2000; // used by: CalendarQuotaManager, updateAvailability_everywhere; tweak: adjust based on Google Calendar API quota limits
+
+// Colors & holidays
+const EVENT_COLOR_AVAILABLE = CalendarApp.EventColor.GREEN; // used by: createCalendarEventFromResponse_, upsertDailySummaryEvent; tweak: change color for available appointment slots
+const EVENT_COLOR_FULL = CalendarApp.EventColor.RED; // used by: createCalendarEventFromResponse_, upsertDailySummaryEvent; tweak: change color for fully booked dates
+const HOLIDAY_CAL_ID = 'en.philippines#holiday@group.v.calendar.google.com'; // used by: HolidayService; tweak: change to different country's holiday calendar
+const HOLIDAY_CACHE_KEY = SCRIPT_VERSION + '_holidays'; // used by: HolidayService; tweak: change suffix to reset holiday cache
+const HOLIDAY_CACHE_TTL = 12 * 60 * 60; // used by: HolidayService; tweak: increase to cache holidays longer
+
+// Tags
+const FULL_SUMMARY_TAG = '[DAILY_SUMMARY]'; // used by: upsertDailySummaryEvent, batchSyncCalendarSummaries, checkCalendarIntegrity; tweak: change tag to identify summary events differently
+const TAG_APPOINTMENT = 'Appointment:'; // used by: rebuildAppointmentEventsAllForms, checkCalendarIntegrity; tweak: change prefix for appointment event titles
+const TAG_HOLIDAY = '[AUTO_HOLIDAY]'; // used by: HolidayService; tweak: change tag to identify auto-generated holiday events
+
+// Form-field IDs
+const FIELD_ID_MAP = { // used by: generatePrefillUrl; tweak: update IDs when form structure changes
+  'Last Name': '1111111111111111111',
+  'First Name': '2222222222222222222',
+  'Purok': '3333333333333333333',
+  'Barangay': '4444444444444444444',
+  'Date of Appointment': '5555555555555555555'
 };
 
-const RESP_DATE_COL = 6; // Column F = 6th column (1-based)
-const AVAIL_BOOKED_COL = 2;
-const AVAIL_LEFT_COL = 3;
+// Chunk sizing
+const CHUNK_SIZE = 50; // used by: rebuildAppointmentEventsAllForms, removeHolidaySummaries, checkCalendarIntegrity; tweak: increase for faster bulk operations, decrease to avoid timeouts
 
-const MAX_ADVANCE_DAYS = 60;
-const BUSINESS_DAYS_WINDOW = 60;
-const EMAIL_THROTTLE_MS = 24 * 60 * 60 * 1000;
-const FULL_SUMMARY_TAG = '[DAILY_SUMMARY]';
-const CHUNK_SIZE = 50;
+// ============================================================================
+// RUNTIME SERVICES
+// ============================================================================
+const TZ = Session.getScriptTimeZone();
 const CACHE = CacheService.getScriptCache();
+const CAL = CalendarApp.getDefaultCalendar();
+let _ssCache = {};
+let _formCache = {};
 
-const EVENT_COLOR_AVAILABLE = CalendarApp.EventColor.GREEN;
-const EVENT_COLOR_FULL      = CalendarApp.EventColor.RED;
-const HOLIDAY_CAL_ID = 'en.philippines#holiday@group.v.calendar.google.com';
-const HOLIDAY_CACHE_KEY = SCRIPT_VERSION + '_holidays';
-const HOLIDAY_CACHE_TTL = 12 * 60 * 60;
+function getCachedSpreadsheet(id) {
+  if (!_ssCache[id]) {
+    _ssCache[id] = SpreadsheetApp.openById(id);
+  }
+  return _ssCache[id];
+}
+
+function getCachedForm(id) {
+  if (!_formCache[id]) {
+    _formCache[id] = FormApp.openById(id);
+  }
+  return _formCache[id];
+}
+
+function removeTestTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(tr => {
+    if (tr.getHandlerFunction() === 'runTests') ScriptApp.deleteTrigger(tr);
+  });
+}
+
+
+// Calendar API call counters
+let calendarCallsThisRun = 0;
+let calendarCallsToday = 0;
+
+// Initialize daily counter from cache/properties
+try {
+  const cached = CACHE.get(SCRIPT_VERSION + '_calendar_calls_today');
+  if (cached) {
+    calendarCallsToday = parseInt(cached, 10) || 0;
+  } else {
+    const props = PropertiesService.getScriptProperties();
+    calendarCallsToday = parseInt(props.getProperty(SCRIPT_VERSION + '_calendar_calls_today') || '0', 10);
+  }
+} catch (e) {
+  logTS('Error loading daily calendar call count: ' + e);
+  calendarCallsToday = 0;
+}
+
+/**
+ * Availability management service for seeding windows and guarded decrements
+ */
+const AvailabilityService = {
+  /**
+   * Seeds availability window by ensuring all dates from startDate to startDate+futureDays exist in all sheets
+   * @param {Date} startDate - Starting date (typically today)
+   * @param {number} futureDays - Number of days to seed forward
+   */
+  seedAvailabilityWindow(startDate, futureDays) {
+    logTS('AvailabilityService.seedAvailabilityWindow: start');
+    
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+      logTS('AvailabilityService.seedAvailabilityWindow: Lock busy, skipping');
+      return;
+    }
+    
+    try {
+      const today = DateUtils.formatYMD(startDate);
+      const endDate = new Date(startDate.getTime() + futureDays * 86400000);
+      
+      // Process each registry entry
+      FORM_REGISTRY.forEach(entry => {
+        try {
+          logTS('AvailabilityService.seedAvailabilityWindow: Processing ' + entry.availabilitySheetName);
+          
+          const sheet = getOrCreateSheet_(entry);
+          
+          // Ensure headers exist
+          const dataRange = sheet.getDataRange();
+          const values = dataRange.getValues();
+          if (values.length === 0) {
+            sheet.getRange(1, 1, 1, 3).setValues([['Date', 'Booked', 'Slots Left']]);
+          }
+          
+          // Delete rows where Date < today
+          const rowsToDelete = [];
+          for (let i = 1; i < values.length; i++) {
+            const cellDate = safeParseDate_(values[i][0]);
+            if (cellDate && cellDate < today) {
+              rowsToDelete.push(i + 1); // +1 for 1-based indexing
+            }
+          }
+          
+          // Delete old rows in reverse order
+          rowsToDelete.reverse().forEach(rowIndex => {
+            try {
+              sheet.deleteRow(rowIndex);
+            } catch (e) {
+              logTS('AvailabilityService.seedAvailabilityWindow: Error deleting row: ' + e);
+            }
+          });
+          
+          // Re-read data after deletions
+          const currentData = sheet.getDataRange().getValues();
+          const existingDates = new Set();
+          for (let i = 1; i < currentData.length; i++) {
+            const cellDate = safeParseDate_(currentData[i][0]);
+            if (cellDate) {
+              existingDates.add(cellDate);
+            }
+          }
+          
+          // Generate missing dates and append them
+          const missingRows = [];
+          let currentDate = new Date(startDate);
+          while (currentDate <= endDate) {
+            const dateString = DateUtils.formatYMD(currentDate);
+            
+            // Skip weekends and holidays
+            const dayOfWeek = currentDate.getDay();
+            if (dayOfWeek !== 0 && dayOfWeek !== 6 && !HolidayService.isHoliday(dateString)) {
+              if (!existingDates.has(dateString)) {
+                missingRows.push([dateString, 0, SLOT_CAP]);
+              }
+            }
+            
+            currentDate.setDate(currentDate.getDate() + 1);
+          }
+          
+          // Append missing rows
+          if (missingRows.length > 0) {
+            const lastRow = sheet.getLastRow();
+            sheet.getRange(lastRow + 1, 1, missingRows.length, 3).setValues(missingRows);
+            logTS('AvailabilityService.seedAvailabilityWindow: Added ' + missingRows.length + ' missing dates to ' + entry.availabilitySheetName);
+          }
+          
+        } catch (e) {
+          logTS('AvailabilityService.seedAvailabilityWindow: Error processing ' + entry.availabilitySheetName + ': ' + e);
+          sendThrottledError('AvailabilityService.seedAvailabilityWindow-' + entry.availabilitySheetName, e);
+        }
+      });
+      
+      logTS('AvailabilityService.seedAvailabilityWindow: end');
+    } finally {
+      lock.releaseLock();
+    }
+  },
+
+  /**
+   * Decrements slots across all categories with preflight guard against overbooking
+   * @param {Date} dateObj - The appointment date object
+   * @return {number[]} Array of newLeft values from each sheet, or empty array if failed
+   */
+  decrementSlotAllCategories(dateObj) {
+    logTS('AvailabilityService.decrementSlotAllCategories: start for ' + DateUtils.formatYMD(dateObj));
+    
+    const dateString = DateUtils.formatYMD(dateObj);
+    
+    // Holiday guard: early exit on holidays
+    if (HolidayService.isHoliday(dateString)) {
+      logTS('AvailabilityService.decrementSlotAllCategories: booking on holiday rejected: ' + dateString);
+      throw new Error('Cannot book appointments on holidays');
+    }
+    
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+      logTS('AvailabilityService.decrementSlotAllCategories: Lock busy, skipping for ' + dateString);
+      throw new Error('System busy, please try again');
+    }
+    
+    try {
+      // Phase 1: Read all current "Slots Left" values and check for overbooking
+      const sheetData = [];
+      let hasOverbooking = false;
+      
+      for (const entry of FORM_REGISTRY) {
+        try {
+          const sheet = getSpreadsheet_(entry).getSheetByName(entry.availabilitySheetName);
+          if (!sheet) {
+            logTS('AvailabilityService.decrementSlotAllCategories: Sheet not found: ' + entry.availabilitySheetName);
+            sheetData.push({ entry, sheet: null, targetRow: -1, currentLeft: 0 });
+            continue;
+          }
+          
+          const dataRange = sheet.getDataRange();
+          const values = dataRange.getValues();
+          
+          let targetRow = -1;
+          let currentLeft = SLOT_CAP;
+          
+          // Find the row for this date
+          for (let i = 1; i < values.length; i++) {
+            const cellDate = safeParseDate_(values[i][0]);
+            if (cellDate === dateString) {
+              targetRow = i + 1; // +1 for 1-based indexing
+              currentLeft = typeof values[i][AVAIL_LEFT_COL - 1] === 'number' ? values[i][AVAIL_LEFT_COL - 1] : SLOT_CAP;
+              break;
+            }
+          }
+          
+          // If no row found, create one
+          if (targetRow === -1) {
+            if (values.length === 0) {
+              sheet.getRange(1, 1, 1, 3).setValues([['Date', 'Booked', 'Slots Left']]);
+            }
+            targetRow = sheet.getLastRow() + 1;
+            sheet.getRange(targetRow, 1, 1, 3).setValues([[dateString, 0, SLOT_CAP]]);
+            currentLeft = SLOT_CAP;
+          }
+          
+          // Check for overbooking
+          if (currentLeft <= 0) {
+            hasOverbooking = true;
+            logTS('AvailabilityService.decrementSlotAllCategories: Overbooking detected in ' + entry.availabilitySheetName + ' for ' + dateString);
+          }
+          
+          sheetData.push({ entry, sheet, targetRow, currentLeft });
+          
+        } catch (e) {
+          logTS('AvailabilityService.decrementSlotAllCategories: Error reading ' + entry.availabilitySheetName + ': ' + e);
+          sendThrottledError('AvailabilityService.decrementSlotAllCategories-read-' + entry.availabilitySheetName, e);
+          sheetData.push({ entry, sheet: null, targetRow: -1, currentLeft: 0 });
+          hasOverbooking = true;
+        }
+      }
+      
+      // If any sheet has overbooking, abort the entire operation
+      if (hasOverbooking) {
+        throw new Error('No available slots for ' + dateString);
+      }
+      
+      // Phase 2: Write decremented values to all sheets
+      const newLeftValues = [];
+      
+      for (const data of sheetData) {
+        try {
+          if (!data.sheet || data.targetRow === -1) {
+            newLeftValues.push(0);
+            continue;
+          }
+          
+          const currentBooked = data.sheet.getRange(data.targetRow, AVAIL_BOOKED_COL).getValue();
+          const newBooked = (typeof currentBooked === 'number' ? currentBooked : 0) + 1;
+          const newLeft = Math.max(0, data.currentLeft - 1);
+          
+          data.sheet.getRange(data.targetRow, AVAIL_BOOKED_COL).setValue(newBooked);
+          data.sheet.getRange(data.targetRow, AVAIL_LEFT_COL).setValue(newLeft);
+          
+          newLeftValues.push(newLeft);
+          logTS('AvailabilityService.decrementSlotAllCategories: Updated ' + data.entry.availabilitySheetName + ' for ' + dateString + ': ' + data.currentLeft + '→' + newLeft);
+          
+        } catch (e) {
+          logTS('AvailabilityService.decrementSlotAllCategories: Error writing to ' + data.entry.availabilitySheetName + ': ' + e);
+          sendThrottledError('AvailabilityService.decrementSlotAllCategories-write-' + data.entry.availabilitySheetName, e);
+          newLeftValues.push(0);
+        }
+      }
+      
+      logTS('AvailabilityService.decrementSlotAllCategories: end for ' + dateString + ' with results: ' + JSON.stringify(newLeftValues));
+      return newLeftValues;
+      
+    } finally {
+      lock.releaseLock();
+    }
+  }
+};
+
+/**
+ * Calendar API quota management service
+ */
+const CalendarQuotaManager = {
+  /**
+   * Initialize run counter and reload daily count from cache/properties
+   */
+  initRun() {
+    calendarCallsThisRun = 0;
+    try {
+      const cached = CACHE.get(SCRIPT_VERSION + '_calendar_calls_today');
+      if (cached) {
+        calendarCallsToday = parseInt(cached, 10) || 0;
+      } else {
+        const props = PropertiesService.getScriptProperties();
+        calendarCallsToday = parseInt(props.getProperty(SCRIPT_VERSION + '_calendar_calls_today') || '0', 10);
+      }
+      logTS(`CalendarQuotaManager.initRun: Daily calls: ${calendarCallsToday}, Run calls reset to 0`);
+    } catch (e) {
+      logTS('CalendarQuotaManager.initRun: Error loading daily count: ' + e);
+      calendarCallsToday = 0;
+    }
+  },
+
+  /**
+   * Check if we can make n calendar API calls without exceeding limits
+   * @param {number} n - Number of calls to check
+   * @return {boolean} True if calls can be made
+   */
+  canCall(n = 1) {
+    const canMakeRunCalls = (calendarCallsThisRun + n) <= CALENDAR_API_CALL_LIMIT_PER_RUN;
+    const canMakeDailyCalls = (calendarCallsToday + n) <= CALENDAR_API_CALL_LIMIT_PER_DAY;
+    
+    if (!canMakeRunCalls) {
+      logTS(`CalendarQuotaManager.canCall: Run limit exceeded (${calendarCallsThisRun + n}/${CALENDAR_API_CALL_LIMIT_PER_RUN})`);
+    }
+    if (!canMakeDailyCalls) {
+      logTS(`CalendarQuotaManager.canCall: Daily limit exceeded (${calendarCallsToday + n}/${CALENDAR_API_CALL_LIMIT_PER_DAY})`);
+    }
+    
+    return canMakeRunCalls && canMakeDailyCalls;
+  },
+
+  /**
+   * Record n calendar API calls and update counters
+   * @param {number} n - Number of calls made
+   */
+  recordCall(n = 1) {
+    calendarCallsThisRun += n;
+    calendarCallsToday += n;
+    
+    // Update cache and properties
+    try {
+      CACHE.put(SCRIPT_VERSION + '_calendar_calls_today', String(calendarCallsToday), 24 * 60 * 60);
+      const props = PropertiesService.getScriptProperties();
+      props.setProperty(SCRIPT_VERSION + '_calendar_calls_today', String(calendarCallsToday));
+    } catch (e) {
+      logTS('CalendarQuotaManager.recordCall: Error updating counters: ' + e);
+    }
+    
+    logTS(`CalendarQuotaManager.recordCall: Run: ${calendarCallsThisRun}/${CALENDAR_API_CALL_LIMIT_PER_RUN}, Daily: ${calendarCallsToday}/${CALENDAR_API_CALL_LIMIT_PER_DAY}`);
+  },
+
+  /**
+   * Safely create a calendar event with quota checking
+   * @param {string} title - Event title
+   * @param {Date} date - Event date
+   * @param {Object} options - Event options
+   * @return {CalendarEvent|null} Created event or null if quota exceeded
+   */
+  safeCreateEvent(title, date, options = {}) {
+    if (!this.canCall(1)) {
+      logTS(`CalendarQuotaManager.safeCreateEvent: Skipping event creation due to quota limits: ${title}`);
+      return null;
+    }
+    
+    try {
+      const event = CAL.createAllDayEvent(title, date, options);
+      this.recordCall(1);
+      logTS(`CalendarQuotaManager.safeCreateEvent: Created event: ${title}`);
+      return event;
+    } catch (e) {
+      logTS(`CalendarQuotaManager.safeCreateEvent: Error creating event: ${e}`);
+      sendThrottledError('CalendarQuotaManager.safeCreateEvent', e);
+      return null;
+    }
+  },
+
+  /**
+   * Safely update event title with quota checking
+   * @param {CalendarEvent} event - Event to update
+   * @param {string} newTitle - New title
+   * @return {boolean} True if updated successfully
+   */
+  safeUpdateTitle(event, newTitle) {
+    if (!event) {
+      logTS('CalendarQuotaManager.safeUpdateTitle: No event provided');
+      return false;
+    }
+
+    // Check if title is already correct to avoid unnecessary API call
+    try {
+      const currentTitle = event.getTitle();
+      if (currentTitle === newTitle) {
+        logTS(`CalendarQuotaManager.safeUpdateTitle: Title unchanged, skipping update: ${newTitle}`);
+        return true;
+      }
+    } catch (e) {
+      logTS(`CalendarQuotaManager.safeUpdateTitle: Error getting current title: ${e}`);
+    }
+
+    if (!this.canCall(1)) {
+      logTS(`CalendarQuotaManager.safeUpdateTitle: Skipping title update due to quota limits: ${newTitle}`);
+      return false;
+    }
+    
+    try {
+      event.setTitle(newTitle);
+      this.recordCall(1);
+      logTS(`CalendarQuotaManager.safeUpdateTitle: Updated title to: ${newTitle}`);
+      return true;
+    } catch (e) {
+      logTS(`CalendarQuotaManager.safeUpdateTitle: Error updating title: ${e}`);
+      sendThrottledError('CalendarQuotaManager.safeUpdateTitle', e);
+      return false;
+    }
+  },
+
+  /**
+   * Safely delete event with quota checking
+   * @param {CalendarEvent} event - Event to delete
+   * @return {boolean} True if deleted successfully
+   */
+  safeDeleteEvent(event) {
+    if (!event) {
+      logTS('CalendarQuotaManager.safeDeleteEvent: No event provided');
+      return false;
+    }
+
+    if (!this.canCall(1)) {
+      logTS('CalendarQuotaManager.safeDeleteEvent: Skipping event deletion due to quota limits');
+      return false;
+    }
+    
+    try {
+      event.deleteEvent();
+      this.recordCall(1);
+      logTS('CalendarQuotaManager.safeDeleteEvent: Event deleted successfully');
+      return true;
+    } catch (e) {
+      logTS(`CalendarQuotaManager.safeDeleteEvent: Error deleting event: ${e}`);
+      sendThrottledError('CalendarQuotaManager.safeDeleteEvent', e);
+      return false;
+    }
+  },
+
+  /**
+   * Reset daily counter (called by midnight trigger)
+   */
+  resetDaily() {
+    calendarCallsToday = 0;
+    try {
+      CACHE.remove(SCRIPT_VERSION + '_calendar_calls_today');
+      const props = PropertiesService.getScriptProperties();
+      props.deleteProperty(SCRIPT_VERSION + '_calendar_calls_today');
+      logTS('CalendarQuotaManager.resetDaily: Daily counter reset to 0');
+    } catch (e) {
+      logTS('CalendarQuotaManager.resetDaily: Error resetting daily counter: ' + e);
+    }
+  }
+};
 
 /**
  * Service to manage creation, deletion, and validation of triggers.
@@ -162,19 +615,29 @@ const TriggerService = {
         .create();
       logTS('TriggerService: created hourly rebuildAllFormDropdowns trigger');
     }
-    // 30-minute updateAvailability_everywhere
+    // Daily midnight updateAvailability_everywhere
     if (!this.triggerExists({handlerFunction: 'updateAvailability_everywhere', eventType: ScriptApp.EventType.CLOCK})) {
       ScriptApp.newTrigger('updateAvailability_everywhere')
         .timeBased()
-        .everyMinutes(30)
+        .everyDays(1)
+        .atHour(0)
         .create();
-      logTS('TriggerService: created 30-min updateAvailability_everywhere trigger');
+      logTS('TriggerService: created daily midnight updateAvailability_everywhere trigger');
+    }
+    // Daily calendar quota reset at midnight
+    if (!this.triggerExists({handlerFunction: 'resetCalendarQuotaDaily', eventType: ScriptApp.EventType.CLOCK})) {
+      ScriptApp.newTrigger('resetCalendarQuotaDaily')
+        .timeBased()
+        .everyDays(1)
+        .atHour(0)
+        .create();
+      logTS('TriggerService: created daily calendar quota reset trigger');
     }
     // Remove extraneous clock triggers
     existing.forEach(trigger => {
       try {
         if (trigger.getEventType() === ScriptApp.EventType.CLOCK &&
-            ['purgeOldResponsesAll', 'rebuildAllFormDropdowns', 'updateAvailability_everywhere']
+            ['purgeOldResponsesAll', 'rebuildAllFormDropdowns', 'updateAvailability_everywhere', 'resetCalendarQuotaDaily']
               .indexOf(trigger.getHandlerFunction()) === -1) {
           ScriptApp.deleteTrigger(trigger);
           logTS('TriggerService: removed extraneous clock trigger for ' + trigger.getHandlerFunction());
@@ -248,21 +711,21 @@ function rebuildAppointmentEventsAllForms() {
     // 3. Recreate appointment events from all form response sheets
     logTS('rebuildAppointmentEventsAllForms: Recreating appointment events from response sheets');
     
-    FORM_REGISTRY.forEach(entry => {
+    for (const entry of FORM_REGISTRY) {
       try {
-        logTS(`rebuildAppointmentEventsAllForms: Processing ${entry.sheetName}`);
+        logTS('rebuildAppointmentEventsAllForms: processing ' + entry.sheetName);
         
         // Open the response sheet
         const sheet = getSpreadsheet_(entry).getSheetByName(entry.sheetName);
         if (!sheet) {
-          logTS(`rebuildAppointmentEventsAllForms: Sheet not found: ${entry.sheetName}`);
-          return;
+          logTS('rebuildAppointmentEventsAllForms: Sheet not found: ' + entry.sheetName);
+          continue;
         }
         
         const lastRow = sheet.getLastRow();
         if (lastRow <= 1) {
-          logTS(`rebuildAppointmentEventsAllForms: No data rows in ${entry.sheetName}`);
-          return;
+          logTS('rebuildAppointmentEventsAllForms: No data rows in ' + entry.sheetName);
+          continue;
         }
         
         // Read all response data from row 2 onward
@@ -321,7 +784,7 @@ function rebuildAppointmentEventsAllForms() {
         logTS(`rebuildAppointmentEventsAllForms: Error processing ${entry.sheetName}: ${entryErr}`);
         sendThrottledError(`rebuildAppointmentEventsAllForms-processEntry-${entry.sheetName}`, entryErr);
       }
-    });
+    }
     
     logTS('rebuildAppointmentEventsAllForms:end');
     
@@ -555,9 +1018,9 @@ const HolidayService = {
           }
           if (holidayEvents.length >= 1) {
             const ev = holidayEvents[0];
-            ev.setTitle(record.title);
+            CalendarQuotaManager.safeUpdateTitle(ev, record.title);
           } else {
-            CAL.createAllDayEvent(record.title, dayDate, { description: TAG_HOLIDAY });
+            CalendarQuotaManager.safeCreateEvent(record.title, dayDate, { description: TAG_HOLIDAY });
           }
         } catch (e) {
           logTS('HolidayService.upsertHolidayEvents: error for date ' + record.date + ': ' + e);
@@ -652,9 +1115,14 @@ function createCalendarEventFromResponse_(responseData, registry, chosenDateObj)
       `Purok: ${purok}\n` +
       `Barangay: ${barangay}`;
 
-    const event = CAL.createAllDayEvent(title, chosenDateObj, {
+    const event = CalendarQuotaManager.safeCreateEvent(title, chosenDateObj, {
       description: description
     });
+
+    if (!event) {
+      logTS('createCalendarEventFromResponse_: Failed to create event due to quota limits');
+      throw new Error('Calendar quota exceeded - could not create appointment event');
+    }
 
     // Color-code based on remaining availability
     const dateString = DateUtils.formatYMD(chosenDateObj);
@@ -673,7 +1141,11 @@ function createCalendarEventFromResponse_(responseData, registry, chosenDateObj)
       }
 
       const color = slotsLeft > 0 ? EVENT_COLOR_AVAILABLE : EVENT_COLOR_FULL;
-      event.setColor(color);
+      try {
+        event.setColor(color);
+      } catch (e) {
+        logTS('createCalendarEventFromResponse_: Error setting event color: ' + e);
+      }
     }
 
     logTS('createCalendarEventFromResponse_: Created appointment event for ' + dateString);
@@ -785,6 +1257,10 @@ function updateFormDateDropdown_(registry) {
       return dateA.localeCompare(dateB);
     });
     
+    if (choices.length === 0) {
+      logTS('updateFormDateDropdown_: no choices for ' + registry.formId + ', skipping update');
+      return;
+    }
     li.setChoiceValues(choices);
     cachedListItem = null; // Invalidate cache
     
@@ -848,10 +1324,25 @@ function removeSpreadsheetTriggers() {
 }
 
 /**
+ * Resets the daily calendar quota counter (called by midnight trigger)
+ */
+function resetCalendarQuotaDaily() {
+  logTS('resetCalendarQuotaDaily: start');
+  try {
+    CalendarQuotaManager.resetDaily();
+    logTS('resetCalendarQuotaDaily: end');
+  } catch (err) {
+    logTS('resetCalendarQuotaDaily: error: ' + err);
+    sendThrottledError('resetCalendarQuotaDaily', err);
+  }
+}
+
+/**
  * Sets up time-driven triggers for daily cleanup and form dropdown rebuilds.
  */
 function setupTimeDrivenTriggers() {
   try {
+    removeTestTriggers_();
     TriggerService.ensureTimeTriggers();
   } catch (err) {
     sendThrottledError('setupTimeDrivenTriggers', err);
@@ -1392,9 +1883,35 @@ function rebuildSlotCounters() {
 }
 
 /**
- * Performs full availability sync for all registered forms.
- * Reads live values from availability sheets, aggregates minimums across categories,
- * and drives calendar summaries and form dropdown updates from aggregated values.
+ * Helper function to build a date window from startDate to startDate+futureDays
+ * Skips weekends and holidays, returns sorted yyyy-MM-dd strings
+ * @param {Date} startDate - Starting date
+ * @param {number} futureDays - Number of days to look ahead
+ * @return {string[]} Array of date strings in yyyy-MM-dd format
+ */
+function buildDateWindow(startDate, futureDays) {
+  const dateWindow = [];
+  const endDate = new Date(startDate.getTime() + futureDays * 86400000);
+  
+  let currentDate = new Date(startDate);
+  while (currentDate <= endDate) {
+    const dayOfWeek = currentDate.getDay();
+    const dateString = DateUtils.formatYMD(currentDate);
+    
+    // Skip weekends and holidays
+    if (dayOfWeek !== 0 && dayOfWeek !== 6 && !HolidayService.isHoliday(dateString)) {
+      dateWindow.push(dateString);
+    }
+    
+    currentDate.setDate(currentDate.getDate() + 1);
+  }
+  
+  return dateWindow.sort();
+}
+
+/**
+ * Nightly orchestrator: fully rebuilds each availability sheet from form responses,
+ * then aggregates across them for calendar summaries and form dropdown updates
  */
 function updateAvailability_everywhere() {
   const lock = LockService.getScriptLock();
@@ -1402,107 +1919,121 @@ function updateAvailability_everywhere() {
     logTS('updateAvailability_everywhere: Lock busy, skipping');
     return;
   }
+  
   try {
-    logTS('updateAvailability_everywhere:start');
+    logTS('updateAvailability_everywhere: start (nightly orchestrator)');
+    
+    // Initialize calendar quota manager
+    CalendarQuotaManager.initRun();
     const today = new Date();
+    const dateWindow = buildDateWindow(today, FUTURE_DAYS);
     
-    // 1. Build map allLeftsByDate = {}
-    const allLeftsByDate = {};
-    
-    FORM_REGISTRY.forEach(entry => {
+    // Build per-form counts by reading and tallying each form's responses
+    const perFormCounts = {};
+    for (const entry of FORM_REGISTRY) {
       try {
-        // Validate entry
-        if (!entry.spreadsheetId || !entry.availabilitySheetName) {
-          logTS('updateAvailability_everywhere: Invalid registry entry: missing spreadsheetId or availabilitySheetName');
-          return;
-        }
-
-        // Open spreadsheet and sheet
-        const ss = SpreadsheetApp.openById(entry.spreadsheetId);
-        const sheet = ss.getSheetByName(entry.availabilitySheetName);
-        if (!sheet) {
-          logTS('updateAvailability_everywhere: Sheet missing: ' + entry.availabilitySheetName);
-          return;
+        const dates = getResponseDates(entry);
+        const counts = tallyByDate(dates);
+        perFormCounts[entry.formId] = counts;
+      } catch (e) {
+        logTS('updateAvailability_everywhere: Error getting response dates for ' + entry.formId + ': ' + e);
+        sendThrottledError('updateAvailability_everywhere-getResponseDates-' + entry.formId, e);
+        perFormCounts[entry.formId] = {};
+      }
+    }
+    
+    // For each entry: clear its sheet and batch-write rows from form response tallies
+    for (const entry of FORM_REGISTRY) {
+      try {
+        logTS('updateAvailability_everywhere: Rebuilding sheet ' + entry.availabilitySheetName);
+        
+        const sheet = getOrCreateSheet_(entry);
+        const counts = perFormCounts[entry.formId] || {};
+        
+        // Clear existing data and write headers
+        sheet.clearContents();
+        sheet.getRange(1, 1, 1, 3).setValues([['Date', 'Booked', 'Slots Left']]);
+        
+        // Build rows for each date in the window
+        const rows = [];
+        dateWindow.forEach(dateStr => {
+          const booked = counts[dateStr] || 0;
+          const left = SLOT_CAP - booked;
+          rows.push([dateStr, booked, left]);
+        });
+        
+        // Write all rows at once if we have data
+        if (rows.length > 0) {
+          sheet.getRange(2, 1, rows.length, 3).setValues(rows);
         }
         
-        // Read all data from sheet
-        const data = sheet.getDataRange().getValues();
-        if (data.length <= 1) {
-          logTS('updateAvailability_everywhere: No data rows in sheet: ' + entry.availabilitySheetName);
-          return;
-        }
-
-        // Read sheet rows into [{dateStr, left}]
-        for (let i = 1; i < data.length; i++) {
-          const row = data[i];
-          
-          // Parse date from row[0]
-          const dateStr = safeParseDate_(row[0]);
-          if (!dateStr) continue;
-          
-          const dateObj = DateUtils.parseDate(dateStr);
-          if (!dateObj) continue;
-          
-          // Skip past dates
-          if (dateObj < today) continue;
-          
-          // Skip holidays
-          if (HolidayService.isHoliday(dateStr)) continue;
-
-          // Extract left directly from sheet columns
-          const left = Number(row[AVAIL_LEFT_COL - 1]) || 0;
-          
-          // Add to allLeftsByDate map
-          if (!allLeftsByDate[dateStr]) {
-            allLeftsByDate[dateStr] = [];
-          }
-          allLeftsByDate[dateStr].push(left);
-        }
+        // Apply color coding
+        colorCodeAvailabilitySheet_(entry);
+        
       } catch (e) {
-        logTS('updateAvailability_everywhere: Error reading ' + entry.availabilitySheetName + ': ' + e);
-        sendThrottledError('updateAvailability_everywhere-read-' + entry.formId, e);
+        logTS('updateAvailability_everywhere: Error rebuilding sheet ' + entry.availabilitySheetName + ': ' + e);
+        sendThrottledError('updateAvailability_everywhere-rebuildSheet-' + entry.formId, e);
       }
+    }
+    
+    // Aggregate totalBookedByDate and minLeftByDate across all forms
+    const totalBookedByDate = {};
+    const minLeftByDate = {};
+    
+    dateWindow.forEach(dateStr => {
+      let totalBooked = 0;
+      let minLeft = SLOT_CAP;
+      
+      FORM_REGISTRY.forEach(entry => {
+        const counts = perFormCounts[entry.formId] || {};
+        const booked = counts[dateStr] || 0;
+        const left = SLOT_CAP - booked;
+        
+        totalBooked += booked;
+        minLeft = Math.min(minLeft, left);
+      });
+      
+      totalBookedByDate[dateStr] = totalBooked;
+      minLeftByDate[dateStr] = minLeft;
     });
     
-    // 2. For each dateStr in map: compute minLeft and update calendar/forms
-    Object.keys(allLeftsByDate).forEach(dateStr => {
+    // For each date: update calendar summary event with aggregated data
+    dateWindow.forEach(dateStr => {
       try {
         const dateObj = DateUtils.parseDate(dateStr);
         if (!dateObj) return;
         
-        const leftValues = allLeftsByDate[dateStr];
-        const minLeft = Math.min(...leftValues);
+        const totalBooked = totalBookedByDate[dateStr];
+        const minLeft = minLeftByDate[dateStr];
         
-        logTS('updateAvailability_everywhere: Processing ' + dateStr + ' with minLeft=' + minLeft + ' from values: ' + JSON.stringify(leftValues));
-        
-        // Update calendar summary event with minimum availability
-        try {
-          // Use first registry entry as representative for calendar events
-          const anyEntry = FORM_REGISTRY[0];
-          upsertDailySummaryEvent(dateObj, undefined, minLeft, anyEntry);
-        } catch (e) {
-          sendThrottledError('updateAvailability_everywhere-upsert-' + dateStr, e);
-        }
-
-        // Update form dropdown for each registry entry with minimum availability
-        FORM_REGISTRY.forEach(registryEntry => {
-          try {
-            updateFormDropdownForDate_(registryEntry, dateObj, minLeft);
-          } catch (e) {
-            sendThrottledError('updateAvailability_everywhere-updateForm-' + registryEntry.formId + '-' + dateStr, e);
-          }
-        });
-        
+        upsertDailySummaryEvent(dateObj, totalBooked, minLeft, FORM_REGISTRY[0]);
       } catch (e) {
-        logTS('updateAvailability_everywhere: Error processing date ' + dateStr + ': ' + e);
-        sendThrottledError('updateAvailability_everywhere-processDate-' + dateStr, e);
+        logTS('updateAvailability_everywhere: Error updating calendar for ' + dateStr + ': ' + e);
+        sendThrottledError('updateAvailability_everywhere-upsertCalendar-' + dateStr, e);
       }
     });
     
-    // Rebuild appointment events to ensure they mirror sheet data
-    rebuildAppointmentEventsAllForms();
+    // Build form dropdown labels and update all forms
+    const labels = dateWindow.map(dateStr => {
+      const minLeft = minLeftByDate[dateStr];
+      if (minLeft <= 0) return null; // Skip fully booked dates
+      
+      const dateObj = DateUtils.parseDate(dateStr);
+      const weekday = Utilities.formatDate(dateObj, TZ, 'EEE');
+      return `${dateStr} ${weekday} (${minLeft} slot${minLeft === 1 ? '' : 's'} left)`;
+    }).filter(label => label !== null);
     
-    logTS('updateAvailability_everywhere:end');
+    FORM_REGISTRY.forEach(entry => {
+      try {
+        const form = FormApp.openById(entry.formId);
+        batchUpdateForm(labels, form);
+      } catch (e) {
+        logTS('updateAvailability_everywhere: Error updating form ' + entry.formId + ': ' + e);
+        sendThrottledError('updateAvailability_everywhere-updateForm-' + entry.formId, e);
+      }
+    });
+    
+    logTS('updateAvailability_everywhere: end (nightly orchestrator)');
   } finally {
     lock.releaseLock();
   }
@@ -1568,7 +2099,7 @@ function syncOneForm(entry) {
 }
 
 /**
- * Handles Form submit event: streamlined handler with isolated steps.
+ * Simplified form submit handler using AvailabilityService with guarded decrements
  * @param {Object} e - Spreadsheet onFormSubmit event object.
  */
 function onFormSubmit(e) {
@@ -1577,13 +2108,19 @@ function onFormSubmit(e) {
     logTS('onFormSubmit: Lock busy, skipping');
     return;
   }
+  
   try {
-    logTS('onFormSubmit:start');
+    logTS('onFormSubmit: start');
+    
+    // Initialize calendar quota manager
+    CalendarQuotaManager.initRun();
+    
     // Identify sheet and row
     if (!e || !e.range || !e.range.getSheet) {
       logTS('onFormSubmit: invalid event object');
       return;
     }
+    
     const sheet = e.range.getSheet();
     const row = e.range.getRow();
     const rowValues = sheet.getRange(row, 2, 1, 5).getValues();
@@ -1591,64 +2128,56 @@ function onFormSubmit(e) {
       logTS('onFormSubmit: unable to read row values');
       return;
     }
+    
     const [lastName, firstName, purok, barangay, dateChoice] = rowValues[0];
     if (typeof dateChoice !== 'string' || !/^\d{4}-\d{2}-\d{2}/.test(dateChoice)) {
       logTS('onFormSubmit: invalid dateChoice format: ' + dateChoice);
       return;
     }
+    
     const dateString = dateChoice.split(' ')[0];
     const dateObj = new Date(dateString);
     if (isNaN(dateObj)) {
       logTS('onFormSubmit: Invalid dateChoice parsed ' + dateChoice);
       return;
     }
+    
     // Lookup registry entry by spreadsheet ID
     const registryEntry = FORM_REGISTRY.find(r => r.spreadsheetId === sheet.getParent().getId());
     if (!registryEntry) {
       logTS('onFormSubmit: registry lookup failed for spreadsheet: ' + sheet.getParent().getId());
       return;
     }
-    // Update availability using new multi-category approach
-    let primary;
-    try {
-      primary = decrementSingleCategory_(registryEntry, dateObj);
-    } catch (err) {
-      logTS('onFormSubmit: Error in decrementSingleCategory_: ' + err);
-      sendThrottledError('decrementSingleCategory_', err);
-    }
-    if (!primary || primary.newLeft < 0) {
-      logTS('onFormSubmit: no availability for ' + dateString + ' in primary category');
-      return;
-    }
     
-    // Decrement across all categories and get minimum left
+    // Use AvailabilityService for guarded decrement across all categories
     let allLefts;
     try {
-      allLefts = decrementSlotAllCategories_(dateObj);
+      allLefts = AvailabilityService.decrementSlotAllCategories(dateObj);
     } catch (err) {
-      logTS('onFormSubmit: Error in decrementSlotAllCategories_: ' + err);
-      sendThrottledError('decrementSlotAllCategories_', err);
-      allLefts = [];
+      logTS('onFormSubmit: Error in AvailabilityService.decrementSlotAllCategories: ' + err);
+      sendThrottledError('onFormSubmit-decrementSlotAllCategories', err);
+      return; // Abort submission on error
     }
     
     if (!allLefts || allLefts.length === 0) {
-      logTS('onFormSubmit: no availability data from decrementSlotAllCategories_');
+      logTS('onFormSubmit: no availability data from AvailabilityService.decrementSlotAllCategories');
       return;
     }
     
-    const aggregateLeft = Math.min(...allLefts);
-    if (aggregateLeft < 0) {
-      logTS('onFormSubmit: aggregate availability exhausted for ' + dateString);
+    const minLeft = Math.min(...allLefts);
+    if (minLeft < 0) {
+      logTS('onFormSubmit: negative availability detected for ' + dateString);
       return;
     }
     
-    // Upsert summary event with aggregate availability
+    // Upsert summary event with minimum availability
     try {
-      upsertDailySummaryEvent(dateObj, primary.newBooked, aggregateLeft, registryEntry);
+      upsertDailySummaryEvent(dateObj, undefined, minLeft, registryEntry);
     } catch (err) {
       logTS('onFormSubmit: Error in upsertDailySummaryEvent: ' + err);
-      sendThrottledError('upsertDailySummaryEvent', err);
+      sendThrottledError('onFormSubmit-upsertDailySummaryEvent', err);
     }
+    
     // Create appointment event
     try {
       createCalendarEventFromResponse_(
@@ -1658,22 +2187,25 @@ function onFormSubmit(e) {
       );
     } catch (err) {
       logTS('onFormSubmit: Error in createCalendarEventFromResponse_: ' + err);
-      sendThrottledError('createCalendarEventFromResponse_', err);
+      sendThrottledError('onFormSubmit-createCalendarEventFromResponse_', err);
     }
-    // Update form dropdown for that date using aggregate availability
+    
+    // Update form dropdown for that date using minimum availability
     try {
-      updateFormDropdownForDate_(registryEntry, dateObj, aggregateLeft);
+      updateFormDropdownForDate_(registryEntry, dateObj, minLeft);
     } catch (err) {
       logTS('onFormSubmit: Error in updateFormDropdownForDate_: ' + err);
-      sendThrottledError('updateFormDropdownForDate_', err);
+      sendThrottledError('onFormSubmit-updateFormDropdownForDate_', err);
     }
+    
     // Purge old responses for this form
     try {
       purgeOldResponses(registryEntry);
     } catch (err) {
       logTS('onFormSubmit: Error in purgeOldResponses: ' + err);
-      sendThrottledError('purgeOldResponses', err);
+      sendThrottledError('onFormSubmit-purgeOldResponses', err);
     }
+    
     // Increment submit counter and schedule fallback if needed
     try {
       const props = PropertiesService.getScriptProperties();
@@ -1691,7 +2223,8 @@ function onFormSubmit(e) {
       logTS('onFormSubmit: Error incrementing submit counter: ' + err);
       sendThrottledError('onFormSubmit-counter', err);
     }
-    logTS('onFormSubmit:end');
+    
+    logTS('onFormSubmit: end');
   } finally {
     lock.releaseLock();
   }
@@ -1972,12 +2505,7 @@ function upsertDailySummaryEvent(appointmentDate, bookedCount, leftCount, regist
     // Delete duplicates if any
     if (events.length > 1) {
       for (let i = 1; i < events.length; i++) {
-        try {
-          events[i].deleteEvent();
-        } catch (e) {
-          logTS('upsertDailySummaryEvent: error deleting duplicate event: ' + e);
-          sendThrottledError('upsertDailySummaryEvent-deleteDuplicate', e);
-        }
+        CalendarQuotaManager.safeDeleteEvent(events[i]);
       }
     }
 
@@ -1987,21 +2515,36 @@ function upsertDailySummaryEvent(appointmentDate, bookedCount, leftCount, regist
     if (events.length >= 1) {
       try {
         const ev = events[0];
-        ev.setTitle(title);
-        ev.setColor(color);
-        logTS(`upsertDailySummaryEvent: Updated event for ${dateString}`);
+        
+        // Check if title is already correct to avoid unnecessary API call
+        const currentTitle = ev.getTitle();
+        if (currentTitle === title) {
+          logTS(`upsertDailySummaryEvent: Title unchanged for ${dateString}, skipping update`);
+          return;
+        }
+        
+        const titleUpdated = CalendarQuotaManager.safeUpdateTitle(ev, title);
+        if (titleUpdated) {
+          try {
+            ev.setColor(color);
+          } catch (e) {
+            logTS('upsertDailySummaryEvent: error setting color: ' + e);
+          }
+          logTS(`upsertDailySummaryEvent: Updated event for ${dateString}`);
+        }
       } catch (e) {
         logTS('upsertDailySummaryEvent: error updating event: ' + e);
         sendThrottledError('upsertDailySummaryEvent-updateEvent', e);
       }
     } else {
-      try {
-        const ev = cal.createAllDayEvent(title, appointmentDate, { description: FULL_SUMMARY_TAG });
-        ev.setColor(color);
+      const ev = CalendarQuotaManager.safeCreateEvent(title, appointmentDate, { description: FULL_SUMMARY_TAG });
+      if (ev) {
+        try {
+          ev.setColor(color);
+        } catch (e) {
+          logTS('upsertDailySummaryEvent: error setting color on new event: ' + e);
+        }
         logTS(`upsertDailySummaryEvent: Created event for ${dateString}`);
-      } catch (e) {
-        logTS('upsertDailySummaryEvent: error creating event: ' + e);
-        sendThrottledError('upsertDailySummaryEvent-createEvent', e);
       }
     }
   } finally {
