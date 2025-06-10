@@ -1,7 +1,7 @@
 /**
  * Main worker: 
  *  • Reads form responses (coercing values into Dates),
- *  • Updates the Form’s "Date of Appointment" dropdown,
+ *  • Updates the Form's "Date of Appointment" dropdown,
  *  • Syncs per-day summary events on Calendar,
  *  • Writes an Availability table into a sheet.
  * Retention Policy: filters out form responses older than RESPONSE_RETENTION_DAYS days.
@@ -97,9 +97,9 @@ const HOLIDAY_CACHE_KEY = SCRIPT_VERSION + '_holidays'; // used by: HolidayServi
 const HOLIDAY_CACHE_TTL = 12 * 60 * 60; // used by: HolidayService; tweak: increase to cache holidays longer
 
 // Tags
-const FULL_SUMMARY_TAG = '[DAILY_SUMMARY]'; // used by: upsertDailySummaryEvent, batchSyncCalendarSummaries, checkCalendarIntegrity; tweak: change tag to identify summary events differently
-const TAG_APPOINTMENT = 'Appointment:'; // used by: rebuildAppointmentEventsAllForms, checkCalendarIntegrity; tweak: change prefix for appointment event titles
-const TAG_HOLIDAY = '[AUTO_HOLIDAY]'; // used by: HolidayService; tweak: change tag to identify auto-generated holiday events
+const FULL_SUMMARY_TAG = '[DAILY_SUMMARY]'; // used by: upsertDailySummaryEvent, batchSyncCalendarSummaries, checkCalendarIntegrity
+const APPT_EVENT_TAG = '[APPOINTMENT]'; // used by: rebuildAppointmentEventsAllForms, checkCalendarIntegrity
+const TAG_HOLIDAY = '[AUTO_HOLIDAY]'; // used by: HolidayService
 
 // Form-field IDs
 const FIELD_ID_MAP = { // used by: generatePrefillUrl; tweak: update IDs when form structure changes
@@ -116,32 +116,15 @@ const CHUNK_SIZE = 50; // used by: rebuildAppointmentEventsAllForms, removeHolid
 // ============================================================================
 // RUNTIME SERVICES
 // ============================================================================
+
+// Initialize core services first
 const TZ = Session.getScriptTimeZone();
 const CACHE = CacheService.getScriptCache();
 const CAL = CalendarApp.getDefaultCalendar();
+
+// Initialize caches
 let _ssCache = {};
 let _formCache = {};
-
-function getCachedSpreadsheet(id) {
-  if (!_ssCache[id]) {
-    _ssCache[id] = SpreadsheetApp.openById(id);
-  }
-  return _ssCache[id];
-}
-
-function getCachedForm(id) {
-  if (!_formCache[id]) {
-    _formCache[id] = FormApp.openById(id);
-  }
-  return _formCache[id];
-}
-
-function removeTestTriggers_() {
-  ScriptApp.getProjectTriggers().forEach(tr => {
-    if (tr.getHandlerFunction() === 'runTests') ScriptApp.deleteTrigger(tr);
-  });
-}
-
 
 // Calendar API call counters
 let calendarCallsThisRun = 0;
@@ -160,6 +143,617 @@ try {
   logTS('Error loading daily calendar call count: ' + e);
   calendarCallsToday = 0;
 }
+
+/**
+ * Utility functions for date handling and validation
+ */
+const DateUtils = {
+  /**
+   * Build a Date object from year, month, day components
+   * @param {number} year - Full year
+   * @param {number} month - Month (1-12)
+   * @param {number} day - Day of month
+   * @return {Date} Date object
+   */
+  buildDate(year, month, day) {
+    return new Date(year, month - 1, day);
+  },
+
+  /**
+   * Format date as YYYY-MM-DD
+   * @param {Date} date - Date to format
+   * @return {string} Formatted date string
+   */
+  formatYMD(date) {
+    if (!(date instanceof Date) || isNaN(date)) {
+      throw new Error('Invalid date provided to formatYMD');
+    }
+    return Utilities.formatDate(date, TZ, 'yyyy-MM-dd');
+  },
+
+  /**
+   * Parse YYYY-MM-DD string to Date
+   * @param {string} dateStr - Date string to parse
+   * @return {Date|null} Parsed date or null if invalid
+   */
+  parseDate(dateStr) {
+    if (!dateStr || typeof dateStr !== 'string') return null;
+    try {
+      const match = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (!match) return null;
+      
+      const year = parseInt(match[1], 10);
+      const month = parseInt(match[2], 10);
+      const day = parseInt(match[3], 10);
+      
+      const date = this.buildDate(year, month, day);
+      return isNaN(date) ? null : date;
+    } catch (e) {
+      return null;
+    }
+  },
+
+  /**
+   * Check if date is a business day (not weekend or holiday)
+   * @param {Date} date - Date to check
+   * @return {boolean} True if business day
+   */
+  isBusinessDay(date) {
+    if (!(date instanceof Date) || isNaN(date)) return false;
+    const dayOfWeek = date.getDay();
+    if (dayOfWeek === 0 || dayOfWeek === 6) return false;
+    return !HolidayService.isHoliday(this.formatYMD(date));
+  },
+
+  /**
+   * Add days to a date
+   * @param {Date} date - Base date
+   * @param {number} days - Number of days to add
+   * @return {Date} New date
+   */
+  addDays(date, days) {
+    const result = new Date(date);
+    result.setDate(result.getDate() + days);
+    return result;
+  },
+
+  /**
+   * Get start of day in script timezone
+   * @param {Date} date - Date to get start of day for
+   * @return {Date} Start of day
+   */
+  startOfDay(date) {
+    const result = new Date(date);
+    result.setHours(0, 0, 0, 0);
+    return result;
+  },
+
+  /**
+   * Get end of day in script timezone
+   * @param {Date} date - Date to get end of day for
+   * @return {Date} End of day
+   */
+  endOfDay(date) {
+    const result = new Date(date);
+    result.setHours(23, 59, 59, 999);
+    return result;
+  }
+};
+
+/**
+ * Enhanced error handling and logging service
+ */
+const ErrorService = {
+  /**
+   * Log error with timestamp and context
+   * @param {string} context - Error context
+   * @param {Error} error - Error object
+   * @param {Object} [metadata] - Additional metadata
+   */
+  logError(context, error, metadata = {}) {
+    const timestamp = new Date().toISOString();
+    const errorInfo = {
+      timestamp,
+      context,
+      message: error.message,
+      stack: error.stack,
+      ...metadata
+    };
+    
+    logTS(`ERROR [${context}]: ${error.message}`);
+    if (error.stack) {
+      logTS(`Stack: ${error.stack}`);
+    }
+    if (Object.keys(metadata).length > 0) {
+      logTS(`Metadata: ${JSON.stringify(metadata)}`);
+    }
+    
+    // Store in script properties for debugging
+    try {
+      const props = PropertiesService.getScriptProperties();
+      const recentErrors = JSON.parse(props.getProperty('RECENT_ERRORS') || '[]');
+      recentErrors.unshift(errorInfo);
+      if (recentErrors.length > 100) recentErrors.pop(); // Keep last 100 errors
+      props.setProperty('RECENT_ERRORS', JSON.stringify(recentErrors));
+    } catch (e) {
+      logTS('ErrorService.logError: Failed to store error: ' + e);
+    }
+  },
+
+  /**
+   * Send throttled error notification
+   * @param {string} context - Error context
+   * @param {Error} error - Error object
+   * @param {Object} [metadata] - Additional metadata
+   */
+  sendThrottledError(context, error, metadata = {}) {
+    const errorKey = `${context}_${error.message}`;
+    const now = Date.now();
+    
+    try {
+      const props = PropertiesService.getScriptProperties();
+      const lastSent = parseInt(props.getProperty(errorKey) || '0', 10);
+      
+      if (now - lastSent >= EMAIL_THROTTLE_MS) {
+        this.logError(context, error, metadata);
+        
+        // Send email notification
+        const subject = `[${SCRIPT_VERSION}] Error in ${context}`;
+        const body = `
+Error occurred in ${context}:
+Message: ${error.message}
+Stack: ${error.stack}
+Metadata: ${JSON.stringify(metadata, null, 2)}
+Time: ${new Date().toISOString()}
+        `;
+        
+        MailApp.sendEmail({
+          to: Session.getEffectiveUser().getEmail(),
+          subject: subject,
+          body: body
+        });
+        
+        props.setProperty(errorKey, String(now));
+      }
+    } catch (e) {
+      logTS('ErrorService.sendThrottledError: Failed to send notification: ' + e);
+    }
+  },
+
+  /**
+   * Get recent errors
+   * @param {number} [limit=10] - Maximum number of errors to return
+   * @return {Array} Recent errors
+   */
+  getRecentErrors(limit = 10) {
+    try {
+      const props = PropertiesService.getScriptProperties();
+      const recentErrors = JSON.parse(props.getProperty('RECENT_ERRORS') || '[]');
+      return recentErrors.slice(0, limit);
+    } catch (e) {
+      logTS('ErrorService.getRecentErrors: Failed to get errors: ' + e);
+      return [];
+    }
+  },
+
+  /**
+   * Clear error history
+   */
+  clearErrorHistory() {
+    try {
+      const props = PropertiesService.getScriptProperties();
+      props.deleteProperty('RECENT_ERRORS');
+    } catch (e) {
+      logTS('ErrorService.clearErrorHistory: Failed to clear errors: ' + e);
+    }
+  }
+};
+
+/**
+ * Calendar quota management service
+ */
+const CalendarQuotaManager = {
+  /**
+   * Initialize quota tracking for a run
+   */
+  initRun() {
+    calendarCallsThisRun = 0;
+  },
+
+  /**
+   * Check if we can make more calendar API calls
+   * @param {number} count - Number of calls to check
+   * @return {boolean} True if calls are allowed
+   */
+  canCall(count = 1) {
+    if (calendarCallsThisRun + count > CALENDAR_API_CALL_LIMIT_PER_RUN) {
+      logTS(`CalendarQuotaManager: Run limit exceeded (${calendarCallsThisRun}/${CALENDAR_API_CALL_LIMIT_PER_RUN})`);
+      return false;
+    }
+    if (calendarCallsToday + count > CALENDAR_API_CALL_LIMIT_PER_DAY) {
+      logTS(`CalendarQuotaManager: Daily limit exceeded (${calendarCallsToday}/${CALENDAR_API_CALL_LIMIT_PER_DAY})`);
+      return false;
+    }
+    return true;
+  },
+
+  /**
+   * Record calendar API calls
+   * @param {number} count - Number of calls made
+   */
+  recordCall(count = 1) {
+    calendarCallsThisRun += count;
+    calendarCallsToday += count;
+    
+    // Update daily counter in cache and properties
+    try {
+      CACHE.put(SCRIPT_VERSION + '_calendar_calls_today', String(calendarCallsToday), 21600); // 6 hours
+      PropertiesService.getScriptProperties().setProperty(SCRIPT_VERSION + '_calendar_calls_today', String(calendarCallsToday));
+    } catch (e) {
+      logTS('CalendarQuotaManager.recordCall: Error updating counters: ' + e);
+    }
+  },
+
+  /**
+   * Get current quota usage
+   * @return {Object} Quota usage stats
+   */
+  getQuotaStats() {
+    return {
+      runCalls: calendarCallsThisRun,
+      runLimit: CALENDAR_API_CALL_LIMIT_PER_RUN,
+      dailyCalls: calendarCallsToday,
+      dailyLimit: CALENDAR_API_CALL_LIMIT_PER_DAY
+    };
+  }
+};
+
+/**
+ * Holiday service for managing holiday checks and caching
+ */
+const HolidayService = {
+  _holidayCalendar: null,
+  _initialized: false,
+  _calendarAvailable: false,
+  _manualHolidays: [
+    { month: 1, day: 1, name: "New Year's Day" },
+    { month: 4, day: 9, name: 'Araw ng Kagitingan' },
+    { month: 5, day: 1, name: 'Labor Day' },
+    { month: 6, day: 12, name: 'Independence Day' },
+    { month: 8, day: 21, name: 'Ninoy Aquino Day' },
+    { month: 11, day: 1, name: "All Saints' Day" },
+    { month: 11, day: 2, name: "All Souls' Day" },
+    { month: 11, day: 30, name: 'Bonifacio Day' },
+    { month: 12, day: 8, name: 'Feast of the Immaculate Conception' },
+    { month: 12, day: 25, name: 'Christmas Day' },
+    { month: 12, day: 30, name: 'Rizal Day' },
+    { month: 12, day: 31, name: "New Year's Eve" }
+  ],
+
+  /**
+   * Check if a date is a holiday
+   * @param {string} dateStr - Date string in YYYY-MM-DD format
+   * @return {boolean} True if holiday
+   */
+  isHoliday(dateStr) {
+    if (!dateStr) return false;
+    const date = DateUtils.parseDate(dateStr);
+    if (!date) return false;
+
+    // Check manual holidays
+    const month = date.getMonth() + 1;
+    const day = date.getDate();
+    if (this._manualHolidays.some(h => h.month === month && h.day === day)) {
+      return true;
+    }
+
+    // Check calendar holidays
+    if (!this._initialized) {
+      this.initHolidayCalendar();
+    }
+    if (this._calendarAvailable) {
+      const events = this._holidayCalendar.getEvents(date, date);
+      return events.length > 0;
+    }
+
+    return false;
+  },
+
+  /**
+   * Initialize the holiday calendar
+   */
+  initHolidayCalendar() {
+    if (this._initialized) return;
+    
+    try {
+      this._holidayCalendar = CalendarApp.getCalendarById(HOLIDAY_CAL_ID);
+      this._calendarAvailable = true;
+    } catch (e) {
+      this._calendarAvailable = false;
+      logTS('HolidayService: Calendar access failed: ' + e);
+    }
+    
+    this._initialized = true;
+  }
+};
+
+/**
+ * Calendar sync service for managing events and quotas
+ */
+const CalendarSyncService = {
+  /**
+   * Sync calendar events for a date range
+   * @param {Date} start - Start date
+   * @param {Date} end - End date
+   * @return {Object} Sync results
+   */
+  syncDateRange(start, end) {
+    const results = {
+      summaryEvents: { created: 0, updated: 0, deleted: 0, errors: 0 },
+      appointmentEvents: { created: 0, updated: 0, deleted: 0, errors: 0 }
+    };
+
+    try {
+      // Initialize quota manager
+      CalendarQuotaManager.initRun();
+
+      // Load all events
+      const allEvents = CAL.getEvents(start, end);
+      const summaryEvents = allEvents.filter(e => e.getTitle().includes(FULL_SUMMARY_TAG));
+      const appointmentEvents = allEvents.filter(e => e.getTitle().includes(APPT_EVENT_TAG));
+
+      // Group events by date
+      const eventsByDate = new Map();
+      [...summaryEvents, ...appointmentEvents].forEach(event => {
+        const dateStr = DateUtils.formatYMD(event.getStartTime());
+        if (!eventsByDate.has(dateStr)) {
+          eventsByDate.set(dateStr, { summary: [], appointments: [] });
+        }
+        const dateEvents = eventsByDate.get(dateStr);
+        if (event.getTitle().includes(FULL_SUMMARY_TAG)) {
+          dateEvents.summary.push(event);
+        } else {
+          dateEvents.appointments.push(event);
+        }
+      });
+
+      // Process each date
+      const currentDate = new Date(start);
+      while (currentDate <= end) {
+        try {
+          const dateStr = DateUtils.formatYMD(currentDate);
+          const dateEvents = eventsByDate.get(dateStr) || { summary: [], appointments: [] };
+
+          // Skip holidays
+          if (HolidayService.isHoliday(dateStr)) {
+            currentDate.setDate(currentDate.getDate() + 1);
+            continue;
+          }
+
+          // Sync summary events
+          this.syncSummaryEvents(dateStr, dateEvents.summary, results.summaryEvents);
+
+          // Sync appointment events
+          this.syncAppointmentEvents(dateStr, dateEvents.appointments, results.appointmentEvents);
+
+        } catch (e) {
+          ErrorService.logError('CalendarSyncService.syncDateRange', e, { date: DateUtils.formatYMD(currentDate) });
+          results.summaryEvents.errors++;
+          results.appointmentEvents.errors++;
+        }
+
+        currentDate.setDate(currentDate.getDate() + 1);
+      }
+
+      return results;
+
+    } catch (e) {
+      ErrorService.logError('CalendarSyncService.syncDateRange', e, { start, end });
+      throw e;
+    }
+  },
+
+  /**
+   * Sync summary events for a date
+   * @param {string} dateStr - Date string
+   * @param {CalendarEvent[]} existingEvents - Existing summary events
+   * @param {Object} results - Results object to update
+   */
+  syncSummaryEvents(dateStr, existingEvents, results) {
+    try {
+      const dateObj = DateUtils.parseDate(dateStr);
+      if (!dateObj) {
+        throw new Error(`Invalid date string: ${dateStr}`);
+      }
+
+      // Get availability data
+      const { totalBooked, minLeft } = this.getAvailabilityForDate(dateStr);
+      const expectedTitle = `${minLeft} slots left ${FULL_SUMMARY_TAG}`;
+
+      // Check for existing events with exact title match
+      const existingWithTitle = CAL.getEvents(dateObj, dateObj, { search: expectedTitle });
+      const hasExactMatch = existingWithTitle.length > 0;
+
+      if (existingEvents.length === 0 && !hasExactMatch) {
+        // Create new summary event only if no exact match exists
+        if (CalendarQuotaManager.canCall(1)) {
+          const event = CAL.createAllDayEvent(expectedTitle, dateObj);
+          event.setColor(minLeft > 0 ? EVENT_COLOR_AVAILABLE : EVENT_COLOR_FULL);
+          CalendarQuotaManager.recordCall(1);
+          results.created++;
+        }
+      } else if (existingEvents.length === 1 && !hasExactMatch) {
+        // Update if title doesn't match and no exact match exists
+        const event = existingEvents[0];
+        if (event.getTitle() !== expectedTitle) {
+          if (CalendarQuotaManager.canCall(1)) {
+            event.setTitle(expectedTitle);
+            event.setColor(minLeft > 0 ? EVENT_COLOR_AVAILABLE : EVENT_COLOR_FULL);
+            CalendarQuotaManager.recordCall(1);
+            results.updated++;
+          }
+        }
+      } else if (existingEvents.length > 1 || hasExactMatch) {
+        // Multiple events or exact match exists - clean up duplicates
+        const eventsToKeep = hasExactMatch ? existingWithTitle : [existingEvents[0]];
+        const eventsToDelete = existingEvents.filter(e => !eventsToKeep.includes(e));
+
+        for (const event of eventsToDelete) {
+          if (CalendarQuotaManager.canCall(1)) {
+            event.deleteEvent();
+            CalendarQuotaManager.recordCall(1);
+            results.deleted++;
+          }
+        }
+
+        // Update keeper if needed
+        const keeper = eventsToKeep[0];
+        if (keeper.getTitle() !== expectedTitle) {
+          if (CalendarQuotaManager.canCall(1)) {
+            keeper.setTitle(expectedTitle);
+            keeper.setColor(minLeft > 0 ? EVENT_COLOR_AVAILABLE : EVENT_COLOR_FULL);
+            CalendarQuotaManager.recordCall(1);
+            results.updated++;
+          }
+        }
+      }
+    } catch (e) {
+      ErrorService.logError('CalendarSyncService.syncSummaryEvents', e, { dateStr });
+      results.errors++;
+    }
+  },
+
+  /**
+   * Sync appointment events for a date
+   * @param {string} dateStr - Date string
+   * @param {CalendarEvent[]} existingEvents - Existing appointment events
+   * @param {Object} results - Results object to update
+   */
+  syncAppointmentEvents(dateStr, existingEvents, results) {
+    try {
+      const dateObj = DateUtils.parseDate(dateStr);
+      if (!dateObj) {
+        throw new Error(`Invalid date string: ${dateStr}`);
+      }
+
+      // Get expected appointments
+      const expectedAppointments = this.getExpectedAppointmentsForDate(dateStr);
+      const existingTitles = new Set(existingEvents.map(e => e.getTitle()));
+
+      // Find missing and extra appointments
+      const missing = new Set([...expectedAppointments].filter(x => !existingTitles.has(x)));
+      const extra = new Set([...existingTitles].filter(x => !expectedAppointments.has(x)));
+
+      // Create missing appointments
+      for (const title of missing) {
+        // Check for exact match before creating
+        const existingWithTitle = CAL.getEvents(dateObj, dateObj, { search: title });
+        if (existingWithTitle.length === 0 && CalendarQuotaManager.canCall(1)) {
+          const event = CAL.createAllDayEvent(title, dateObj);
+          event.setColor(EVENT_COLOR_AVAILABLE);
+          CalendarQuotaManager.recordCall(1);
+          results.created++;
+        }
+      }
+
+      // Delete extra appointments
+      for (const title of extra) {
+        const eventsToDelete = existingEvents.filter(e => e.getTitle() === title);
+        for (const event of eventsToDelete) {
+          if (CalendarQuotaManager.canCall(1)) {
+            event.deleteEvent();
+            CalendarQuotaManager.recordCall(1);
+            results.deleted++;
+          }
+        }
+      }
+
+    } catch (e) {
+      ErrorService.logError('CalendarSyncService.syncAppointmentEvents', e, { dateStr });
+      results.errors++;
+    }
+  },
+
+  /**
+   * Get availability data for a date
+   * @param {string} dateStr - Date string
+   * @return {Object} Availability data
+   */
+  getAvailabilityForDate(dateStr) {
+    const totalBooked = {};
+    let minLeft = SLOT_CAP;
+
+    for (const entry of FORM_REGISTRY) {
+      try {
+        const sheet = getCachedSpreadsheet(entry.spreadsheetId).getSheetByName(entry.availabilitySheetName);
+        if (!sheet) continue;
+
+        const data = sheet.getDataRange().getValues();
+        for (let i = 1; i < data.length; i++) {
+          const row = data[i];
+          if (row[0] === dateStr) {
+            const booked = row[AVAIL_BOOKED_COL - 1] || 0;
+            const left = row[AVAIL_LEFT_COL - 1] || SLOT_CAP;
+            totalBooked[entry.formId] = booked;
+            minLeft = Math.min(minLeft, left);
+          }
+        }
+      } catch (e) {
+        ErrorService.logError('CalendarSyncService.getAvailabilityForDate', e, { dateStr, formId: entry.formId });
+      }
+    }
+
+    return { totalBooked, minLeft };
+  },
+
+  /**
+   * Get expected appointments for a date with deduplication
+   * @param {string} dateStr - Date string
+   * @return {Set<string>} Set of expected appointment titles
+   */
+  getExpectedAppointmentsForDate(dateStr) {
+    const expectedTitles = new Set();
+    const seenSubmissions = new Set(); // For deduplication
+
+    for (const entry of FORM_REGISTRY) {
+      try {
+        const sheet = getCachedSpreadsheet(entry.spreadsheetId).getSheetByName(entry.sheetName);
+        if (!sheet) continue;
+
+        const data = sheet.getDataRange().getValues();
+        const headers = data[0];
+        const lastNameCol = headers.indexOf('Last Name');
+        const firstNameCol = headers.indexOf('First Name');
+        const purokCol = headers.indexOf('Purok');
+        const barangayCol = headers.indexOf('Barangay');
+        const dateCol = headers.indexOf('Date of Appointment');
+        const timestampCol = headers.indexOf('Timestamp');
+
+        if (lastNameCol === -1 || firstNameCol === -1 || purokCol === -1 || 
+            barangayCol === -1 || dateCol === -1 || timestampCol === -1) continue;
+
+        // Sort by timestamp to handle duplicates
+        const rows = data.slice(1)
+          .map((row, index) => ({ row, index: index + 1 }))
+          .filter(({ row }) => row[dateCol] === dateStr)
+          .sort((a, b) => new Date(b.row[timestampCol]) - new Date(a.row[timestampCol]));
+
+        for (const { row } of rows) {
+          const submissionKey = `${row[lastNameCol]}-${row[firstNameCol]}-${row[purokCol]}-${row[barangayCol]}`;
+          if (!seenSubmissions.has(submissionKey)) {
+            seenSubmissions.add(submissionKey);
+            const title = `${entry.sheetName}:${row[lastNameCol]}, ${row[firstNameCol]} ${row[purokCol]}, ${row[barangayCol]} ${APPT_EVENT_TAG}`;
+            expectedTitles.add(title);
+          }
+        }
+      } catch (e) {
+        ErrorService.logError('CalendarSyncService.getExpectedAppointmentsForDate', e, { dateStr, formId: entry.formId });
+      }
+    }
+
+    return expectedTitles;
+  }
+};
 
 /**
  * Availability management service for seeding windows and guarded decrements
@@ -380,177 +974,26 @@ const AvailabilityService = {
   }
 };
 
-/**
- * Calendar API quota management service
- */
-const CalendarQuotaManager = {
-  /**
-   * Initialize run counter and reload daily count from cache/properties
-   */
-  initRun() {
-    calendarCallsThisRun = 0;
-    try {
-      const cached = CACHE.get(SCRIPT_VERSION + '_calendar_calls_today');
-      if (cached) {
-        calendarCallsToday = parseInt(cached, 10) || 0;
-      } else {
-        const props = PropertiesService.getScriptProperties();
-        calendarCallsToday = parseInt(props.getProperty(SCRIPT_VERSION + '_calendar_calls_today') || '0', 10);
-      }
-      logTS(`CalendarQuotaManager.initRun: Daily calls: ${calendarCallsToday}, Run calls reset to 0`);
-    } catch (e) {
-      logTS('CalendarQuotaManager.initRun: Error loading daily count: ' + e);
-      calendarCallsToday = 0;
-    }
-  },
-
-  /**
-   * Check if we can make n calendar API calls without exceeding limits
-   * @param {number} n - Number of calls to check
-   * @return {boolean} True if calls can be made
-   */
-  canCall(n = 1) {
-    const canMakeRunCalls = (calendarCallsThisRun + n) <= CALENDAR_API_CALL_LIMIT_PER_RUN;
-    const canMakeDailyCalls = (calendarCallsToday + n) <= CALENDAR_API_CALL_LIMIT_PER_DAY;
-    
-    if (!canMakeRunCalls) {
-      logTS(`CalendarQuotaManager.canCall: Run limit exceeded (${calendarCallsThisRun + n}/${CALENDAR_API_CALL_LIMIT_PER_RUN})`);
-    }
-    if (!canMakeDailyCalls) {
-      logTS(`CalendarQuotaManager.canCall: Daily limit exceeded (${calendarCallsToday + n}/${CALENDAR_API_CALL_LIMIT_PER_DAY})`);
-    }
-    
-    return canMakeRunCalls && canMakeDailyCalls;
-  },
-
-  /**
-   * Record n calendar API calls and update counters
-   * @param {number} n - Number of calls made
-   */
-  recordCall(n = 1) {
-    calendarCallsThisRun += n;
-    calendarCallsToday += n;
-    
-    // Update cache and properties
-    try {
-      CACHE.put(SCRIPT_VERSION + '_calendar_calls_today', String(calendarCallsToday), 24 * 60 * 60);
-      const props = PropertiesService.getScriptProperties();
-      props.setProperty(SCRIPT_VERSION + '_calendar_calls_today', String(calendarCallsToday));
-    } catch (e) {
-      logTS('CalendarQuotaManager.recordCall: Error updating counters: ' + e);
-    }
-    
-    logTS(`CalendarQuotaManager.recordCall: Run: ${calendarCallsThisRun}/${CALENDAR_API_CALL_LIMIT_PER_RUN}, Daily: ${calendarCallsToday}/${CALENDAR_API_CALL_LIMIT_PER_DAY}`);
-  },
-
-  /**
-   * Safely create a calendar event with quota checking
-   * @param {string} title - Event title
-   * @param {Date} date - Event date
-   * @param {Object} options - Event options
-   * @return {CalendarEvent|null} Created event or null if quota exceeded
-   */
-  safeCreateEvent(title, date, options = {}) {
-    if (!this.canCall(1)) {
-      logTS(`CalendarQuotaManager.safeCreateEvent: Skipping event creation due to quota limits: ${title}`);
-      return null;
-    }
-    
-    try {
-      const event = CAL.createAllDayEvent(title, date, options);
-      this.recordCall(1);
-      logTS(`CalendarQuotaManager.safeCreateEvent: Created event: ${title}`);
-      return event;
-    } catch (e) {
-      logTS(`CalendarQuotaManager.safeCreateEvent: Error creating event: ${e}`);
-      sendThrottledError('CalendarQuotaManager.safeCreateEvent', e);
-      return null;
-    }
-  },
-
-  /**
-   * Safely update event title with quota checking
-   * @param {CalendarEvent} event - Event to update
-   * @param {string} newTitle - New title
-   * @return {boolean} True if updated successfully
-   */
-  safeUpdateTitle(event, newTitle) {
-    if (!event) {
-      logTS('CalendarQuotaManager.safeUpdateTitle: No event provided');
-      return false;
-    }
-
-    // Check if title is already correct to avoid unnecessary API call
-    try {
-      const currentTitle = event.getTitle();
-      if (currentTitle === newTitle) {
-        logTS(`CalendarQuotaManager.safeUpdateTitle: Title unchanged, skipping update: ${newTitle}`);
-        return true;
-      }
-    } catch (e) {
-      logTS(`CalendarQuotaManager.safeUpdateTitle: Error getting current title: ${e}`);
-    }
-
-    if (!this.canCall(1)) {
-      logTS(`CalendarQuotaManager.safeUpdateTitle: Skipping title update due to quota limits: ${newTitle}`);
-      return false;
-    }
-    
-    try {
-      event.setTitle(newTitle);
-      this.recordCall(1);
-      logTS(`CalendarQuotaManager.safeUpdateTitle: Updated title to: ${newTitle}`);
-      return true;
-    } catch (e) {
-      logTS(`CalendarQuotaManager.safeUpdateTitle: Error updating title: ${e}`);
-      sendThrottledError('CalendarQuotaManager.safeUpdateTitle', e);
-      return false;
-    }
-  },
-
-  /**
-   * Safely delete event with quota checking
-   * @param {CalendarEvent} event - Event to delete
-   * @return {boolean} True if deleted successfully
-   */
-  safeDeleteEvent(event) {
-    if (!event) {
-      logTS('CalendarQuotaManager.safeDeleteEvent: No event provided');
-      return false;
-    }
-
-    if (!this.canCall(1)) {
-      logTS('CalendarQuotaManager.safeDeleteEvent: Skipping event deletion due to quota limits');
-      return false;
-    }
-    
-    try {
-      event.deleteEvent();
-      this.recordCall(1);
-      logTS('CalendarQuotaManager.safeDeleteEvent: Event deleted successfully');
-      return true;
-    } catch (e) {
-      logTS(`CalendarQuotaManager.safeDeleteEvent: Error deleting event: ${e}`);
-      sendThrottledError('CalendarQuotaManager.safeDeleteEvent', e);
-      return false;
-    }
-  },
-
-  /**
-   * Reset daily counter (called by midnight trigger)
-   */
-  resetDaily() {
-    calendarCallsToday = 0;
-    try {
-      CACHE.remove(SCRIPT_VERSION + '_calendar_calls_today');
-      const props = PropertiesService.getScriptProperties();
-      props.deleteProperty(SCRIPT_VERSION + '_calendar_calls_today');
-      logTS('CalendarQuotaManager.resetDaily: Daily counter reset to 0');
-    } catch (e) {
-      logTS('CalendarQuotaManager.resetDaily: Error resetting daily counter: ' + e);
-    }
+// Helper functions
+function getCachedSpreadsheet(id) {
+  if (!_ssCache[id]) {
+    _ssCache[id] = SpreadsheetApp.openById(id);
   }
-};
+  return _ssCache[id];
+}
+
+function getCachedForm(id) {
+  if (!_formCache[id]) {
+    _formCache[id] = FormApp.openById(id);
+  }
+  return _formCache[id];
+}
+
+function removeTestTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(tr => {
+    if (tr.getHandlerFunction() === 'runTests') ScriptApp.deleteTrigger(tr);
+  });
+}
 
 /**
  * Service to manage creation, deletion, and validation of triggers.
@@ -822,278 +1265,6 @@ const propsEmail = PropertiesService.getScriptProperties();
 // Module-level cache for form list item
 let cachedListItem = null;
 let cachedCounts = null;
-
-/**
- * Centralized holiday service with fallback mechanisms
- */
-const HolidayService = {
-  _holidayCalendar: null,
-  _initialized: false,
-  _calendarAvailable: false,
-  _manualHolidays: [
-    { month: 1, day: 1, name: "New Year's Day" },       // New Year's Day
-    { month: 4, day: 9, name: 'Araw ng Kagitingan' },   // Araw ng Kagitingan
-    { month: 5, day: 1, name: 'Labor Day' },             // Labor Day
-    { month: 6, day: 12, name: 'Independence Day' },    // Independence Day
-    { month: 8, day: 21, name: 'Ninoy Aquino Day' },    // Ninoy Aquino Day
-    { month: 11, day: 1, name: "All Saints' Day" },      // All Saints' Day
-    { month: 11, day: 2, name: "All Souls' Day" },      // All Souls' Day
-    { month: 11, day: 30, name: 'Bonifacio Day' },      // Bonifacio Day
-    { month: 12, day: 8, name: 'Feast of the Immaculate Conception' },  // Feast of the Immaculate Conception
-    { month: 12, day: 25, name: 'Christmas Day' },      // Christmas Day
-    { month: 12, day: 30, name: 'Rizal Day' },          // Rizal Day
-    { month: 12, day: 31, name: "New Year's Eve" }      // New Year's Eve
-  ],
-
-  /**
-   * Calculate National Heroes Day (last Monday of August)
-   * @param {number} year - The year to calculate for
-   * @return {Date} The National Heroes Day date
-   */
-  getNationalHeroesDay(year) {
-    // Start from August 31 and work backwards to find the last Monday
-    let date = new Date(year, 7, 31); // August 31 (month is 0-indexed)
-    while (date.getDay() !== 1) { // 1 = Monday
-      date.setDate(date.getDate() - 1);
-    }
-    return date;
-  },
-
-  /**
-   * Initialize the holiday calendar instance and test access
-   */
-  initHolidayCalendar() {
-    if (this._initialized) return;
-    
-    try {
-      this._holidayCalendar = CalendarApp.getCalendarById(HOLIDAY_CAL_ID);
-      // Test access by trying to get events for a small range
-      const testStart = new Date();
-      const testEnd = new Date(testStart.getTime() + 86400000); // +1 day
-      this._holidayCalendar.getEvents(testStart, testEnd);
-      this._calendarAvailable = true;
-      logTS('HolidayService: Calendar access verified');
-    } catch (e) {
-      this._calendarAvailable = false;
-      logTS('HolidayService: Calendar access failed, will use fallbacks: ' + e);
-    }
-    
-    this._initialized = true;
-  },
-
-  /**
-   * Fetch holiday dates and titles for a range with fallback mechanisms
-   * @param {Date} startDate - Start date
-   * @param {Date} endDate - End date
-   * @return {Array<{date:string, title:string}>} Array of holiday records
-   */
-  fetchRange(startDate, endDate) {
-    this.initHolidayCalendar();
-    
-    const startStr = DateUtils.formatYMD(startDate);
-    const endStr = DateUtils.formatYMD(endDate);
-    const cacheKey = `${SCRIPT_VERSION}_holidays_${startStr}_${endStr}`;
-    
-    // Check cache first
-    const cached = safeCacheGet(cacheKey);
-    if (cached) {
-      try {
-        const records = JSON.parse(cached);
-        logTS(`HolidayService: cache hit for range ${startStr} to ${endStr}`);
-        return records;
-      } catch (e) {
-        logTS('HolidayService: cache parse error: ' + e);
-      }
-    }
-    
-    let records = [];
-    
-    // Try CalendarApp first
-    if (this._calendarAvailable) {
-      try {
-        const events = this._holidayCalendar.getEvents(startDate, endDate);
-        records = events.map(ev => ({
-          date: DateUtils.formatYMD(ev.getStartTime()),
-          title: ev.getTitle()
-        }));
-        logTS(`HolidayService: CalendarApp fetched ${records.length} holidays`);
-      } catch (e) {
-        logTS('HolidayService: CalendarApp fetch failed: ' + e);
-        this._calendarAvailable = false;
-        records = [];
-      }
-    }
-    
-    // Fallback to ICS feed if CalendarApp failed
-    if (records.length === 0 && !this._calendarAvailable) {
-      try {
-        const icsUrl = 'https://calendar.google.com/calendar/ical/en.philippines%23holiday%40group.v.calendar.google.com/public/basic.ics';
-        const response = UrlFetchApp.fetch(icsUrl);
-        const icsContent = response.getContentText();
-        const vevents = icsContent.split('BEGIN:VEVENT').slice(1);
-        const icsRecords = [];
-        vevents.forEach(block => {
-          const text = 'BEGIN:VEVENT' + block;
-          const summaryMatch = text.match(/SUMMARY:(.+)/);
-          const dtMatch = text.match(/DTSTART;VALUE=DATE:(\d{4})(\d{2})(\d{2})/);
-          if (summaryMatch && dtMatch) {
-            const year = parseInt(dtMatch[1], 10);
-            const month = parseInt(dtMatch[2], 10);
-            const day = parseInt(dtMatch[3], 10);
-            const holidayDate = DateUtils.buildDate(year, month, day);
-            if (holidayDate >= startDate && holidayDate <= endDate) {
-              icsRecords.push({
-                date: DateUtils.formatYMD(holidayDate),
-                title: summaryMatch[1]
-              });
-            }
-          }
-        });
-        records = icsRecords;
-        logTS(`HolidayService: ICS fallback fetched ${records.length} holidays`);
-      } catch (e) {
-        logTS('HolidayService: ICS fallback failed: ' + e);
-        records = [];
-      }
-    }
-    
-    // Final fallback to manual recurring rules
-    if (records.length === 0) {
-      const manualRecords = [];
-      const startYear = startDate.getFullYear();
-      const endYear = endDate.getFullYear();
-      for (let year = startYear; year <= endYear; year++) {
-        this._manualHolidays.forEach(holiday => {
-          const holidayDate = DateUtils.buildDate(year, holiday.month, holiday.day);
-          if (holidayDate >= startDate && holidayDate <= endDate) {
-            manualRecords.push({
-              date: DateUtils.formatYMD(holidayDate),
-              title: holiday.name
-            });
-          }
-        });
-        const nhd = this.getNationalHeroesDay(year);
-        if (nhd >= startDate && nhd <= endDate) {
-          manualRecords.push({
-            date: DateUtils.formatYMD(nhd),
-            title: 'National Heroes Day'
-          });
-        }
-      }
-      records = manualRecords;
-      logTS(`HolidayService: Manual rules generated ${records.length} holidays`);
-    }
-    
-    // Cache the results
-    safeCachePut(cacheKey, JSON.stringify(records), HOLIDAY_CACHE_TTL);
-    return records;
-  },
-
-  /**
-   * Upsert holiday events for a given date range.
-   * Ensures one all-day event per holiday with correct title and description TAG_HOLIDAY.
-   * @param {Date} startDate - Start date
-   * @param {Date} endDate - End date
-   */
-  upsertHolidayEvents(startDate, endDate) {
-    logTS(`HolidayService.upsertHolidayEvents:start ${DateUtils.formatYMD(startDate)} to ${DateUtils.formatYMD(endDate)}`);
-    const lock = LockService.getScriptLock();
-    if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
-      logTS('HolidayService.upsertHolidayEvents: Lock busy, skipping');
-      return;
-    }
-    try {
-      const records = this.fetchRange(startDate, endDate);
-      records.forEach(record => {
-        try {
-          const dayDate = DateUtils.parseDate(record.date);
-          if (!dayDate) return;
-          const dayEvents = CAL.getEventsForDay(dayDate);
-          const holidayEvents = dayEvents.filter(ev => ev.getDescription().indexOf(TAG_HOLIDAY) === 0);
-          // Delete duplicates
-          if (holidayEvents.length > 1) {
-            for (let i = 1; i < holidayEvents.length; i++) {
-              holidayEvents[i].deleteEvent();
-            }
-          }
-          if (holidayEvents.length >= 1) {
-            const ev = holidayEvents[0];
-            CalendarQuotaManager.safeUpdateTitle(ev, record.title);
-          } else {
-            CalendarQuotaManager.safeCreateEvent(record.title, dayDate, { description: TAG_HOLIDAY });
-          }
-        } catch (e) {
-          logTS('HolidayService.upsertHolidayEvents: error for date ' + record.date + ': ' + e);
-          sendThrottledError('HolidayService.upsertHolidayEvents', e);
-        }
-      });
-    } finally {
-      lock.releaseLock();
-      logTS('HolidayService.upsertHolidayEvents:end');
-    }
-  },
-
-  /**
-   * Check if a specific date is a holiday
-   * @param {string|Date} dateInput - Date string in yyyy-MM-dd format or Date object
-   * @return {boolean} True if holiday, false otherwise (defaults to true on error)
-   */
-  isHoliday(dateInput) {
-    try {
-      this.initHolidayCalendar();
-      
-      let date;
-      if (dateInput instanceof Date) {
-        date = dateInput;
-      } else {
-        date = DateUtils.parseDate(dateInput);
-        if (!date) {
-          logTS('HolidayService.isHoliday: Invalid date: ' + dateInput);
-          return true; // Assume holiday on invalid date
-        }
-      }
-      
-      // Try calendar first if available
-      if (this._calendarAvailable) {
-        try {
-          const events = this._holidayCalendar.getEventsForDay(date);
-          if (events.length > 0) {
-            logTS('HolidayService.isHoliday: confirmed holiday via calendar ' + DateUtils.formatYMD(date));
-            return true;
-          }
-        } catch (e) {
-          logTS('HolidayService.isHoliday: calendar error, falling back to manual: ' + e);
-          this._calendarAvailable = false;
-        }
-      }
-      
-      // Fallback to manual holiday checks
-      const month = date.getMonth() + 1; // Convert to 1-12
-      const day = date.getDate();
-      const year = date.getFullYear();
-      
-      // Check fixed holidays
-      for (const holiday of this._manualHolidays) {
-        if (holiday.month === month && holiday.day === day) {
-          logTS('HolidayService.isHoliday: confirmed fixed holiday ' + DateUtils.formatYMD(date));
-          return true;
-        }
-      }
-      
-      // Check National Heroes Day (last Monday of August)
-      const nationalHeroesDay = this.getNationalHeroesDay(year);
-      if (date.getTime() === nationalHeroesDay.getTime()) {
-        logTS('HolidayService.isHoliday: confirmed National Heroes Day ' + DateUtils.formatYMD(date));
-        return true;
-      }
-      
-      return false;
-    } catch (e) {
-      logTS('HolidayService.isHoliday: error checking ' + dateInput + ': ' + e);
-      return true; // Assume holiday on error to be safe
-    }
-  }
-};
 
 /**
  * Creates a calendar event for a form submission and handles rollback on failure.
@@ -1382,52 +1553,6 @@ function rebuildAllFormDropdowns() {
     sendThrottledError('rebuildAllFormDropdowns', err);
   }
 }
-
-/**
- * Centralized date utilities for timezone-safe operations
- */
-const DateUtils = {
-  /**
-   * Build a Date object from year, month, day components
-   * @param {number} year - Full year
-   * @param {number} month - Month (1-12)
-   * @param {number} day - Day of month
-   * @return {Date} Date object
-   */
-  buildDate(year, month, day) {
-    return new Date(year, month - 1, day);
-  },
-
-  /**
-   * Format a Date object as yyyy-MM-dd using script timezone
-   * @param {Date} date - Date to format
-   * @return {string} Formatted date string
-   */
-  formatYMD(date) {
-    return Utilities.formatDate(date, TZ, 'yyyy-MM-dd');
-  },
-
-  /**
-   * Parse a date string into a Date object
-   * @param {string} dateText - Date string in yyyy-MM-dd format
-   * @return {Date|null} Date object or null if invalid
-   */
-  parseDate(dateText) {
-    try {
-      const match = dateText.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-      if (!match) return null;
-      
-      const year = parseInt(match[1], 10);
-      const month = parseInt(match[2], 10);
-      const day = parseInt(match[3], 10);
-      
-      const date = this.buildDate(year, month, day);
-      return isNaN(date) ? null : date;
-    } catch (e) {
-      return null;
-    }
-  }
-};
 
 /**
  * Checks if a given date is a holiday.
@@ -1923,117 +2048,50 @@ function updateAvailability_everywhere() {
   try {
     logTS('updateAvailability_everywhere: start (nightly orchestrator)');
     
-    // Initialize calendar quota manager
+    // Initialize services
     CalendarQuotaManager.initRun();
     const today = new Date();
+    const start = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000); // 7 days ago
+    const end = new Date(today.getTime() + MAX_ADVANCE_DAYS * 24 * 60 * 60 * 1000); // MAX_ADVANCE_DAYS ahead
+    
+    // Sync calendar events
+    const syncResults = CalendarSyncService.syncDateRange(start, end);
+    
+    // Log results
+    logTS('updateAvailability_everywhere: Calendar sync results:');
+    logTS(`Summary events: ${JSON.stringify(syncResults.summaryEvents)}`);
+    logTS(`Appointment events: ${JSON.stringify(syncResults.appointmentEvents)}`);
+    
+    // Update form dropdowns
     const dateWindow = buildDateWindow(today, FUTURE_DAYS);
-    
-    // Build per-form counts by reading and tallying each form's responses
-    const perFormCounts = {};
-    for (const entry of FORM_REGISTRY) {
-      try {
-        const dates = getResponseDates(entry);
-        const counts = tallyByDate(dates);
-        perFormCounts[entry.formId] = counts;
-      } catch (e) {
-        logTS('updateAvailability_everywhere: Error getting response dates for ' + entry.formId + ': ' + e);
-        sendThrottledError('updateAvailability_everywhere-getResponseDates-' + entry.formId, e);
-        perFormCounts[entry.formId] = {};
-      }
-    }
-    
-    // For each entry: clear its sheet and batch-write rows from form response tallies
-    for (const entry of FORM_REGISTRY) {
-      try {
-        logTS('updateAvailability_everywhere: Rebuilding sheet ' + entry.availabilitySheetName);
-        
-        const sheet = getOrCreateSheet_(entry);
-        const counts = perFormCounts[entry.formId] || {};
-        
-        // Clear existing data and write headers
-        sheet.clearContents();
-        sheet.getRange(1, 1, 1, 3).setValues([['Date', 'Booked', 'Slots Left']]);
-        
-        // Build rows for each date in the window
-        const rows = [];
-        dateWindow.forEach(dateStr => {
-          const booked = counts[dateStr] || 0;
-          const left = SLOT_CAP - booked;
-          rows.push([dateStr, booked, left]);
-        });
-        
-        // Write all rows at once if we have data
-        if (rows.length > 0) {
-          sheet.getRange(2, 1, rows.length, 3).setValues(rows);
-        }
-        
-        // Apply color coding
-        colorCodeAvailabilitySheet_(entry);
-        
-      } catch (e) {
-        logTS('updateAvailability_everywhere: Error rebuilding sheet ' + entry.availabilitySheetName + ': ' + e);
-        sendThrottledError('updateAvailability_everywhere-rebuildSheet-' + entry.formId, e);
-      }
-    }
-    
-    // Aggregate totalBookedByDate and minLeftByDate across all forms
-    const totalBookedByDate = {};
-    const minLeftByDate = {};
-    
-    dateWindow.forEach(dateStr => {
-      let totalBooked = 0;
-      let minLeft = SLOT_CAP;
-      
-      FORM_REGISTRY.forEach(entry => {
-        const counts = perFormCounts[entry.formId] || {};
-        const booked = counts[dateStr] || 0;
-        const left = SLOT_CAP - booked;
-        
-        totalBooked += booked;
-        minLeft = Math.min(minLeft, left);
-      });
-      
-      totalBookedByDate[dateStr] = totalBooked;
-      minLeftByDate[dateStr] = minLeft;
-    });
-    
-    // For each date: update calendar summary event with aggregated data
-    dateWindow.forEach(dateStr => {
-      try {
-        const dateObj = DateUtils.parseDate(dateStr);
-        if (!dateObj) return;
-        
-        const totalBooked = totalBookedByDate[dateStr];
-        const minLeft = minLeftByDate[dateStr];
-        
-        upsertDailySummaryEvent(dateObj, totalBooked, minLeft, FORM_REGISTRY[0]);
-      } catch (e) {
-        logTS('updateAvailability_everywhere: Error updating calendar for ' + dateStr + ': ' + e);
-        sendThrottledError('updateAvailability_everywhere-upsertCalendar-' + dateStr, e);
-      }
-    });
-    
-    // Build form dropdown labels and update all forms
     const labels = dateWindow.map(dateStr => {
-      const minLeft = minLeftByDate[dateStr];
+      const availability = CalendarSyncService.getAvailabilityForDate(dateStr);
+      const minLeft = availability.minLeft;
+      
       if (minLeft <= 0) return null; // Skip fully booked dates
       
       const dateObj = DateUtils.parseDate(dateStr);
+      if (!dateObj) return null;
+      
       const weekday = Utilities.formatDate(dateObj, TZ, 'EEE');
       return `${dateStr} ${weekday} (${minLeft} slot${minLeft === 1 ? '' : 's'} left)`;
     }).filter(label => label !== null);
     
-    FORM_REGISTRY.forEach(entry => {
+    // Update all forms
+    for (const entry of FORM_REGISTRY) {
       try {
         const form = FormApp.openById(entry.formId);
         batchUpdateForm(labels, form);
       } catch (e) {
-        logTS('updateAvailability_everywhere: Error updating form ' + entry.formId + ': ' + e);
-        sendThrottledError('updateAvailability_everywhere-updateForm-' + entry.formId, e);
+        ErrorService.logError('updateAvailability_everywhere', e, { formId: entry.formId });
       }
-    });
+    }
     
     logTS('updateAvailability_everywhere: end (nightly orchestrator)');
+    
+  } catch (e) {
+    ErrorService.logError('updateAvailability_everywhere', e);
+    throw e;
   } finally {
     lock.releaseLock();
   }
@@ -3298,83 +3356,7 @@ function decrementChoiceForDate(dateText, formId) {
   }
 }
 
-/**
- * Ensures exactly one summary event exists for a given date with correct title and color.
- * This is the SOLE function responsible for creating/updating summary events.
- * Updates existing event or creates new one if missing. Deletes any duplicates.
- * Uses script lock to prevent race conditions from parallel execution.
- * @deprecated Use upsertDailySummaryEvent instead for consistency
- * @param {string} dateText - Date string yyyy-MM-dd.
- * @param {number} left - Slots left.
- */
-function upsertDailySummary(dateText, left) {
-  logTS(`upsertDailySummary:start (deprecated - use upsertDailySummaryEvent) for ${dateText}, ${left} slots left`);
-  
-  // Holiday guard: immediately return if holiday - prevent any event creation/modification
-  if (HolidayService.isHoliday(dateText)) {
-    logTS('upsertDailySummary: early exit on holiday ' + dateText);
-    return;
-  }
-  
-  // Acquire lock to prevent race conditions
-  let lock = LockService.getScriptLock();
-  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
-    logTS(`upsertDailySummary: Lock busy for ${dateText}, skipping`);
-    return;
-  }
-  
-  try {
-    const [y, m, d] = dateText.split('-').map(Number);
-    const start = new Date(y, m - 1, d);
-    
-    // Fetch all existing summary events for this day
-    let summaries;
-    try {
-      summaries = CAL.getEventsForDay(start)
-         .filter(ev => ev.getDescription().indexOf(FULL_SUMMARY_TAG) === 0);
-    } catch (err) {
-      sendThrottledError('upsertDailySummary-getEvents', err);
-      throw err;
-    }
-    
-    const title = left > 0 ? `${left} Slots left (${SLOT_CAP} total)` : `Fully booked`;
-    const color = left > 0 ? EVENT_COLOR_AVAILABLE : EVENT_COLOR_FULL;
-    
-    if (summaries.length > 0) {
-      try {
-        // Update the first existing summary
-        summaries[0].setTitle(title);
-        summaries[0].setColor(color);
-        logTS(`Updated existing summary for ${dateText}`);
-        
-        // Delete any additional summaries to enforce uniqueness
-        if (summaries.length > 1) {
-          logTS(`Removing ${summaries.length - 1} duplicate summaries for ${dateText}`);
-          for (let i = 1; i < summaries.length; i++) {
-            summaries[i].deleteEvent();
-          }
-        }
-      } catch (err) {
-        sendThrottledError('upsertDailySummary-updateEvent', err);
-        throw err;
-      }
-    } else {
-      try {
-        // Create new summary if none exists - this is the ONLY place summaries are created
-        const ev = CAL.createAllDayEvent(title, start, { description: FULL_SUMMARY_TAG });
-        ev.setColor(color);
-        logTS(`Created new summary for ${dateText}`);
-      } catch (err) {
-        sendThrottledError('upsertDailySummary-createEvent', err);
-        throw err;
-      }
-    }
-  } finally {
-    lock.releaseLock();
-  }
-  
-  logTS(`upsertDailySummary:end for ${dateText}`);
-}
+
 
 /**
  * Updates a single row in the availability sheet for a given date.
@@ -3585,3 +3567,554 @@ function processAvailabilitySheet_(registryEntry) {
     sendThrottledError('processAvailabilitySheet_', err);
   }
 }
+
+
+
+/**
+ * Enhanced error handling and logging service
+ */
+const ErrorService = {
+  /**
+   * Log error with timestamp and context
+   * @param {string} context - Error context
+   * @param {Error} error - Error object
+   * @param {Object} [metadata] - Additional metadata
+   */
+  logError(context, error, metadata = {}) {
+    const timestamp = new Date().toISOString();
+    const errorInfo = {
+      timestamp,
+      context,
+      message: error.message,
+      stack: error.stack,
+      ...metadata
+    };
+    
+    logTS(`ERROR [${context}]: ${error.message}`);
+    if (error.stack) {
+      logTS(`Stack: ${error.stack}`);
+    }
+    if (Object.keys(metadata).length > 0) {
+      logTS(`Metadata: ${JSON.stringify(metadata)}`);
+    }
+    
+    // Store in script properties for debugging
+    try {
+      const props = PropertiesService.getScriptProperties();
+      const recentErrors = JSON.parse(props.getProperty('RECENT_ERRORS') || '[]');
+      recentErrors.unshift(errorInfo);
+      if (recentErrors.length > 100) recentErrors.pop(); // Keep last 100 errors
+      props.setProperty('RECENT_ERRORS', JSON.stringify(recentErrors));
+    } catch (e) {
+      logTS('ErrorService.logError: Failed to store error: ' + e);
+    }
+  },
+
+  /**
+   * Send throttled error notification
+   * @param {string} context - Error context
+   * @param {Error} error - Error object
+   * @param {Object} [metadata] - Additional metadata
+   */
+  sendThrottledError(context, error, metadata = {}) {
+    const errorKey = `${context}_${error.message}`;
+    const now = Date.now();
+    
+    try {
+      const props = PropertiesService.getScriptProperties();
+      const lastSent = parseInt(props.getProperty(errorKey) || '0', 10);
+      
+      if (now - lastSent >= EMAIL_THROTTLE_MS) {
+        this.logError(context, error, metadata);
+        
+        // Send email notification
+        const subject = `[${SCRIPT_VERSION}] Error in ${context}`;
+        const body = `
+Error occurred in ${context}:
+Message: ${error.message}
+Stack: ${error.stack}
+Metadata: ${JSON.stringify(metadata, null, 2)}
+Time: ${new Date().toISOString()}
+        `;
+        
+        MailApp.sendEmail({
+          to: Session.getEffectiveUser().getEmail(),
+          subject: subject,
+          body: body
+        });
+        
+        props.setProperty(errorKey, String(now));
+      }
+    } catch (e) {
+      logTS('ErrorService.sendThrottledError: Failed to send notification: ' + e);
+    }
+  },
+
+  /**
+   * Get recent errors
+   * @param {number} [limit=10] - Maximum number of errors to return
+   * @return {Array} Recent errors
+   */
+  getRecentErrors(limit = 10) {
+    try {
+      const props = PropertiesService.getScriptProperties();
+      const recentErrors = JSON.parse(props.getProperty('RECENT_ERRORS') || '[]');
+      return recentErrors.slice(0, limit);
+    } catch (e) {
+      logTS('ErrorService.getRecentErrors: Failed to get errors: ' + e);
+      return [];
+    }
+  },
+
+  /**
+   * Clear error history
+   */
+  clearErrorHistory() {
+    try {
+      const props = PropertiesService.getScriptProperties();
+      props.deleteProperty('RECENT_ERRORS');
+    } catch (e) {
+      logTS('ErrorService.clearErrorHistory: Failed to clear errors: ' + e);
+    }
+  }
+};
+
+/**
+ * Enhanced cache service with better error handling and type safety
+ */
+const CacheService = {
+  /**
+   * Get value from cache with type checking
+   * @param {string} key - Cache key
+   * @param {string} expectedType - Expected type ('string', 'number', 'object', etc.)
+   * @return {*} Cached value or null if not found/invalid
+   */
+  get(key, expectedType = 'string') {
+    try {
+      const value = CACHE.get(key);
+      if (!value) return null;
+      
+      switch (expectedType) {
+        case 'string':
+          return value;
+        case 'number':
+          const num = Number(value);
+          return isNaN(num) ? null : num;
+        case 'object':
+          try {
+            return JSON.parse(value);
+          } catch {
+            return null;
+          }
+        case 'boolean':
+          return value === 'true';
+        default:
+          return value;
+      }
+    } catch (e) {
+      ErrorService.logError('CacheService.get', e, { key, expectedType });
+      return null;
+    }
+  },
+
+  /**
+   * Put value in cache with type conversion
+   * @param {string} key - Cache key
+   * @param {*} value - Value to cache
+   * @param {number} ttlSeconds - Time to live in seconds
+   * @return {boolean} Success status
+   */
+  put(key, value, ttlSeconds = 300) {
+    try {
+      let stringValue;
+      if (typeof value === 'object') {
+        stringValue = JSON.stringify(value);
+      } else {
+        stringValue = String(value);
+      }
+      
+      CACHE.put(key, stringValue, ttlSeconds);
+      return true;
+    } catch (e) {
+      ErrorService.logError('CacheService.put', e, { key, value, ttlSeconds });
+      return false;
+    }
+  },
+
+  /**
+   * Remove value from cache
+   * @param {string} key - Cache key
+   * @return {boolean} Success status
+   */
+  remove(key) {
+    try {
+      CACHE.remove(key);
+      return true;
+    } catch (e) {
+      ErrorService.logError('CacheService.remove', e, { key });
+      return false;
+    }
+  }
+};
+
+/**
+ * Safe cache operations with error handling
+ */
+function safeCacheGet(key) {
+  try {
+    return CACHE.get(key);
+  } catch (e) {
+    logTS('safeCacheGet: Error getting from cache: ' + e);
+    return null;
+  }
+}
+
+function safeCachePut(key, value, ttlSeconds) {
+  try {
+    CACHE.put(key, value, ttlSeconds);
+    return true;
+  } catch (e) {
+    logTS('safeCachePut: Error putting to cache: ' + e);
+    return false;
+  }
+}
+
+/**
+ * Logging utility with timestamp
+ */
+function logTS(message) {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${message}`);
+}
+
+/**
+ * Availability management service
+ */
+const AvailabilityService = {
+  /**
+   * Seed availability window for a form
+   * @param {string} formId - Form ID
+   * @param {string} sheetName - Sheet name
+   */
+  seedAvailabilityWindow(formId, sheetName) {
+    try {
+      const sheet = getCachedSpreadsheet(FORM_REGISTRY.find(r => r.formId === formId).spreadsheetId)
+        .getSheetByName(sheetName);
+      if (!sheet) {
+        throw new Error(`Sheet not found: ${sheetName}`);
+      }
+
+      const today = new Date();
+      const endDate = DateUtils.addDays(today, FUTURE_DAYS);
+      const dates = [];
+      let currentDate = new Date(today);
+
+      while (currentDate <= endDate) {
+        if (DateUtils.isBusinessDay(currentDate)) {
+          dates.push(DateUtils.formatYMD(currentDate));
+        }
+        currentDate = DateUtils.addDays(currentDate, 1);
+      }
+
+      const data = dates.map(date => [date, 0, SLOT_CAP]);
+      sheet.getRange(2, 1, data.length, 3).setValues(data);
+      logTS(`Seeded ${data.length} dates for ${sheetName}`);
+    } catch (e) {
+      ErrorService.logError('AvailabilityService.seedAvailabilityWindow', e, { formId, sheetName });
+    }
+  },
+
+  /**
+   * Decrement availability for a date
+   * @param {string} dateStr - Date string
+   * @param {string} formId - Form ID
+   * @return {boolean} Success status
+   */
+  decrementAvailability(dateStr, formId) {
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+      logTS('decrementAvailability: Lock busy');
+      return false;
+    }
+
+    try {
+      const entry = FORM_REGISTRY.find(r => r.formId === formId);
+      if (!entry) {
+        throw new Error(`Form not found: ${formId}`);
+      }
+
+      const sheet = getCachedSpreadsheet(entry.spreadsheetId)
+        .getSheetByName(entry.availabilitySheetName);
+      if (!sheet) {
+        throw new Error(`Sheet not found: ${entry.availabilitySheetName}`);
+      }
+
+      const data = sheet.getDataRange().getValues();
+      for (let i = 1; i < data.length; i++) {
+        if (data[i][0] === dateStr) {
+          const booked = data[i][AVAIL_BOOKED_COL - 1] || 0;
+          const left = data[i][AVAIL_LEFT_COL - 1] || SLOT_CAP;
+          
+          if (left <= 0) {
+            logTS(`No slots left for ${dateStr} in ${entry.availabilitySheetName}`);
+            return false;
+          }
+
+          sheet.getRange(i + 1, AVAIL_BOOKED_COL).setValue(booked + 1);
+          sheet.getRange(i + 1, AVAIL_LEFT_COL).setValue(left - 1);
+          return true;
+        }
+      }
+
+      logTS(`Date not found: ${dateStr} in ${entry.availabilitySheetName}`);
+      return false;
+    } catch (e) {
+      ErrorService.logError('AvailabilityService.decrementAvailability', e, { dateStr, formId });
+      return false;
+    } finally {
+      lock.releaseLock();
+    }
+  },
+
+  /**
+   * Revert availability for a date
+   * @param {string} dateStr - Date string
+   * @param {string} formId - Form ID
+   */
+  revertAvailability(dateStr, formId) {
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+      logTS('revertAvailability: Lock busy');
+      return;
+    }
+
+    try {
+      const entry = FORM_REGISTRY.find(r => r.formId === formId);
+      if (!entry) {
+        throw new Error(`Form not found: ${formId}`);
+      }
+
+      const sheet = getCachedSpreadsheet(entry.spreadsheetId)
+        .getSheetByName(entry.availabilitySheetName);
+      if (!sheet) {
+        throw new Error(`Sheet not found: ${entry.availabilitySheetName}`);
+      }
+
+      const data = sheet.getDataRange().getValues();
+      for (let i = 1; i < data.length; i++) {
+        if (data[i][0] === dateStr) {
+          const booked = data[i][AVAIL_BOOKED_COL - 1] || 0;
+          const left = data[i][AVAIL_LEFT_COL - 1] || SLOT_CAP;
+          
+          if (booked > 0) {
+            sheet.getRange(i + 1, AVAIL_BOOKED_COL).setValue(booked - 1);
+            sheet.getRange(i + 1, AVAIL_LEFT_COL).setValue(left + 1);
+          }
+          return;
+        }
+      }
+    } catch (e) {
+      ErrorService.logError('AvailabilityService.revertAvailability', e, { dateStr, formId });
+    } finally {
+      lock.releaseLock();
+    }
+  }
+};
+
+/**
+ * Form handling service
+ */
+const FormService = {
+  /**
+   * Update form dropdown for a date
+   * @param {string} formId - Form ID
+   * @param {string} dateStr - Date string
+   * @param {boolean} isAvailable - Whether the date is available
+   */
+  updateFormDropdown(formId, dateStr, isAvailable) {
+    try {
+      const form = getCachedForm(formId);
+      const dateItem = form.getItemById(FIELD_ID_MAP['Date of Appointment']);
+      if (!dateItem) {
+        throw new Error('Date field not found in form');
+      }
+
+      const choices = dateItem.asListItem().getChoices();
+      const dateChoice = choices.find(c => c.getValue() === dateStr);
+      
+      if (dateChoice) {
+        if (!isAvailable) {
+          // Remove unavailable date
+          const newChoices = choices.filter(c => c.getValue() !== dateStr);
+          dateItem.asListItem().setChoices(newChoices);
+        }
+      } else if (isAvailable) {
+        // Add available date
+        const newChoice = dateItem.createChoice(dateStr);
+        const newChoices = choices.concat([newChoice]);
+        dateItem.asListItem().setChoices(newChoices);
+      }
+    } catch (e) {
+      ErrorService.logError('FormService.updateFormDropdown', e, { formId, dateStr, isAvailable });
+    }
+  },
+
+  /**
+   * Rebuild all form dropdowns
+   */
+  rebuildAllFormDropdowns() {
+    for (const entry of FORM_REGISTRY) {
+      try {
+        const form = getCachedForm(entry.formId);
+        const dateItem = form.getItemById(FIELD_ID_MAP['Date of Appointment']);
+        if (!dateItem) continue;
+
+        const sheet = getCachedSpreadsheet(entry.spreadsheetId)
+          .getSheetByName(entry.availabilitySheetName);
+        if (!sheet) continue;
+
+        const data = sheet.getDataRange().getValues();
+        const availableDates = [];
+        
+        for (let i = 1; i < data.length; i++) {
+          const row = data[i];
+          const dateStr = row[0];
+          const left = row[AVAIL_LEFT_COL - 1] || SLOT_CAP;
+          
+          if (left > 0 && DateUtils.isBusinessDay(DateUtils.parseDate(dateStr))) {
+            availableDates.push(dateItem.createChoice(dateStr));
+          }
+        }
+
+        dateItem.asListItem().setChoices(availableDates);
+        logTS(`Rebuilt dropdown for ${entry.formId} with ${availableDates.length} dates`);
+      } catch (e) {
+        ErrorService.logError('FormService.rebuildAllFormDropdowns', e, { formId: entry.formId });
+      }
+    }
+  },
+
+  /**
+   * Handle form submission
+   * @param {Object} e - Form submission event
+   */
+  onFormSubmit(e) {
+    try {
+      const formId = e.source.getId();
+      const entry = FORM_REGISTRY.find(r => r.formId === formId);
+      if (!entry) {
+        throw new Error(`Form not found: ${formId}`);
+      }
+
+      const response = e.response;
+      const dateResponse = response.getItemResponses()
+        .find(r => r.getItem().getId() === FIELD_ID_MAP['Date of Appointment']);
+      const dateStr = dateResponse ? dateResponse.getResponse() : null;
+
+      if (!dateStr) {
+        throw new Error('No date selected in form submission');
+      }
+
+      // Decrement availability
+      if (!AvailabilityService.decrementAvailability(dateStr, formId)) {
+        throw new Error(`Failed to decrement availability for ${dateStr}`);
+      }
+
+      // Update form dropdown
+      FormService.updateFormDropdown(formId, dateStr, false);
+
+      // Create calendar event
+      const lastNameResponse = response.getItemResponses()
+        .find(r => r.getItem().getId() === FIELD_ID_MAP['Last Name']);
+      const lastName = lastNameResponse ? lastNameResponse.getResponse() : '';
+      
+      const firstNameResponse = response.getItemResponses()
+        .find(r => r.getItem().getId() === FIELD_ID_MAP['First Name']);
+      const firstName = firstNameResponse ? firstNameResponse.getResponse() : '';
+      
+      const purokResponse = response.getItemResponses()
+        .find(r => r.getItem().getId() === FIELD_ID_MAP['Purok']);
+      const purok = purokResponse ? purokResponse.getResponse() : '';
+      
+      const barangayResponse = response.getItemResponses()
+        .find(r => r.getItem().getId() === FIELD_ID_MAP['Barangay']);
+      const barangay = barangayResponse ? barangayResponse.getResponse() : '';
+
+      const title = `${entry.sheetName}:${lastName}, ${firstName} ${purok}, ${barangay} ${APPT_EVENT_TAG}`;
+      const date = DateUtils.parseDate(dateStr);
+      
+      if (CalendarQuotaManager.canCall(1)) {
+        const event = CAL.createAllDayEvent(title, date);
+        event.setColor(EVENT_COLOR_AVAILABLE);
+        CalendarQuotaManager.recordCall(1);
+      }
+
+      // Update summary event
+      CalendarSyncService.syncSummaryEvents(dateStr, [], { created: 0, updated: 0, deleted: 0, errors: 0 });
+
+    } catch (e) {
+      ErrorService.logError('FormService.onFormSubmit', e, { formId: e.source.getId() });
+      // Revert availability on error
+      const response = e.response;
+      const dateResponse = response ? response.getItemResponses()
+        .find(r => r.getItem().getId() === FIELD_ID_MAP['Date of Appointment']) : null;
+      const dateStr = dateResponse ? dateResponse.getResponse() : null;
+      if (dateStr) {
+        AvailabilityService.revertAvailability(dateStr, e.source.getId());
+      }
+    }
+  }
+};
+
+/**
+ * Main calendar sync function
+ */
+function updateAvailability_everywhere() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+    logTS('updateAvailability_everywhere: Lock busy');
+    return;
+  }
+
+  try {
+    // Initialize services
+    CalendarQuotaManager.initRun();
+    HolidayService.initHolidayCalendar();
+
+    // Calculate date range
+    const start = new Date();
+    const end = DateUtils.addDays(start, BATCH_DAYS_WINDOW);
+
+    // Sync calendar events
+    const results = CalendarSyncService.syncDateRange(start, end);
+    logTS(`Calendar sync results: ${JSON.stringify(results)}`);
+
+    // Update form dropdowns
+    for (const entry of FORM_REGISTRY) {
+      try {
+        const sheet = getCachedSpreadsheet(entry.spreadsheetId)
+          .getSheetByName(entry.availabilitySheetName);
+        if (!sheet) continue;
+
+        const data = sheet.getDataRange().getValues();
+        for (let i = 1; i < data.length; i++) {
+          const row = data[i];
+          const dateStr = row[0];
+          const left = row[AVAIL_LEFT_COL - 1] || SLOT_CAP;
+          
+          if (left === 0) {
+            FormService.updateFormDropdown(entry.formId, dateStr, false);
+          }
+        }
+      } catch (e) {
+        ErrorService.logError('updateAvailability_everywhere', e, { formId: entry.formId });
+      }
+    }
+
+  } catch (e) {
+    ErrorService.logError('updateAvailability_everywhere', e);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
