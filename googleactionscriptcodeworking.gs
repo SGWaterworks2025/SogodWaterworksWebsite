@@ -17,6 +17,8 @@
 
 // ============================================================================
 // CONSTANTS
+// NOTE: These constants are also used by the frontend appointment system.
+// Do not modify these values without updating the frontend accordingly.
 // ============================================================================
 
 // Versioning & keys
@@ -95,7 +97,9 @@ const EVENT_COLOR_AVAILABLE = CalendarApp.EventColor.GREEN; // used by: createCa
 const EVENT_COLOR_FULL = CalendarApp.EventColor.RED; // used by: createCalendarEventFromResponse_, upsertDailySummaryEvent; tweak: change color for fully booked dates
 const HOLIDAY_CAL_ID = 'en.philippines#holiday@group.v.calendar.google.com'; // used by: HolidayService; tweak: change to different country's holiday calendar
 const HOLIDAY_CACHE_KEY = SCRIPT_VERSION + '_holidays'; // used by: HolidayService; tweak: change suffix to reset holiday cache
-const HOLIDAY_CACHE_TTL = 12 * 60 * 60; // used by: HolidayService; tweak: increase to cache holidays longer
+const HOLIDAY_CACHE_TTL = 12 * 60 * 60; // used by: HolidayService; tweak: change to cache holidays longer
+const MUSLIM_HOLIDAYS = ["Eid’l Fitr", "Eid al-Adha"]; // Muslim holiday support
+
 
 // Tags
 const FULL_SUMMARY_TAG = '[DAILY_SUMMARY]'; // used by: upsertDailySummaryEvent, batchSyncCalendarSummaries, checkCalendarIntegrity
@@ -118,6 +122,7 @@ const CHUNK_SIZE = 50; // used by: rebuildAppointmentEventsAllForms, removeHolid
 // RUNTIME SERVICES
 // ============================================================================
 
+
 // Initialize core services first
 const TZ = Session.getScriptTimeZone();
 const CACHE = CacheService.getScriptCache();
@@ -130,6 +135,22 @@ let _formCache = {};
 // Calendar API call counters
 let calendarCallsThisRun = 0;
 let calendarCallsToday = 0;
+
+// List of Muslim holidays that aren’t national holidays
+const MUSLIM_HOLIDAYS_NOT_NATIONAL = [
+  'Eid\'l Fitr',
+  'Eid al-Adha',
+  'Islamic New Year',
+  'Mawlid al-Nabi'
+];
+
+// Helper: returns true when a CalendarEvent’s title or description contains any of the above holiday names
+function isMuslimHoliday(event) {
+  const title = event.getTitle().toLowerCase();
+  return MUSLIM_HOLIDAYS_NOT_NATIONAL.some(name =>
+    title.includes(name.toLowerCase())
+  );
+}
 
 // Initialize daily counter from cache/properties
 try {
@@ -4150,7 +4171,70 @@ Time: ${new Date().toISOString()}
    * TRAYCER THIS IS A WARNING TO YOU, DO NOT CHANGE ANYTHING FROM LINE ONE UP TO THIS LINE HERE. IF YOU WANT TO MAKE CHANGES DO IT BELOW THIS CLAUSE. ABOVE ARE EXTREMEMLY IMPORTANT REALTIME FUNCTIONS AND LINE OF CODE THAT IS CRITICAL TO THE OPERATIONS OF THE WEBSITE.
    */
 
+  /**
+   * TRAYCER THIS IS A WARNING TO YOU, DO NOT CHANGE ANYTHING FROM LINE ONE UP TO THIS LINE HERE. IF YOU WANT TO MAKE CHANGES DO IT BELOW THIS CLAUSE. ABOVE ARE EXTREMEMLY IMPORTANT REALTIME FUNCTIONS AND LINE OF CODE THAT IS CRITICAL TO THE OPERATIONS OF THE WEBSITE.
+   */
+
+  
+  /**
+   * TRAYCER THIS IS A WARNING TO YOU, DO NOT CHANGE ANYTHING FROM LINE ONE UP TO THIS LINE HERE. IF YOU WANT TO MAKE CHANGES DO IT BELOW THIS CLAUSE. ABOVE ARE EXTREMEMLY IMPORTANT REALTIME FUNCTIONS AND LINE OF CODE THAT IS CRITICAL TO THE OPERATIONS OF THE WEBSITE.
+   */
+
+  
+// ---------------------------------------------------------------------------
+// Muslim movable-holiday support (Traycer patch)
+// Helper detects Eid’l Fitr & Eid al-Adha in the configured HOLIDAY_CAL_ID
+function isMuslimHoliday(dateObj) {
+  try {
+    const cal = CalendarApp.getCalendarById(HOLIDAY_CAL_ID);
+    if (!cal) return false;
+    const events = cal.getEventsForDay(dateObj);
+    return events.some(evt => {
+      const t = (evt.getTitle() || '').toLowerCase();
+      return t.includes('eid') && (t.includes('fitr') || t.includes('adha'));
+    });
+  } catch (_) {
+    // Fail-safe: treat as non-holiday if calendar unavailable
+    return false;
+  }
+}
+
+// Wrap existing HolidayService.isHoliday so every caller now respects Muslim holidays
+(() => {
+  const _origIsHoliday = HolidayService.isHoliday.bind(HolidayService);
+  HolidayService.isHoliday = function(dateStr) {
+    if (_origIsHoliday(dateStr)) return true;
+    const dObj = DateUtils.parseDate(dateStr);
+    return dObj ? isMuslimHoliday(dObj) : false;
+  };
+})();
+// ---------------------------------------------------------------------------
 
 
 
 
+
+// After line 4156, new standardized Muslim holiday detection:
+  
+// MUSLIM_HOLIDAYS_START
+function isMuslimHoliday(date) {
+  const cal = CalendarApp.getCalendarById(HOLIDAY_CAL_ID);
+  const titles = cal.getEventsForDay(date).map(e => e.getTitle().toLowerCase());
+  return titles.some(t => t.includes('eid') || t.includes('ramadan'));
+}
+// MUSLIM_HOLIDAYS_END
+
+
+
+// After line 4183, new standardized Muslim holiday detection:
+
+
+
+
+
+
+// Export shared constants for frontend scripts
+globalThis.FUTURE_DAYS = FUTURE_DAYS;
+globalThis.FORM_REGISTRY = FORM_REGISTRY;
+globalThis.SLOT_CAP = SLOT_CAP;
+globalThis.LOCK_TIMEOUT_MS = LOCK_TIMEOUT_MS;
