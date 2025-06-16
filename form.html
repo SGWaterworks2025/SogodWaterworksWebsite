@@ -43,109 +43,7 @@
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     <style>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -374,7 +272,7 @@
           margin-bottom: 5px;
         }
         
-        .container.grid-layout .button-container {
+        .container.grid-layout .button-container { 
           grid-row: 2;
           grid-column: 1 / span 2;
           margin-top: 10px;
@@ -842,56 +740,87 @@
     <link rel="shortlink" href="index.html" />
      <meta name="generator" content="Elementor 3.28.1; features: additional_custom_breakpoints, e_local_google_fonts; settings: css_print_method-external, google_font-enabled, font_display-auto" />
     <link rel="stylesheet" href="menu.css" type="text/css" media="all">
-    <style>
-      #loadingOverlay { 
-        position: fixed; 
-        top: 0; 
-        left: 0; 
-        width: 100%; 
-        height: 100%; 
-        background: rgba(0,0,0,0.5); 
-        display: flex; 
-        align-items: center; 
-        justify-content: center; 
-        flex-direction: column; 
-        opacity: 0; 
-        pointer-events: none; 
-        transition: opacity 0.2s ease; 
-        z-index: 9999;
-      }
-      #loadingOverlay.visible { 
-        opacity: 1; 
-        pointer-events: all; 
-      }
-      @keyframes spin { 
-        from { transform: rotate(0deg); } 
-        to { transform: rotate(360deg); } 
-      }
-    </style>
   </head>
   <body class="home page-template page-template-elementor_header_footer page page-id-250 current_page_item no-js jet-desktop-menu-active elementor-default elementor-template-full-width elementor-kit-3750 elementor-page elementor-page-250 jupiterx-header-fixed jupiterx-header-overlapped jupiterx-header-overlapped-tablet jupiterx-header-overlapped-mobile main-page" itemscope="itemscope" itemtype="http://schema.org/WebPage">
     <div class="jupiterx-site">
       <header class="main-header">
-        <nav class="main-navigation">
-          <div class="nav-logo">
-            <img src="sogodassets/image/logosogod.png" alt="SOGOD Waterworks Logo">
-          </div>
-          <div class="nav-menu">
-            <ul class="main-menu">
 
-                          <div class="nav-menu">
-                            <!-- Header goes here OUTSIDE the main menu <ul> -->
-                            <ul style="list-style: none; padding: 0; margin: 0; width: 100%; text-align: center;">
-                              <li style="font-size: 3em; font-weight: bold;">SOGOD WATERWORKS</li>
-                            </ul>
+
+
+        
+                              <!-- Overlay Date/Time/Weather -->
+                      <div id="header-widgets" style="
+                        position: absolute;
+                        top: 10px;
+                        right: 20px;
+                        text-align: right;
+                        font-size: 1.1em;
+                        z-index: 500;
+                        background-color: rgba(255, 255, 255, 0);
+                        padding: 5px 5px;
+                        border-radius: 5px;
+                      ">
+                        <div id="date" style="white-space: nowrap;"></div>
+                        <div id="time" style="white-space: nowrap;"></div>
+                        <a class="weatherwidget-io"
+                          href="https://forecast7.com"
+                          data-label_1="WEATHER"
+                          data-label_2="TODAY"
+                          data-theme="original"
+                          data-basecolor="#ffffff"
+                          data-textcolor="#000000">
+                          WEATHER
+                        </a>
+                      </div>
+
+                      <script>
+                        function updateDateTime() {
+                          const dateElem = document.getElementById("date");
+                          const timeElem = document.getElementById("time");
+                          const now = new Date();
+                          dateElem.textContent = now.toLocaleDateString('en-US', {
+                            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+                          });
+                          timeElem.textContent = now.toLocaleTimeString('en-US', {
+                            hour: '2-digit', minute: '2-digit', second: '2-digit'
+                          });
+                        }
+                        setInterval(updateDateTime, 1000);
+                        updateDateTime();
+                      </script>
+
+                      <script>
+                        !function(d,s,id){
+                          var js, fjs = d.getElementsByTagName(s)[0];
+                          if(!d.getElementById(id)){
+                            js = d.createElement(s); js.id = id;
+                            js.src = 'https://weatherwidget.io/js/widget.min.js';
+                            fjs.parentNode.insertBefore(js,fjs);
+                          }
+                        }(document,'script','weatherwidget-io-js');
+                      </script>
+
+
+<div class="sogod-header">
+  <div class="sogod-nav-logo">
+    <img src="sogodassets/image/logosogod.png" alt="SOGOD Waterworks Logo">
+  </div>
+
+  <div class="sogod-header-group">
+    <div class="sogod-site-title">SOGOD WATERWORKS</div>
+
 
                             <!-- Main navigation menu starts here -->
-                            <ul class="main-menu">
+<!--                            <ul class="main-menu">
                               <li><a href="index.html">Home</a></li>
+
+
+
+                              
                               <li class="has-dropdown">
-                                <a href="#">Book an Appointment</a>
+                                <a href="#">📅 Book an Appointment</a>
                                 <ul class="dropdown-menu">
-                                  <li><a href="#">Book an Appointment</a></li>
+                                  <li><a href="#">📅 Book an Appointment</a></li>
                                   <li><a href="connection.html">For Connection</a></li>
                                   <li><a href="disconnection.html">For Disconnection</a></li>
                                   <li><a href="reconnection.html">For Reconnection</a></li>
@@ -900,6 +829,60 @@
                                 </ul>
                               </li>
                             </ul>
+-->
+
+
+
+
+  <!-- Title + Menu -->
+  <div class="sogod-nav-content">
+
+
+    <div class="sogod-dropdown-nav">
+      <a href="index.html" class="sogod-dropdown-button">🏠 HOME</a>
+
+      <div class="sogod-dropdown-container">
+        <div class="sogod-dropdown-button">📅 BOOK AN APPOINTMENT ▾</div>
+        <div class="sogod-dropdown-content">
+          <a href="form.html">📅 Book an Appointment</a>
+          <a href="connection.html">🔌 For Connection</a>
+          <a href="disconnection.html">🔌 For Disconnection</a>
+          <a href="reconnection.html">🔄 For Reconnection</a>
+          <a href="repairandmaintenance.html">🛠️ For Repair</a>
+          <a href="otherconcerns.html">❓ Other Matters</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+
+
+
+
+
+
+
+
+                            <script>
+                              const dropdown = document.getElementById('appointmentDropdown');
+                              const button = dropdown.querySelector('.dropdown-button');
+
+                              button.addEventListener('click', () => {
+                                dropdown.classList.toggle('active');
+                              });
+
+                              // Optional: close if you click outside
+                              document.addEventListener('click', (e) => {
+                                if (!dropdown.contains(e.target)) {
+                                  dropdown.classList.remove('active');
+                                }
+                              });
+                            </script>
+
+
+
                           </div>
 
 
@@ -913,42 +896,16 @@
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-          <div class="mobile-menu-toggle">
+         <!-- <div class="mobile-menu-toggle">
             <span></span>
             <span></span>
             <span></span>
-          </div>
+          </div>  -->
+
+
+
+
+
         </nav>
       </header>
 
@@ -956,7 +913,7 @@
 
 
 
-      <main class="jupiterx-main">
+      <main class="jupiterx-main sogod-main-x-content">
         <div data-elementor-type="wp-page" data-elementor-id="250" class="elementor elementor-250">
           <section class="elementor-section elementor-top-section elementor-element elementor-element-4328ca4 elementor-section-boxed elementor-section-height-default elementor-section-height-default" data-id="4328ca4" data-element_type="section">
             <div class="elementor-container elementor-column-gap-default">
@@ -975,8 +932,6 @@
                       <!-- Main Content Should be Placed Here -->
 
                       <div style="padding-top:20px; padding-bottom:20px;">
-                      </div>
-                                            <div style="padding-top:20px; padding-bottom:20px;">
                       </div>
 
 
@@ -1015,7 +970,8 @@
 
                                                         <!-- wrap for responsiveness -->
 <!-- Your Google Form iframe -->
-<iframe
+<div class="full-width-mobile">
+<iframe 
   id="myGoogleForm"
   src="https://docs.google.com/forms/d/e/1FAIpQLScO5tMXW546nmElzrAlrMU_L3g219xtNl_9f2ZqvW9ofNurWg/viewform?embedded=true"
   width="100%"
@@ -1026,6 +982,7 @@
   scrolling="no">
   Loading…
 </iframe>
+</div>
 
 <!-- Loading Overlay -->
 <div id="loadingOverlay">

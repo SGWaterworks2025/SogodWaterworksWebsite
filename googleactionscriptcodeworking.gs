@@ -98,7 +98,7 @@ const HOLIDAY_CACHE_KEY = SCRIPT_VERSION + '_holidays'; // used by: HolidayServi
 const HOLIDAY_CACHE_TTL = 12 * 60 * 60; // used by: HolidayService; tweak: increase to cache holidays longer
 
 // Tags
-const FULL_SUMMARY_TAG = '[DAILY_SUMMARY]'; // used by: upsertDailySummaryEvent, batchSyncCalendarSummaries, checkCalendarIntegrity
+const FULL_SUMMARY_TAG = '📅'; // used by: upsertDailySummaryEvent, batchSyncCalendarSummaries, checkCalendarIntegrity
 const APPT_EVENT_TAG = '[APPOINTMENT]'; // used by: rebuildAppointmentEventsAllForms, checkCalendarIntegrity
 const TAG_HOLIDAY = '[AUTO_HOLIDAY]'; // used by: HolidayService
 
@@ -359,7 +359,7 @@ const CalendarQuotaManager = {
     try {
       CACHE.put(SCRIPT_VERSION + '_calendar_calls_today', String(calendarCallsToday), 21600); // 6 hours
       PropertiesService.getScriptProperties().setProperty(SCRIPT_VERSION + '_calendar_calls_today', String(calendarCallsToday));
-    } catch (e) {
+    } catch (e) { 
       logTS('CalendarQuotaManager.recordCall: Error updating counters: ' + e);
     }
   },
@@ -483,6 +483,28 @@ const HolidayService = {
     { month: 12, day: 31, name: "New Year's Eve" }
   ],
 
+  _excludedHolidayNames: new Set([
+    'Amun Jadid',
+    'Maulid un-Nabi',
+    'Lailatul Isra Wal Mi Raj',
+    'Eid al-Adha Day 2',
+    'Eid al-Fitr Day 2',
+    'Eid al-Adha Day 3',
+    'Eid al-Fitr Day 3'
+  ]),
+  _overrideWorkingDays: new Set(), // TODO future admin UI
+
+  /**
+   * Check if holiday name should be excluded
+   * @param {string} summary - Event title or manual holiday name
+   * @return {boolean} True if excluded
+   * @private
+   */
+  isExcludedName_(summary) {
+    if (!summary) return false;
+    return [...this._excludedHolidayNames].some(name => summary.includes(name));
+  },
+
   /**
    * Check if a date is a holiday
    * @param {string} dateStr - Date string in YYYY-MM-DD format
@@ -490,42 +512,67 @@ const HolidayService = {
    */
   isHoliday(dateStr) {
     if (!dateStr) return false;
+    // Override working days take highest precedence
+    if (this._overrideWorkingDays.has(dateStr)) {
+      return false;
+    }
     const date = DateUtils.parseDate(dateStr);
     if (!date) return false;
-
-    // Try cache first for quick lookup
-    try {
-      const cached = CACHE.get(HOLIDAY_CACHE_KEY);
-      if (cached) {
-        const cachedHolidays = new Set(JSON.parse(cached));
-        if (cachedHolidays.has(dateStr)) {
-          return true;
-        }
-      }
-    } catch (e) {
-      logTS('HolidayService.isHoliday: Cache error: ' + e);
-    }
 
     // Initialize calendar on first call
     if (!this._initialized) {
       this.initHolidayCalendar();
     }
 
+    let isPotentialHoliday = false;
     // Try ICS calendar first if available
     if (this._calendarAvailable) {
       try {
-        const events = CalendarApp.getCalendarById(HOLIDAY_CAL_ID).getEventsForDay(date);
-        return events.length > 0;
+        const events = this._holidayCalendar.getEventsForDay(date);
+        // consider holiday if any non-excluded event exists
+        if (events.some(e => !this.isExcludedName_(e.getTitle()))) {
+          isPotentialHoliday = true;
+        }
       } catch (e) {
         this._calendarAvailable = false;
         logTS('HolidayService.isHoliday: ICS calendar error, falling back to manual: ' + e);
       }
     }
 
-    // Fallback to manual holidays if ICS unavailable
-    const month = date.getMonth() + 1;
-    const day = date.getDate();
-    return this._manualHolidays.some(h => h.month === month && h.day === day);
+    // Fallback to manual holidays if not detected yet
+    if (!isPotentialHoliday) {
+      const month = date.getMonth() + 1;
+      const day = date.getDate();
+      if (this._manualHolidays.some(h => h.month === month && h.day === day)) {
+        isPotentialHoliday = true;
+      }
+    }
+
+    // If nothing flagged as holiday, return false
+    if (!isPotentialHoliday) {
+      return false;
+    }
+
+    // Exclusion: if any ICS event on that date matches excluded names, treat as working day
+    if (this._calendarAvailable) {
+      try {
+        const events = this._holidayCalendar.getEventsForDay(date);
+        if (events.some(e => this.isExcludedName_(e.getTitle()))) {
+          return false;
+        }
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    // Exclusion: if manual holiday name is in excluded list, skip it
+    const month2 = date.getMonth() + 1;
+    const day2 = date.getDate();
+    const manual = this._manualHolidays.find(h => h.month === month2 && h.day === day2);
+    if (manual && this._excludedHolidayNames.has(manual.name)) {
+      return false;
+    }
+
+    return true;
   },
 
   /**
@@ -557,21 +604,9 @@ const HolidayService = {
       const cached = CACHE.get(HOLIDAY_CACHE_KEY);
       if (cached) {
         const cachedHolidays = new Set(JSON.parse(cached));
-        // Check if requested range is subset of cached dates
-        const startStr = DateUtils.formatYMD(start);
-        const endStr = DateUtils.formatYMD(end);
-        let currentDate = new Date(start);
-        let allCached = true;
-        
-        while (currentDate <= end) {
-          const dateStr = DateUtils.formatYMD(currentDate);
-          // We only need to check if holidays are cached, not all dates
-          currentDate.setDate(currentDate.getDate() + 1);
-        }
-        
         // Return cached holidays within range
         const rangeHolidays = new Set();
-        currentDate = new Date(start);
+        let currentDate = new Date(start);
         while (currentDate <= end) {
           const dateStr = DateUtils.formatYMD(currentDate);
           if (cachedHolidays.has(dateStr)) {
@@ -597,8 +632,11 @@ const HolidayService = {
       try {
         const events = this._holidayCalendar.getEvents(start, end);
         events.forEach(event => {
-          const eventDate = event.getStartTime();
-          holidayDates.add(DateUtils.formatYMD(eventDate));
+          const title = event.getTitle();
+          if (!this.isExcludedName_(title)) {
+            const eventDate = event.getStartTime();
+            holidayDates.add(DateUtils.formatYMD(eventDate));
+          }
         });
       } catch (e) {
         this._calendarAvailable = false;
@@ -611,11 +649,10 @@ const HolidayService = {
     while (currentDate <= end) {
       const month = currentDate.getMonth() + 1;
       const day = currentDate.getDate();
-      
-      if (this._manualHolidays.some(h => h.month === month && h.day === day)) {
+      const h = this._manualHolidays.find(h => h.month === month && h.day === day);
+      if (h && !this._excludedHolidayNames.has(h.name)) {
         holidayDates.add(DateUtils.formatYMD(currentDate));
       }
-      
       currentDate.setDate(currentDate.getDate() + 1);
     }
 
@@ -639,6 +676,8 @@ const HolidayService = {
       const holidayDates = this.fetchRange(start, end);
       
       for (const dateStr of holidayDates) {
+        // Skip excluded or overridden days
+        if (!this.isHoliday(dateStr)) continue;
         const date = DateUtils.parseDate(dateStr);
         if (!date) continue;
         
@@ -678,6 +717,48 @@ const HolidayService = {
     const holiday = this._manualHolidays.find(h => h.month === month && h.day === day);
     return holiday ? holiday.name : 'Holiday';
   }
+};
+
+// Invalidate holiday cache after updates
+CACHE.remove(HOLIDAY_CACHE_KEY);
+
+/**
+ * Purges past calendar events (appointments and summaries) before today
+ */
+function purgePastCalendarEvents() {
+  const todayStart = DateUtils.startOfDay(new Date());
+  logTS('purgePastCalendarEvents: start, cutoff=' + todayStart.toISOString());
+
+  // ... rest of file unchanged until end ...
+
+// ---------------------------------------------------------------------------
+// Muslim movable-holiday support (Traycer patch)
+// Helper detects Eid’l Fitr & Eid al-Adha in the configured HOLIDAY_CAL_ID
+function isMuslimHoliday(dateObj) {
+  try {
+    const cal = CalendarApp.getCalendarById(HOLIDAY_CAL_ID);
+    if (!cal) return false;
+    const events = cal.getEventsForDay(dateObj);
+    return events.some(evt => {
+      const t = (evt.getTitle() || '').toLowerCase();
+      return t.includes('eid') && (t.includes('fitr') || t.includes('adha'));
+    });
+  } catch (_) {
+    // Fail-safe: treat as non-holiday if calendar unavailable
+    return false;
+  }
+}
+
+// Wrap existing HolidayService.isHoliday so every caller now respects Muslim holidays
+(() => {
+  const _origIsHoliday = HolidayService.isHoliday.bind(HolidayService);
+  HolidayService.isHoliday = function(dateStr) {
+    if (_origIsHoliday(dateStr)) return true;
+    const dObj = DateUtils.parseDate(dateStr);
+    return dObj ? isMuslimHoliday(dObj) : false;
+  };
+})();
+
 };
 
 /**
@@ -4793,25 +4874,6 @@ function isMuslimHoliday(dateObj) {
   };
 })();
 // ---------------------------------------------------------------------------
-
-
-
-
-
-// After line 4156, new standardized Muslim holiday detection:
-  
-// MUSLIM_HOLIDAYS_START
-function isMuslimHoliday(date) {
-  const cal = CalendarApp.getCalendarById(HOLIDAY_CAL_ID);
-  const titles = cal.getEventsForDay(date).map(e => e.getTitle().toLowerCase());
-  return titles.some(t => t.includes('eid') || t.includes('ramadan'));
-}
-// MUSLIM_HOLIDAYS_END
-
-
-
-// After line 4183, new standardized Muslim holiday detection:
-
 
 
 

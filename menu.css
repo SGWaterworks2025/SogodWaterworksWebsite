@@ -27,49 +27,48 @@ body {
     }
   }
 
-/* Drop-right submenu styles */
-.has-drop-right {
-  position: relative;
-}
+  /* Drop-right submenu styles */
+  .has-drop-right {
+    position: relative;
+  }
 
-.drop-right-menu {
-  display: none;
-  position: absolute;
-  left: 100%;
-  top: 0;
-  min-width: 200px;
-  background: white;
-  border: 1px solid #ccc;
-  box-shadow: 2px 2px 5px rgba(0,0,0,0.2);
-  z-index: 120;
-  list-style: none;
-  padding: 0;
-}
+  .drop-right-menu {
+    display: none;
+    position: absolute;
+    left: 100%;
+    top: 0;
+    min-width: 200px;
+    background: white;
+    border: 1px solid #ccc;
+    box-shadow: 2px 2px 5px rgba(0,0,0,0.2);
+    z-index: 120;
+    list-style: none;
+    padding: 0;
+  }
 
-.has-drop-right:hover .drop-right-menu {
-  display: block;
-}
+  .has-drop-right:hover .drop-right-menu {
+    display: block;
+  }
 
-/* Base styles for dropdown menus */
-.dropdown-menu {
-  position: absolute;
-  z-index: 1000;
-  background: white;
-  border: 1px solid #ccc;
-  box-shadow: 2px 2px 5px rgba(0,0,0,0.2);
-  list-style: none;
-  padding: 0;
-  margin: 0;
-}
+  /* Base styles for dropdown menus */
+  .dropdown-menu {
+    position: absolute;
+    z-index: 1000;
+    background: white;
+    border: 1px solid #ccc;
+    box-shadow: 2px 2px 5px rgba(0,0,0,0.2);
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
 
-/* When the drop-right menu should be visible (using pure CSS) */
-.has-dropright:hover > .dropdown-menu,
-.has-dropright:focus-within > .dropdown-menu {
-  display: block;
-}
+  /* When the drop-right menu should be visible (using pure CSS) */
+  .has-dropright:hover > .dropdown-menu,
+  .has-dropright:focus-within > .dropdown-menu {
+    display: block;
+  }
 
-/* Auto-positioning for submenus that would overflow the viewport */
-@media (min-width: 769px) {
+  /* Auto-positioning for submenus that would overflow the viewport */
   .has-dropright.viewport-edge > .dropdown-menu {
     left: auto;
     right: 100%;
@@ -194,12 +193,14 @@ body {
   /* Mobile adjustments for drop-right menus */
   .drop-right-menu {
     position: static;
-    display: none;
     margin-left: 1rem;
     box-shadow: none;
     border: none;
     width: 100%;
     background-color: transparent;
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.4s ease;
   }
   
   /* Improved indentation for nested mobile menus */
@@ -211,8 +212,9 @@ body {
     margin-left: 2rem;
   }
   
-  .has-drop-right:hover .drop-right-menu {
-    display: block;
+  /* Mobile accordion animation for drop-right menus */
+  .has-drop-right.open > .drop-right-menu {
+    max-height: 80vh;
   }
   
   /* Mobile accordion style for top-menu dropdowns using pure CSS */
@@ -254,6 +256,12 @@ body {
   }
 }
 
+/* Helper for consistent root menu padding */
+.root-menu-padding > .dropdown-menu,
+.root-menu-padding > .drop-right-menu {
+  margin-left: 1rem;
+}
+
 /* Ensure dropdown toggles have proper cursor */
 .has-dropright > .dropdown-toggle,
 .has-drop-right > a {
@@ -286,4 +294,11 @@ body {
 .main-menu .dropdown-menu a[href="#"]:hover,
 .main-menu .drop-right-menu a[href="#"]:hover {
   background: none;
+}
+
+/* Safety rule to ensure dropdown appears on mobile when JS toggles .open */
+@media (max-width: 768px) {
+  .has-dropdown.open > .dropdown-menu {
+    display: block;
+  }
 }
