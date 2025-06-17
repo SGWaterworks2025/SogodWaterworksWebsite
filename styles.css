@@ -1197,6 +1197,66 @@ a[href="index.html?p=1853.html"] {
 /* -------------------- SOGOD - Base Styles -------------------- */
 /* -------------------- SOGOD - Unified Responsive -------------------- */
 
+/* 📱 Base Styles (Desktop-first) */
+/* -------------------- SOGOD -------------------- */
+/* -------------------- SOGOD -------------------- */
+/* -------------------- SOGOD -------------------- */
+
+
+
+
+.sogod-header-widget-panel {
+  position: absolute;
+  top: 10px;
+  right: 20px;
+  text-align: right;
+  font-size: 1.1em;
+  z-index: 2001;
+  background-color: rgba(255, 255, 255, 0);
+  padding: 5px 5px;
+  border-radius: 5px;
+}
+
+@media (max-width: 1000px) {
+  .sogod-header-widget-panel {
+    display: none !important;
+  }
+}
+/* -------------------- SOGOD -------------------- */
+/* -------------------- SOGOD -------------------- */
+
+/* -------------------- SOGOD -------------------- */
+
+/* -------------------- SOGOD -------------------- */
+
+/* -------------------- SOGOD -------------------- */
+
+/* -------------------- SOGOD -------------------- */
+
+/* -------------------- SOGOD -------------------- */
+/* -------------------- SOGOD -------------------- */
+/* -------------------- SOGOD -------------------- */
+
+/* -------------------- SOGOD -------------------- */
+
+/* -------------------- SOGOD -------------------- */
+/* -------------------- SOGOD -------------------- */
+
+/* -------------------- SOGOD -------------------- */
+
+/* -------------------- SOGOD -------------------- */
+/* -------------------- SOGOD -------------------- */
+
+/* -------------------- SOGOD -------------------- */
+
+/* -------------------- SOGOD -------------------- */
+
+/* -------------------- SOGOD -------------------- */
+
+/* -------------------- SOGOD -------------------- */
+
+/* -------------------- SOGOD -------------------- */
+
 .sogod-header {
   display: flex;
   align-items: center;
@@ -1204,7 +1264,16 @@ a[href="index.html?p=1853.html"] {
   gap: 15px;
   flex-wrap: wrap;
   padding: 5px 20px;
-  transform: translateX(-240px);
+  overflow-x: visible;
+  margin-bottom: 20px;
+  /* Add these properties to fix positioning */
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  background-color: white;
+  z-index: 1000;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
 }
 
 .sogod-nav-header {
@@ -1255,6 +1324,7 @@ a[href="index.html?p=1853.html"] {
   display: inline-block;
   line-height: 1.5;
   width: fit-content;
+  user-select: none;
 }
 
 .sogod-dropdown-button:hover {
@@ -1264,18 +1334,18 @@ a[href="index.html?p=1853.html"] {
 
 .sogod-dropdown-container {
   position: relative;
-  z-index: 1;
+  z-index: 1002;
 }
 
 .sogod-dropdown-content {
   display: none;
   position: absolute;
-  top: 90%;
+  top: 100%;
   left: 0;
   background-color: white;
   box-shadow: 0 8px 16px rgba(0,0,0,0.2);
   border-radius: 6px;
-  z-index: 999;
+  z-index: 1001;
   min-width: 220px;
   padding: 8px 0;
 }
@@ -1290,7 +1360,7 @@ a[href="index.html?p=1853.html"] {
 }
 
 .sogod-dropdown-container:hover .sogod-dropdown-content {
-  display: block;
+  display: block !important;
 }
 
 .sogod-dropdown-content a:hover {
@@ -1299,61 +1369,246 @@ a[href="index.html?p=1853.html"] {
 }
 
 .sogod-main-x-content {
-  padding: -10px;
+  padding: 0;
+  margin-top: 165px; /* Base: 155px header + 10px gap */
 }
 
-/* 📱 Mobile: Shrink proportionally, keep layout horizontal */
-@media (max-width: 767px) {
+/* 📱 Responsive profiles - All with 10px consistent gap */
+/* Large desktop screens */
+@media (min-width: 1367px) {
+  .sogod-main-x-content { 
+    margin-top: 165px !important; /* 155px header + 10px gap */
+  }
+}
+
+@media (max-width: 1366px) {
+  .sogod-main-x-content { 
+    margin-top: 165px !important; /* 155px header + 10px gap */
+  }
+}
+
+@media (max-width: 1300px) {
+  .sogod-main-x-content { 
+    margin-top: 165px !important; /* 155px header + 10px gap */
+  }
+}
+
+@media (max-width: 1248px) {
+  .sogod-main-x-content { 
+    margin-top: 161px !important; /* 151px header + 10px gap */
+  }
+}
+
+@media (max-width: 1200px) {
+  .sogod-main-x-content { 
+    margin-top: 161px !important; /* 151px header + 10px gap */
+  }
+}
+
+@media (max-width: 1127px) {
+  .sogod-main-x-content { 
+    margin-top: 176px !important; /* 166px header + 10px gap */
+  }
+}
+
+@media (max-width: 1100px) {
+  .sogod-main-x-content { 
+    margin-top: 176px !important; /* 166px header + 10px gap */
+  }
+}
+
+@media (max-width: 1000px) {
+  .sogod-main-x-content { 
+    margin-top: 176px !important; /* 166px header + 10px gap */
+  }
+}
+
+@media (max-width: 946px) {
+  .sogod-main-x-content { 
+    margin-top: 215px !important; /* 205px header + 10px gap */
+  }
+}
+
+@media (max-width: 922px) {
+  .sogod-main-x-content { 
+    margin-top: 383px !important; /* 373px header + 10px gap */
+  }
+  .sogod-site-title { 
+    font-size: 2.5em; 
+  }
+  .sogod-nav-logo img { 
+    max-width: 75px; 
+  }
+}
+
+@media (max-width: 850px) {
+  .sogod-main-x-content { 
+    margin-top: 383px !important; /* Maintain 922px spacing + 10px gap */
+  }
+}
+
+@media (max-width: 800px) {
+  .sogod-main-x-content { 
+    margin-top: 383px !important; /* Maintain 922px spacing + 10px gap */
+  }
+}
+
+@media (max-width: 744px) {
   .sogod-header {
-    transform: translateX(-20px); /* Slight left shift if needed */
-    padding: 25px;
-    flex-direction: row;
-    flex-wrap: wrap;
-    justify-content: flex-start; /* align to left instead of center */
-    gap: 12px;
-  }
-
-  .sogod-site-title {
-    font-size: 2.2em;
-  }
-
-  .sogod-dropdown-button {
-    font-size: 0.95em;
-    padding: 8px 14px;
-    width: auto;                /* ✅ no stretching */
-    box-sizing: border-box;
-    text-align: center;
-  }
-
-  .sogod-dropdown-nav {
-    flex-wrap: wrap;
+    padding: 8px 15px;
     gap: 10px;
   }
-
-  .sogod-dropdown-content a {
-    font-size: 1.2em;
-    padding: 16px 20px;
+  .sogod-main-x-content { 
+    margin-top: 169px !important; /* 159px header + 10px gap */
   }
-
-.sogod-main-x-content {
-  padding: 110px;
+  .sogod-site-title { 
+    font-size: 2em; 
+  }
+  .sogod-nav-logo img { 
+    max-width: 65px; 
+    margin-right: 15px;
+  }
+  .sogod-dropdown-button {
+    padding: 4px 12px;
+    font-size: 0.9em;
+  }
 }
 
-  .responsive-embed {
-    width: 100% !important;
+@media (max-width: 700px) {
+  .sogod-main-x-content { 
+    margin-top: 169px !important; /* Maintain 744px spacing + 10px gap */
+  }
+  .sogod-site-title { 
+    font-size: 1.8em; 
+  }
+}
+
+@media (max-width: 687px) {
+  .sogod-header {
+    padding: 10px 12px;
+    gap: 8px;
+  }
+  .sogod-main-x-content { 
+    margin-top: 243px !important; /* 233px header + 10px gap */
+  }
+  .sogod-site-title { 
+    font-size: 1.6em; 
+  }
+  .sogod-nav-logo img { 
+    max-width: 55px; 
+    margin-right: 10px;
+  }
+  .sogod-dropdown-nav {
+    gap: 6px;
+  }
+  .sogod-dropdown-button {
+    padding: 3px 10px;
+    font-size: 0.85em;
+  }
+}
+
+/* Small mobile screens */
+@media (max-width: 600px) {
+  .sogod-header {
+    padding: 8px 10px;
+    gap: 6px;
+  }
+  .sogod-nav-logo img { 
+    max-width: 50px; 
+    margin-right: 8px;
+  }
+  .sogod-site-title { 
+    font-size: 1.4em; 
+  }
+  .sogod-main-x-content { 
+    margin-top: 243px !important; /* Maintain 687px spacing + 10px gap */
+  }
+  .sogod-dropdown-button {
+    padding: 2px 8px;
+    font-size: 0.8em;
+  }
+}
+
+@media (max-width: 500px) {
+  .sogod-main-x-content { 
+    margin-top: 243px !important; /* Maintain consistent + 10px gap */
+  }
+  .sogod-site-title { 
+    font-size: 1.3em; 
+  }
+}
+
+@media (max-width: 400px) {
+  .sogod-header {
+    padding: 6px 8px;
+    gap: 4px;
+  }
+  .sogod-main-x-content { 
+    margin-top: 243px !important; /* Maintain consistent + 10px gap */
+  }
+  .sogod-site-title { 
+    font-size: 1.2em; 
+  }
+  .sogod-nav-logo img { 
+    max-width: 45px; 
+    margin-right: 6px;
+  }
+  .sogod-dropdown-content a {
+    padding: 8px 14px;
+    font-size: 1em;
+  }
+  .sogod-dropdown-button {
+    padding: 2px 6px;
+    font-size: 0.75em;
+  }
+}
+
+@media (max-width: 300px) {
+  .sogod-main-x-content { 
+    margin-top: 243px !important; /* Maintain consistent + 10px gap */
+  }
+  .sogod-site-title { 
+    font-size: 1.1em; 
+  }
+  .sogod-nav-logo img { 
+    max-width: 40px; 
+  }
+}
+
+/* 📅 Calendar full width fix */
+@media (max-width: 1000px) {
+  .full-width-mobile {
     max-width: 100% !important;
     padding: 0 !important;
     margin: 0 !important;
+    box-sizing: border-box;
   }
-
-  .responsive-embed iframe {
+  .full-width-mobile iframe {
     width: 100% !important;
     display: block;
     border: none;
   }
-
-
-
 }
 
+/* Additional utility classes for better mobile experience */
+.sogod-mobile-optimize {
+  -webkit-text-size-adjust: 100%;
+  -ms-text-size-adjust: 100%;
+}
+
+/* Ensure dropdown works on mobile */
+@media (max-width: 744px) {
+  .sogod-dropdown-content {
+    min-width: 180px;
+    left: 50%;
+    transform: translateX(-50%);
+  }
+}
+
+/* Fix dropdown hover for all screen sizes */
+.sogod-dropdown-container:hover .sogod-dropdown-content,
+.sogod-dropdown-container:focus-within .sogod-dropdown-content,
+.sogod-dropdown-button:hover + .sogod-dropdown-content {
+  display: block !important;
+}
 

@@ -748,14 +748,21 @@
 
 
         
+ 
+
+
+<div class="sogod-header">
+
+
+
                               <!-- Overlay Date/Time/Weather -->
-                      <div id="header-widgets" style="
+                      <div class="sogod-header-widget-panel" id="header-widgets" style="
                         position: absolute;
                         top: 10px;
                         right: 20px;
                         text-align: right;
                         font-size: 1.1em;
-                        z-index: 500;
+                        z-index: 2001;
                         background-color: rgba(255, 255, 255, 0);
                         padding: 5px 5px;
                         border-radius: 5px;
@@ -801,7 +808,8 @@
                       </script>
 
 
-<div class="sogod-header">
+
+
   <div class="sogod-nav-logo">
     <img src="sogodassets/image/logosogod.png" alt="SOGOD Waterworks Logo">
   </div>
@@ -1468,6 +1476,7 @@
         });
       </script>
       <script src="assets/js/main-background-switcher.js"></script>
+      
       <script>
         // Ensure DOM is fully loaded before loading scroll restoration script
         document.addEventListener('DOMContentLoaded', function() {
