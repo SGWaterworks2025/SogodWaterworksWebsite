@@ -58,6 +58,12 @@ const FORM_REGISTRY = [ // used by: ensureAllFormTriggersExist, updateAvailabili
     availabilitySheetName: 'Availability_Repair'
   },
   {
+    formId: '1jeVbs7nAIhaGhiJEyqcAygwgTNVixV6gt81xwdUWrYs',
+    sheetName: 'ForWaterTruckRequest',
+    spreadsheetId: '1SZqf77i655xHA1FI6YzeZ332E6M4Y_dpFmz_h1tM6xQ',
+    availabilitySheetName: 'Availability_WaterTruck'
+  },
+  {
     formId: '19acXAZfOnMunLOg9enl9JrSJCfzjqbqwn45_QD9vX4g',
     sheetName: 'ForOtherConcerns',
     spreadsheetId: '1SZqf77i655xHA1FI6YzeZ332E6M4Y_dpFmz_h1tM6xQ',
@@ -473,6 +479,7 @@ const HolidayService = {
     { month: 4, day: 9, name: 'Araw ng Kagitingan' },
     { month: 5, day: 1, name: 'Labor Day' },
     { month: 6, day: 12, name: 'Independence Day' },
+    { month: 7, day: 15, name: 'SOGOD MUNICIPAL FIESTA' },
     { month: 8, day: 21, name: 'Ninoy Aquino Day' },
     { month: 11, day: 1, name: "All Saints' Day" },
     { month: 11, day: 2, name: "All Souls' Day" },
@@ -483,15 +490,26 @@ const HolidayService = {
     { month: 12, day: 31, name: "New Year's Eve" }
   ],
 
-  _excludedHolidayNames: new Set([
-    'Amun Jadid',
-    'Maulid un-Nabi',
-    'Lailatul Isra Wal Mi Raj',
-    'Eid al-Adha Day 2',
-    'Eid al-Fitr Day 2',
-    'Eid al-Adha Day 3',
-    'Eid al-Fitr Day 3'
-  ]),
+_excludedHolidayNames: new Set([
+  'Amun Jadid',
+  'Maulid un-Nabi',
+  'Mawlid al-Nabi',
+  'Lailatul Isra Wal Mi Raj',
+  'Eid al-Adha Day 2',
+  'Eid al-Adha Day 3',
+  'Eid al-Fitr Day 2',
+  'Eid al-Fitr Day 3',
+  'Hijri New Year',
+  'Ashura',
+  'Arba\'een',
+  'Laylat al-Bara\'ah',
+  'Laylat al-Qadr',
+  'Waqf al-Arafa',
+  'Ramadan Start',
+  'Ramadan End',
+  'Laylat al-Raghaib',
+  'Eid al-Ghadir'
+]),
   _overrideWorkingDays: new Set(), // TODO future admin UI
 
   /**
