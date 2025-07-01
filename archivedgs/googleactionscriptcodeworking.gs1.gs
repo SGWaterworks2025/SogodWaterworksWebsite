@@ -1342,9 +1342,11 @@ const AvailabilityService = {
     }
     
     const lock = LockService.getScriptLock();
-    if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
-      logTS('AvailabilityService.decrementSlotAllCategories: Lock busy, skipping for ' + dateString);
-      throw new Error('System busy, please try again');
+    try {
+      lock.waitLock(LOCK_TIMEOUT_MS);
+    } catch (e) {
+      logTS('AvailabilityService.decrementSlotAllCategories: Could not obtain lock after ' + (LOCK_TIMEOUT_MS / 1000) + ' seconds.');
+      throw new Error('The system is busy with background tasks. Please try submitting again in a moment.');
     }
     
     try {
@@ -1528,14 +1530,13 @@ const TriggerService = {
         .create();
       logTS('TriggerService: created hourly rebuildAllFormDropdowns trigger');
     }
-    // Daily midnight updateAvailability_everywhere
+    // Hourly updateAvailability_everywhere
     if (!this.triggerExists({handlerFunction: 'updateAvailability_everywhere', eventType: ScriptApp.EventType.CLOCK})) {
       ScriptApp.newTrigger('updateAvailability_everywhere')
         .timeBased()
-        .everyDays(1)
-        .atHour(0)
+        .everyHours(1)
         .create();
-      logTS('TriggerService: created daily midnight updateAvailability_everywhere trigger');
+      logTS('TriggerService: created hourly updateAvailability_everywhere trigger');
     }
     // Daily calendar quota reset at midnight
     if (!this.triggerExists({handlerFunction: 'resetCalendarQuotaDaily', eventType: ScriptApp.EventType.CLOCK})) {
@@ -2648,16 +2649,9 @@ function syncOneForm(entry) {
  * @param {Object} e - Spreadsheet onFormSubmit event object.
  */
 function onFormSubmit(e) {
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
-    logTS('onFormSubmit: Lock busy, skipping');
-    return;
-  }
-  
+  console.log("🔔 Triggered onFormSubmit"); // Added as per request
   try {
     logTS('onFormSubmit: start');
-    
-    // Initialize calendar quota manager
     CalendarQuotaManager.initRun();
     
     // Identify sheet and row
@@ -2747,31 +2741,15 @@ function onFormSubmit(e) {
       sendThrottledError('onFormSubmit-purgeOldResponses', err);
     }
     
-    // Increment submit counter and schedule fallback if needed
-    try {
-      const props = PropertiesService.getScriptProperties();
-      let count = parseInt(props.getProperty(SUBMIT_COUNT_KEY) || '0', 10) + 1;
-      props.setProperty(SUBMIT_COUNT_KEY, String(count));
-      if (count >= 10) {
-        ScriptApp.newTrigger('updateAvailability_everywhere')
-          .timeBased()
-          .after(1000)
-          .create();
-        logTS('onFormSubmit: Scheduled fallback sync after 10 submissions');
-        props.setProperty(SUBMIT_COUNT_KEY, '0');
-      }
-    } catch (err) {
-      logTS('onFormSubmit: Error incrementing submit counter: ' + err);
-      sendThrottledError('onFormSubmit-counter', err);
-    }
       if (!e) {
     Logger.log("No event object provided.");
     return;
   }
     generateUnifiedAppointmentList(e);
     logTS('onFormSubmit: end');
-  } finally {
-    lock.releaseLock();
+  } catch (err) {
+    logTS('onFormSubmit: Error: ' + err);
+    sendThrottledError('onFormSubmit', err);
   }
 }
 
@@ -4055,7 +4033,50 @@ function processAvailabilitySheet_(registryEntry) {
   }
 }
 
+/**
+ * Ensures a sheet tab with the given name exists in the active spreadsheet.
+ * If the sheet does not exist, it creates it and adds a default header row.
+ *
+ * @param {string} sheetName - The name of the sheet to ensure.
+ * @return {GoogleAppsScript.Spreadsheet.Sheet} The Sheet object.
+ */
+function ensureSheetTab(sheetName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(sheetName);
 
+  if (!sheet) {
+    console.log(`📄 Creating new tab: ${sheetName}`);
+    sheet = ss.insertSheet(sheetName);
+    sheet.appendRow(["Timestamp", "Name", "Date"]);
+  }
+  return sheet;
+}
+
+
+/**
+ * Appends a log entry to a specified sheet.
+ *
+ * @param {string} name - The name to log.
+ * @param {string} date - The date to log.
+ * @param {string} sheetName - The name of the sheet to log to.
+ */
+function logToSheet(name, date, sheetName) {
+  const sheet = ensureSheetTab(sheetName);
+  sheet.appendRow([new Date(), name, date]);
+}
+
+
+/**
+ * Creates a simple all-day event on the default calendar.
+ *
+ * @param {string} name - The name to include in the event title.
+ * @param {string} dateStr - The date for the event in a string format parseable by new Date().
+ */
+function createCalendarEvent(name, dateStr) {
+  const calendar = CalendarApp.getDefaultCalendar();
+  const date = new Date(dateStr);
+  calendar.createEvent(`Appointment: ${name}`, date, date);
+}
 
 /**
  * Validates the summary window ensuring exactly one summary on valid business dates and none elsewhere
@@ -4285,7 +4306,7 @@ globalThis.LOCK_TIMEOUT_MS = LOCK_TIMEOUT_MS;
 //if (!globalThis.FUTURE_DAYS || !Array.isArray(globalThis.FORM_REGISTRY)) {
 //  throw new Error('Shared constants missing – check googleactionscriptcodeworking.gs');
 //}
-
+ 
 const PRIMARY_SS_ID = FORM_REGISTRY[0].spreadsheetId; // local helper only
 
 // Frontend-specific constants

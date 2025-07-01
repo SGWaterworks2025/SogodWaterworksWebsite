@@ -1370,68 +1370,68 @@ a[href="index.html?p=1853.html"] {
 
 .sogod-main-x-content {
   padding: 0;
-  margin-top: 165px; /* Base: 155px header + 10px gap */
+  margin-top: 175px; /* Base: 155px header + 20px gap */
 }
 
 /* 📱 Responsive profiles - All with 10px consistent gap */
 /* Large desktop screens */
 @media (min-width: 1367px) {
   .sogod-main-x-content { 
-    margin-top: 165px !important; /* 155px header + 10px gap */
+    margin-top: 175px !important; /* 155px header + 20px gap */
   }
 }
 
 @media (max-width: 1366px) {
   .sogod-main-x-content { 
-    margin-top: 165px !important; /* 155px header + 10px gap */
+    margin-top: 175px !important; /* 155px header + 20px gap */
   }
 }
 
 @media (max-width: 1300px) {
   .sogod-main-x-content { 
-    margin-top: 165px !important; /* 155px header + 10px gap */
+    margin-top: 175px !important; /* 155px header + 20px gap */
   }
 }
 
 @media (max-width: 1248px) {
   .sogod-main-x-content { 
-    margin-top: 161px !important; /* 151px header + 10px gap */
+    margin-top: 171px !important; /* 151px header + 20px gap */
   }
 }
 
 @media (max-width: 1200px) {
   .sogod-main-x-content { 
-    margin-top: 161px !important; /* 151px header + 10px gap */
+    margin-top: 171px !important; /* 151px header + 20px gap */
   }
 }
 
 @media (max-width: 1127px) {
   .sogod-main-x-content { 
-    margin-top: 176px !important; /* 166px header + 10px gap */
+    margin-top: 186px !important; /* 166px header + 20px gap */
   }
 }
 
 @media (max-width: 1100px) {
   .sogod-main-x-content { 
-    margin-top: 176px !important; /* 166px header + 10px gap */
+    margin-top: 186px !important; /* 166px header + 20px gap */
   }
 }
 
 @media (max-width: 1000px) {
   .sogod-main-x-content { 
-    margin-top: 176px !important; /* 166px header + 10px gap */
+    margin-top: 186px !important; /* 166px header + 20px gap */
   }
 }
 
 @media (max-width: 946px) {
   .sogod-main-x-content { 
-    margin-top: 215px !important; /* 205px header + 10px gap */
+    margin-top: 225px !important; /* 205px header + 20px gap */
   }
 }
 
 @media (max-width: 922px) {
   .sogod-main-x-content { 
-    margin-top: 383px !important; /* 373px header + 10px gap */
+    margin-top: 393px !important; /* 373px header + 20px gap */
   }
   .sogod-site-title { 
     font-size: 2.5em; 
@@ -1443,13 +1443,13 @@ a[href="index.html?p=1853.html"] {
 
 @media (max-width: 850px) {
   .sogod-main-x-content { 
-    margin-top: 383px !important; /* Maintain 922px spacing + 10px gap */
+    margin-top: 393px !important; /* Maintain 922px spacing + 20px gap */
   }
 }
 
 @media (max-width: 800px) {
   .sogod-main-x-content { 
-    margin-top: 383px !important; /* Maintain 922px spacing + 10px gap */
+    margin-top: 393px !important; /* Maintain 922px spacing + 20px gap */
   }
 }
 
@@ -1459,7 +1459,7 @@ a[href="index.html?p=1853.html"] {
     gap: 10px;
   }
   .sogod-main-x-content { 
-    margin-top: 169px !important; /* 159px header + 10px gap */
+    margin-top: 179px !important; /* 159px header + 20px gap */
   }
   .sogod-site-title { 
     font-size: 2em; 
@@ -1476,7 +1476,7 @@ a[href="index.html?p=1853.html"] {
 
 @media (max-width: 700px) {
   .sogod-main-x-content { 
-    margin-top: 169px !important; /* Maintain 744px spacing + 10px gap */
+    margin-top: 179px !important; /* Maintain 744px spacing + 20px gap */
   }
   .sogod-site-title { 
     font-size: 1.8em; 
@@ -1489,7 +1489,7 @@ a[href="index.html?p=1853.html"] {
     gap: 8px;
   }
   .sogod-main-x-content { 
-    margin-top: 243px !important; /* 233px header + 10px gap */
+    margin-top: 253px !important; /* 233px header + 20px gap */
   }
   .sogod-site-title { 
     font-size: 1.6em; 
@@ -1611,4 +1611,3 @@ a[href="index.html?p=1853.html"] {
 .sogod-dropdown-button:hover + .sogod-dropdown-content {
   display: block !important;
 }
-
