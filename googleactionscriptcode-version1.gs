@@ -661,20 +661,35 @@ function ensureDistributedQueueSheet() {
 }
 
 /**
- * Enqueue a new job in the distributed queue.
- * @param {Object} payload - The job payload.
+ * Enqueue a new job in the distributed queue (agentic job model).
+ * @param {Object} job - The job object. Must include taskName and args.
  * @return {string} Job ID
  */
-function distributedQueueEnqueue(payload) {
+function distributedQueueEnqueue(job) {
+  // Validate job structure
+  if (!job || typeof job !== 'object' || !job.taskName) {
+    throw new Error('Job must have a taskName (matching TASK_REGISTRY)');
+  }
   const sheet = ensureDistributedQueueSheet();
   const id = Utilities.getUuid();
   const now = new Date().toISOString();
-  sheet.appendRow([id, JSON.stringify(payload), now, '', '', 'PENDING']);
+  // Build agentic job payload
+  const jobPayload = {
+    id,
+    taskName: job.taskName,
+    args: job.args || {},
+    state: job.state || {},
+    priority: typeof job.priority === 'number' ? job.priority : 0,
+    retries: typeof job.retries === 'number' ? job.retries : 0,
+    status: 'PENDING',
+    dependenciesResolved: typeof job.dependenciesResolved === 'boolean' ? job.dependenciesResolved : true
+  };
+  sheet.appendRow([id, JSON.stringify(jobPayload), now, '', '', 'PENDING']);
   return id;
 }
 
 /**
- * Atomically claim a job from the distributed queue.
+ * Atomically claim a job from the distributed queue (agentic job model).
  * @param {string} workerId - Unique worker identifier.
  * @param {number} [claimTimeoutSec=60] - Claim timeout in seconds.
  * @return {Object|null} Claimed job object or null if none available.
@@ -698,9 +713,16 @@ function distributedQueueDequeueAtomic(workerId, claimTimeoutSec) {
       const currentStatus = range.getValue();
       if (currentStatus === status) { // compare-and-swap
         sheet.getRange(rowIdx, 4, 1, 3).setValues([[now.toISOString(), workerId, 'CLAIMED']]);
+        // Parse agentic job payload
+        let jobPayload;
+        try {
+          jobPayload = JSON.parse(row[1]);
+        } catch (e) {
+          // Legacy/old jobs: fallback to old payload
+          jobPayload = { id: row[0], legacyPayload: row[1] };
+        }
         return {
-          id: row[0],
-          payload: JSON.parse(row[1]),
+          ...jobPayload,
           row: rowIdx
         };
       }
@@ -719,7 +741,7 @@ function distributedQueueComplete(rowIdx) {
 }
 
 /**
- * List all jobs in the distributed queue (for monitoring).
+ * List all jobs in the distributed queue (agentic job model).
  * @return {Array<Object>} List of job objects.
  */
 function distributedQueueListAll() {
@@ -727,9 +749,15 @@ function distributedQueueListAll() {
   const data = sheet.getDataRange().getValues();
   const jobs = [];
   for (let i = 1; i < data.length; i++) {
+    let jobPayload;
+    try {
+      jobPayload = JSON.parse(data[i][1]);
+    } catch (e) {
+      // Legacy/old jobs: fallback to old payload
+      jobPayload = { id: data[i][0], legacyPayload: data[i][1] };
+    }
     jobs.push({
-      id: data[i][0],
-      payload: data[i][1],
+      ...jobPayload,
       enqueuedAt: data[i][2],
       claimedAt: data[i][3],
       claimedBy: data[i][4],
@@ -2670,6 +2698,20 @@ function onFormSubmit(e) {
     const payload = _getSubmissionPayload(e);
     if (!payload) return;
 
+    // --- Advanced deduplication: override old entries ---
+    // Key: lastName + firstName + barangay + dateString
+    const dedupKey = [payload.rowData.lastName, payload.rowData.firstName, payload.rowData.barangay, payload.dateString].join('|');
+    const sheet = e.range.getSheet();
+    const data = sheet.getDataRange().getValues();
+    const currentRow = e.range.getRow();
+    for (let i = data.length - 1; i >= 1; i--) { // skip header
+      const [ts, lastName, firstName, purok, barangay, dateOfAppt] = data[i];
+      const rowKey = [lastName, firstName, barangay, (dateOfAppt || '').split(' ')[0]].join('|');
+      if (rowKey === dedupKey && (i + 1) !== currentRow) {
+        sheet.deleteRow(i + 1); // delete old duplicate
+      }
+    }
+
     if (_isRequestDuplicate(payload.idempotencyKey)) {
       Logger.log(`onFormSubmit: Duplicate request, skipping: ${payload.idempotencyKey}`);
       return;
@@ -2959,16 +3001,23 @@ const ContinuationManager = {
    * @return {Object} The loaded or initial state, with metrics fields.
    */
   loadState(taskName, initialState = {}) {
+    const defaultMetrics = {
+      startTime: Date.now(),
+      apiCalls: 0,
+      rowsProcessedThisRun: 0,
+      lastUpdate: Date.now(),
+      batchSize: initialState.batchSize || 100,
+      timeoutRecoveryCount: 0,
+      continuationTriggerId: null,
+    };
+
     const props = PropertiesService.getScriptProperties();
     const saved = props.getProperty(taskName);
-    let state = saved ? JSON.parse(saved) : { ...initialState };
-    // Ensure all metrics fields are present
-    if (!state.startTime) state.startTime = Date.now();
-    if (typeof state.apiCalls !== 'number') state.apiCalls = 0;
-    if (typeof state.rowsProcessedThisRun !== 'number') state.rowsProcessedThisRun = 0;
-    if (!state.lastUpdate) state.lastUpdate = Date.now();
-    if (typeof state.batchSize !== 'number') state.batchSize = initialState.batchSize || 100;
-    if (typeof state.timeoutRecoveryCount !== 'number') state.timeoutRecoveryCount = 0;
+    let state = saved ? JSON.parse(saved) : {};
+
+    // Merge defaults, initial state, and saved state
+    state = { ...defaultMetrics, ...initialState, ...state };
+
     // Self-healing: detect stale state (likely timeout)
     const now = Date.now();
     if (saved && (now - state.lastUpdate > STALE_STATE_TIMEOUT_MS)) {
@@ -3322,8 +3371,16 @@ function masterAsyncJobWorker(options, e) {
         return;
       }
       while (state.row <= lastRow) {
-        const job = dequeueNextJobByPriority(sheet);
-        if (!job) break;
+        const rowValues = sheet.getRange(state.row, 1, 1, sheet.getLastColumn()).getValues()[0];
+        if (!rowValues || !rowValues[0]) {
+          state.row++;
+          continue;
+        }
+        const job = {
+          id: rowValues[0],
+          payload: JSON.parse(rowValues[1]),
+          row: state.row
+        };
         try {
           const handler = JobHandlerRegistry.getHandler(job.payload.type);
           if (handler) {
@@ -3492,4 +3549,1877 @@ function drainQueueWithContinuation(e) {
   }
   Logger.log(`drainQueueWithContinuation: Finished. Total jobs processed: ${state.processed}`);
   ContinuationManager.finish(taskName, continuationFnName);
+}
+
+// === TASK_REGISTRY: System Call Table for Apps Script OS ===
+// This registry defines all orchestratable/admin tasks for dynamic scheduling and agentic invocation.
+// Only include top-level system/admin/orchestratable functions (no queue primitives or helpers).
+const TASK_REGISTRY = {
+  setupOrValidateSystem: {
+    functionName: 'setupOrValidateSystem',
+    description: 'Main admin entry for validation and repair of system resources.',
+    parameters: [ { name: 'sheetId', type: 'string', required: true }, { name: 'options', type: 'object', required: false } ],
+    resourceCost: 'MEDIUM', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  validateResources: {
+    functionName: 'validateResources',
+    description: 'Validates all resources (sheets, forms, calendar) for a given sheet ID.',
+    parameters: [ { name: 'sheetId', type: 'string', required: true } ],
+    resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  },
+  modernPopulateResources: {
+    functionName: 'modernPopulateResources',
+    description: 'Populates or repairs resources for a given sheet ID (optionally repair only).',
+    parameters: [ { name: 'sheetId', type: 'string', required: true }, { name: 'options', type: 'object', required: false } ],
+    resourceCost: 'MEDIUM', retryPolicy: 'linear_backoff', dependencies: ['validateResources']
+  },
+  validateConsistency: {
+    functionName: 'validateConsistency',
+    description: 'Checks cross-resource consistency for a given sheet ID.',
+    parameters: [ { name: 'sheetId', type: 'string', required: true } ],
+    resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  },
+  validateDataQuality: {
+    functionName: 'validateDataQuality',
+    description: 'Checks data quality in all response and availability tabs for a given sheet ID.',
+    parameters: [ { name: 'sheetId', type: 'string', required: true } ],
+    resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  },
+  sendFormLinksEmail: {
+    functionName: 'sendFormLinksEmail',
+    description: 'Emails Google Form embed codes to the script owner for a given sheet ID.',
+    parameters: [ { name: 'sheetId', type: 'string', required: true } ],
+    resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  },
+  masterAsyncJobWorker: {
+    functionName: 'masterAsyncJobWorker',
+    description: 'Processes jobs from the distributed queue with lease management and retry policy.',
+    parameters: [ { name: 'options', type: 'object', required: false }, { name: 'e', type: 'object', required: false } ],
+    resourceCost: 'HIGH', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  drainQueueWithContinuation: {
+    functionName: 'drainQueueWithContinuation',
+    description: 'Processes all jobs in the distributed queue using ContinuationManager.',
+    parameters: [ { name: 'e', type: 'object', required: false } ],
+    resourceCost: 'HIGH', retryPolicy: 'move_to_dlq', dependencies: []
+  },
+  rebuildSlotCounters: {
+    functionName: 'rebuildSlotCounters',
+    description: 'Rebuilds slot counters for all availability sheets.',
+    parameters: [ { name: 'e', type: 'object', required: false } ],
+    resourceCost: 'HIGH', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  rebuildAppointmentEventsAllForms: {
+    functionName: 'rebuildAppointmentEventsAllForms',
+    description: 'Deletes and recreates all appointment events from form responses.',
+    parameters: [ { name: 'e', type: 'object', required: false } ],
+    resourceCost: 'HIGH', retryPolicy: 'move_to_dlq', dependencies: []
+  },
+  rebuildAllFormDropdowns: {
+    functionName: 'rebuildAllFormDropdowns',
+    description: 'Rebuilds all form dropdowns to show slot availability.',
+    parameters: [], resourceCost: 'MEDIUM', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  generateUnifiedAppointmentList: {
+    functionName: 'generateUnifiedAppointmentList',
+    description: 'Generates the unified appointment list in block layout for staff.',
+    parameters: [], resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  },
+  auditAvailabilitySheets: {
+    functionName: 'auditAvailabilitySheets',
+    description: 'Audits all availability sheets for integrity and auto-corrects checksums if needed.',
+    parameters: [], resourceCost: 'MEDIUM', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  productionSystemDiagnostics: {
+    functionName: 'productionSystemDiagnostics',
+    description: 'Runs a full system health and diagnostics check.',
+    parameters: [], resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  },
+  setupFreeTierSystem: {
+    functionName: 'setupFreeTierSystem',
+    description: 'Sets up all triggers, quotas, and unified list for free-tier deployment.',
+    parameters: [], resourceCost: 'MEDIUM', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  dailyMaintenanceRoutine: {
+    functionName: 'dailyMaintenanceRoutine',
+    description: 'Performs daily maintenance: resets quotas, purges old responses, syncs calendar, and checks integrity.',
+    parameters: [], resourceCost: 'HIGH', retryPolicy: 'move_to_dlq', dependencies: []
+  },
+  monitorFreeTierSystem: {
+    functionName: 'monitorFreeTierSystem',
+    description: 'Checks system health, quotas, and trigger status.',
+    parameters: [], resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  },
+  checkQueueStatus: {
+    functionName: 'checkQueueStatus',
+    description: 'Checks the status of the distributed queue and DLQ.',
+    parameters: [], resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  },
+  checkExecutionTimeBudget: {
+    functionName: 'checkExecutionTimeBudget',
+    description: 'Checks remaining execution time budget for the day.',
+    parameters: [], resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  },
+  testFreeTierSystem: {
+    functionName: 'testFreeTierSystem',
+    description: 'Tests the free-tier system with a sample job.',
+    parameters: [], resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  },
+  emergencyFreeTierCleanup: {
+    functionName: 'emergencyFreeTierCleanup',
+    description: 'Performs emergency cleanup: releases leases, clears queues, resets quotas, and regenerates unified list.',
+    parameters: [], resourceCost: 'HIGH', retryPolicy: 'none', dependencies: []
+  },
+  retryFailedJobs: {
+    functionName: 'retryFailedJobs',
+    description: 'Retries failed jobs from the Dead-Letter Queue (DLQ).',
+    parameters: [ { name: 'limit', type: 'number', required: false } ],
+    resourceCost: 'MEDIUM', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  forceReleaseWorkerLeases: {
+    functionName: 'forceReleaseWorkerLeases',
+    description: 'Force releases stuck worker leases.',
+    parameters: [], resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  },
+  processUnifiedListUpdateJob: {
+    functionName: 'processUnifiedListUpdateJob',
+    description: 'Handles UNIFIED_LIST_UPDATE jobs by regenerating the unified appointment list.',
+    parameters: [ { name: 'payload', type: 'object', required: false } ],
+    resourceCost: 'MEDIUM', retryPolicy: 'linear_backoff', dependencies: ['generateUnifiedAppointmentList']
+  },
+  processCalendarSyncJob_: {
+    functionName: 'processCalendarSyncJob_',
+    description: 'Handler for CALENDAR_SYNC jobs. Syncs calendar for a date.',
+    parameters: [ { name: 'payload', type: 'object', required: true } ],
+    resourceCost: 'HIGH', retryPolicy: 'move_to_dlq', dependencies: []
+  },
+  processDropdownUpdateJob_: {
+    functionName: 'processDropdownUpdateJob_',
+    description: 'Handler for DROPDOWN_UPDATE jobs. Updates form dropdown for a date.',
+    parameters: [ { name: 'payload', type: 'object', required: true } ],
+    resourceCost: 'MEDIUM', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  processCleanupJob_: {
+    functionName: 'processCleanupJob_',
+    description: 'Handler for CLEANUP jobs. Purges old responses for all forms.',
+    parameters: [ { name: 'payload', type: 'object', required: false } ],
+    resourceCost: 'MEDIUM', retryPolicy: 'move_to_dlq', dependencies: []
+  },
+  onFormSubmit: {
+    functionName: 'onFormSubmit',
+    description: 'Main orchestrator for form submission events.',
+    parameters: [ { name: 'e', type: 'object', required: true } ],
+    resourceCost: 'MEDIUM', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  updateFormDropdownForDate: {
+    functionName: 'updateFormDropdownForDate',
+    description: 'Updates the dropdown for a specific date in a form, after booking or slot change.',
+    parameters: [ { name: 'registry', type: 'object', required: true }, { name: 'date', type: 'string', required: true } ],
+    resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  },
+  sendSystemHealthDigest: {
+    functionName: 'sendSystemHealthDigest',
+    description: 'Sends a daily system health digest email to the administrator.',
+    parameters: [], resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  },
+  runAllTests: {
+    functionName: 'runAllTests',
+    description: 'Runs all unit tests for core logic and system health.',
+    parameters: [], resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  },
+  garbageCollectSystem: {
+    functionName: 'garbageCollectSystem',
+    description: 'Prunes old log entries and obsolete save states.',
+    parameters: [],
+    resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  },
+  consolidatePerformanceLog: {
+    functionName: 'consolidatePerformanceLog',
+    description: 'Consolidates raw performance log data into daily summaries.',
+    parameters: [],
+    resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  },
+  consolidateSystemMetrics: {
+    functionName: 'consolidateSystemMetrics',
+    description: 'Orchestrated system data consolidation: performance logs, metrics, etc.',
+    parameters: [],
+    resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  }
+};
+
+/**
+ * ContinuationOrchestrationKernel: The OS-like orchestrator for agentic jobs.
+ * Responsibilities:
+ * - Acquire Lease
+ * - Assess Resources (API quota, execution time, etc.)
+ * - Select Job: Dequeue highest-priority job whose dependencies are met and resourceCost fits available resources
+ * - Load State: Use ContinuationManager to load job state
+ * - Dynamic Invocation: Use TASK_REGISTRY[taskName].functionName and args to call the function, passing in state
+ * - Process Return: If not done, update job in queue with new state; if done, mark as COMPLETE or archive
+ * - Handle Failure: Use retryPolicy to re-enqueue, backoff, or move to DLQ
+ * - Release Lease
+ * - Supports full-drain/ContinuationManager mode for long-running jobs
+ * - Logs metrics to ConcurrencyMonitor
+ */
+function ContinuationOrchestrationKernel(options, e) {
+  options = options || {};
+  const fullDrain = !!options.fullDrain;
+  const workerId = 'kernel_async_' + Utilities.getUuid();
+  let leaseAcquired = false;
+  const maxBatch = 5;
+  const executionStart = Date.now();
+  const maxExecutionTime = 4 * 60 * 1000;
+  let processedCount = 0;
+
+  // --- PAUSE CHECK (stateless, persistent) ---
+  if (isKernelPaused()) {
+    Logger.log('[Kernel] PAUSED: Exiting without processing jobs.');
+    return;
+  }
+
+  // Business hours check (Mon-Fri, 8am-5pm)
+  const now = new Date();
+  const day = now.getDay();
+  const hour = now.getHours();
+  if (day === 0 || day === 6 || hour < 8 || hour >= 17) {
+    Logger.log('ContinuationOrchestrationKernel: Outside business hours, skipping run.');
+    return;
+  }
+
+  try {
+    leaseAcquired = WorkerLeaseManager.acquireLease(workerId);
+    if (!leaseAcquired) {
+      Logger.log('ContinuationOrchestrationKernel: Failed to acquire lease, another worker is active');
+      return;
+    }
+    const queueStatus = checkQueueStatus ? checkQueueStatus() : { pendingJobs: 0 };
+    if (typeof ConcurrencyMonitor !== 'undefined') {
+      ConcurrencyMonitor.logQueueDepth(queueStatus.pendingJobs || 0);
+    }
+
+    if (fullDrain) {
+      const taskName = 'FULL_DRAIN_QUEUE_STATE';
+      const continuationFnName = 'ContinuationOrchestrationKernel';
+      let state = e && e.state ? e.state : ContinuationManager.loadState(taskName, { row: 2, processed: 0 });
+      const sheet = ensureDistributedQueueSheet();
+      const lastRow = sheet.getLastRow();
+      let processedThisRun = 0;
+      while (state.row <= lastRow) {
+        const rowValues = sheet.getRange(state.row, 1, 1, sheet.getLastColumn()).getValues()[0];
+        if (!rowValues || !rowValues[0]) {
+          state.row++;
+          continue;
+        }
+        let job;
+        try {
+          job = JSON.parse(rowValues[1]);
+        } catch (err) {
+          job = { id: rowValues[0], legacyPayload: rowValues[1] };
+        }
+        job.row = state.row;
+        // --- CANCEL CHECK (stateless, persistent) ---
+        if (isJobCancelled(job.id)) {
+          Logger.log('[Kernel] Job ' + job.id + ' is CANCELLED. Marking as CANCELLED and completing.');
+          job.status = 'CANCELLED';
+          distributedQueueComplete(job.row);
+          if (typeof ConcurrencyMonitor !== 'undefined') {
+            ConcurrencyMonitor._logMetric('job_cancelled', {
+              jobId: job.id,
+              jobType: job.taskName,
+              workerId: workerId
+            });
+          }
+          state.row++;
+          state.processed++;
+          processedThisRun++;
+          continue;
+        }
+        const result = processSingleJob(job, {
+          workerId,
+          mode: 'full-drain',
+          maxExecutionTime,
+          executionStart
+        });
+        processedThisRun++;
+        state.row++;
+        state.processed++;
+        if (!ContinuationManager.shouldContinue(executionStart, maxExecutionTime)) {
+          Logger.log(`[Kernel] [full-drain] Pausing after ${processedThisRun} jobs, will continue...`);
+          ContinuationManager.saveAndContinue(taskName, state, continuationFnName);
+          return;
+        }
+      }
+      Logger.log(`[Kernel] [full-drain] Finished. Total jobs processed: ${state.processed}`);
+      ContinuationManager.finish(taskName, continuationFnName);
+      return;
+    }
+
+    // --- Regular Batch Mode (default) ---
+    const jobs = distributedQueueListAll()
+      .filter(j => j.status === 'PENDING' && j.dependenciesResolved !== false)
+      .sort((a, b) => (b.priority || 0) - (a.priority || 0))
+      .slice(0, maxBatch);
+    for (const job of jobs) {
+      Logger.log(`[Kernel] [batch] Selected job ${job.id} of task ${job.taskName}`);
+      // --- CANCEL CHECK (stateless, persistent) ---
+      if (isJobCancelled(job.id)) {
+        Logger.log('[Kernel] Job ' + job.id + ' is CANCELLED. Marking as CANCELLED and completing.');
+        job.status = 'CANCELLED';
+        distributedQueueComplete(job.row);
+        if (typeof ConcurrencyMonitor !== 'undefined') {
+          ConcurrencyMonitor._logMetric('job_cancelled', {
+            jobId: job.id,
+            jobType: job.taskName,
+            workerId: workerId
+          });
+        }
+        processedCount++;
+        continue;
+      }
+      processSingleJob(job, {
+        workerId,
+        mode: 'batch',
+        maxExecutionTime,
+        executionStart
+      });
+      processedCount++;
+      if ((Date.now() - executionStart) > maxExecutionTime) {
+        Logger.log('[Kernel] [batch] Execution time limit reached, stopping');
+        break;
+      }
+    }
+  } finally {
+    if (leaseAcquired) {
+      WorkerLeaseManager.releaseLease(workerId);
+    }
+    const executionTime = Date.now() - executionStart;
+    Logger.log(`[Kernel] Finished run, processed ${processedCount} jobs in ${executionTime}ms`);
+    if (typeof ConcurrencyMonitor !== 'undefined') {
+      ConcurrencyMonitor._logMetric('worker_performance', {
+        workerId: workerId,
+        processedCount: processedCount,
+        executionTime: executionTime,
+        leaseAcquired: leaseAcquired
+      });
+    }
+  }
+}
+
+/**
+ * Process a single job (used by both full-drain and batch modes)
+ * Handles compatibility shim, handler lookup, invocation, state/result, error/retry/DLQ, logging, and metrics.
+ * @param {Object} job - The job object
+ * @param {Object} context - { workerId, mode, maxExecutionTime, executionStart }
+ * @returns {Object} { done: boolean, continued: boolean, error: Error|null }
+ */
+function processSingleJob(job, context) {
+  const { workerId, mode } = context;
+  // --- Compatibility shim for legacy job payloads ---
+  if (!job.taskName && job.payload && job.payload.type) {
+    job.taskName = job.payload.type;
+    job.args = job.payload.args || job.payload;
+  }
+  // --- End compatibility shim ---
+  const task = TASK_REGISTRY[job.taskName];
+  const legacyHandler = typeof JOB_HANDLERS !== 'undefined' ? JOB_HANDLERS[job.taskName] : undefined;
+  if (!task && !legacyHandler) {
+    Logger.log(`[Kernel] Unknown taskName: ${job.taskName}`);
+    deadLetterEnqueue(job, `Unknown taskName: ${job.taskName}`);
+    distributedQueueComplete(job.row);
+    if (typeof ConcurrencyMonitor !== 'undefined') {
+      ConcurrencyMonitor._logMetric('job_failure', {
+        jobId: job.id,
+        jobType: job.taskName,
+        error: 'Unknown taskName',
+        workerId: workerId
+      });
+    }
+    return { done: true, continued: false, error: new Error('Unknown taskName') };
+  }
+  let stateObj = job.state || {};
+  let done = false;
+  try {
+    Logger.log(`[Kernel] [${mode}] Invoking handler for job ${job.id} (${job.taskName})`);
+    let result;
+    if (task) {
+      const fn = this[task.functionName] || eval(task.functionName);
+      result = fn(job.args, stateObj);
+    } else if (legacyHandler) {
+      result = legacyHandler.length === 2 ? legacyHandler(job.args, stateObj) : legacyHandler(job.args);
+    }
+    if (result && typeof result === 'object' && 'done' in result) {
+      stateObj = result.newState || {};
+      done = !!result.done;
+    } else {
+      done = true;
+    }
+    if (!done) {
+      job.state = stateObj;
+      job.status = 'PENDING';
+      distributedQueueEnqueue(job);
+      Logger.log(`[Kernel] [${mode}] Job ${job.id} not done, re-enqueued for continuation.`);
+      if (typeof ConcurrencyMonitor !== 'undefined') {
+        ConcurrencyMonitor._logMetric('job_continuation', {
+          jobId: job.id,
+          jobType: job.taskName,
+          workerId: workerId
+        });
+      }
+      return { done: false, continued: true, error: null };
+    } else {
+      distributedQueueComplete(job.row);
+      Logger.log(`[Kernel] [${mode}] Completed job ${job.id} (done=${done})`);
+      if (typeof ConcurrencyMonitor !== 'undefined') {
+        ConcurrencyMonitor._logMetric('job_success', {
+          jobId: job.id,
+          jobType: job.taskName,
+          workerId: workerId
+        });
+      }
+      return { done: true, continued: false, error: null };
+    }
+  } catch (e) {
+    Logger.log(`[Kernel] [${mode}] FAILED job ${job.id}. Error: ${e.toString()}`);
+    job.retries = (job.retries || 0) + 1;
+    const retryPolicy = task && task.retryPolicy || 'none';
+    if (typeof ConcurrencyMonitor !== 'undefined') {
+      ConcurrencyMonitor._logMetric('job_retry', {
+        jobId: job.id,
+        jobType: job.taskName,
+        error: e.toString(),
+        workerId: workerId,
+        retryCount: job.retries
+      });
+    }
+    if (retryPolicy === 'move_to_dlq' || job.retries > 3) {
+      deadLetterEnqueue(job, `Max retries or policy: ${e.toString()}`);
+      distributedQueueComplete(job.row);
+      Logger.log(`[Kernel] [${mode}] Job ${job.id} moved to DLQ after ${job.retries} retries.`);
+      if (typeof ConcurrencyMonitor !== 'undefined') {
+        ConcurrencyMonitor._logMetric('job_failure', {
+          jobId: job.id,
+          jobType: job.taskName,
+          error: e.toString(),
+          workerId: workerId
+        });
+      }
+      return { done: true, continued: false, error: e };
+    } else {
+      distributedQueueEnqueue(job);
+      distributedQueueComplete(job.row);
+      Logger.log(`[Kernel] [${mode}] Job ${job.id} re-enqueued for retry (${job.retries}).`);
+      return { done: false, continued: true, error: e };
+    }
+  }
+}
+
+/**
+ * TEST HARNESS: Validates ContinuationOrchestrationKernel with modern and legacy jobs.
+ * - Clears the distributed queue and DLQ.
+ * - Enqueues a mix of modern and legacy jobs (some complete, some require continuation, some fail).
+ * - Runs the kernel in both batch and full-drain modes.
+ * - Logs results and prints final queue and DLQ states.
+ */
+function testContinuationOrchestrationKernel() {
+  Logger.log('--- TEST HARNESS: ContinuationOrchestrationKernel ---');
+  // 1. Clear distributed queue and DLQ
+  if (typeof clearDistributedQueue === 'function') clearDistributedQueue();
+  if (typeof clearDeadLetterQueue === 'function') clearDeadLetterQueue();
+
+  // 2. Enqueue modern jobs
+  distributedQueueEnqueue({
+    id: 'modern1',
+    taskName: 'testModernComplete',
+    args: { value: 42 },
+    status: 'PENDING',
+    priority: 1
+  });
+  distributedQueueEnqueue({
+    id: 'modern2',
+    taskName: 'testModernContinue',
+    args: { value: 1 },
+    status: 'PENDING',
+    priority: 2
+  });
+  distributedQueueEnqueue({
+    id: 'modern3',
+    taskName: 'testModernFail',
+    args: { value: 0 },
+    status: 'PENDING',
+    priority: 3
+  });
+
+  // 3. Enqueue legacy jobs
+  distributedQueueEnqueue({
+    id: 'legacy1',
+    payload: { type: 'testLegacyComplete', value: 99 },
+    status: 'PENDING',
+    priority: 1
+  });
+  distributedQueueEnqueue({
+    id: 'legacy2',
+    payload: { type: 'testLegacyContinue', value: 2 },
+    status: 'PENDING',
+    priority: 2
+  });
+  distributedQueueEnqueue({
+    id: 'legacy3',
+    payload: { type: 'testLegacyFail', value: 0 },
+    status: 'PENDING',
+    priority: 3
+  });
+
+  // 4. Enqueue job with invalid/missing handler (should go to DLQ)
+  distributedQueueEnqueue({
+    id: 'invalid1',
+    taskName: 'nonExistentHandler',
+    args: { foo: 'bar' },
+    status: 'PENDING',
+    priority: 4
+  });
+
+  // 5. Enqueue job with custom retry policy (linear_backoff)
+  TASK_REGISTRY.testModernBackoff = {
+    functionName: 'testModernBackoffHandler',
+    description: 'Fails twice, then succeeds',
+    parameters: [{ name: 'value' }],
+    resourceCost: 1,
+    retryPolicy: 'linear_backoff',
+    dependencies: []
+  };
+  distributedQueueEnqueue({
+    id: 'modernBackoff',
+    taskName: 'testModernBackoff',
+    args: { value: 0 },
+    status: 'PENDING',
+    priority: 5
+  });
+
+  // 6. Enqueue job with dependency (if supported)
+  // For demonstration, we add a dependency field, but actual dependency resolution logic must exist in the kernel for this to have effect.
+  distributedQueueEnqueue({
+    id: 'modernDep',
+    taskName: 'testModernComplete',
+    args: { value: 100 },
+    status: 'PENDING',
+    priority: 6,
+    dependenciesResolved: false // Simulate unresolved dependency
+  });
+
+  // 7. Register test handlers
+  TASK_REGISTRY.testModernComplete = {
+    functionName: 'testModernCompleteHandler',
+    description: 'Completes immediately',
+    parameters: [{ name: 'value' }],
+    resourceCost: 1,
+    retryPolicy: 'none',
+    dependencies: []
+  };
+  TASK_REGISTRY.testModernContinue = {
+    functionName: 'testModernContinueHandler',
+    description: 'Requires continuation',
+    parameters: [{ name: 'value' }],
+    resourceCost: 1,
+    retryPolicy: 'none',
+    dependencies: []
+  };
+  TASK_REGISTRY.testModernFail = {
+    functionName: 'testModernFailHandler',
+    description: 'Always fails',
+    parameters: [{ name: 'value' }],
+    resourceCost: 1,
+    retryPolicy: 'move_to_dlq',
+    dependencies: []
+  };
+  if (typeof JOB_HANDLERS === 'object') {
+    JOB_HANDLERS.testLegacyComplete = function(args) {
+      Logger.log('Legacy complete handler called with: ' + JSON.stringify(args));
+      return { done: true };
+    };
+    JOB_HANDLERS.testLegacyContinue = function(args, state) {
+      Logger.log('Legacy continue handler called with: ' + JSON.stringify(args) + ', state: ' + JSON.stringify(state));
+      if (!state.counter) state.counter = 0;
+      state.counter++;
+      return { done: state.counter >= 2, newState: state };
+    };
+    JOB_HANDLERS.testLegacyFail = function(args) {
+      Logger.log('Legacy fail handler called with: ' + JSON.stringify(args));
+      throw new Error('Legacy job failed intentionally');
+    };
+  }
+  this.testModernCompleteHandler = function(args, state) {
+    Logger.log('Modern complete handler called with: ' + JSON.stringify(args));
+    return { done: true };
+  };
+  this.testModernContinueHandler = function(args, state) {
+    Logger.log('Modern continue handler called with: ' + JSON.stringify(args) + ', state: ' + JSON.stringify(state));
+    if (!state.counter) state.counter = 0;
+    state.counter++;
+    return { done: state.counter >= 2, newState: state };
+  };
+  this.testModernFailHandler = function(args, state) {
+    Logger.log('Modern fail handler called with: ' + JSON.stringify(args));
+    throw new Error('Modern job failed intentionally');
+  };
+  this.testModernBackoffHandler = function(args, state) {
+    Logger.log('Modern backoff handler called with: ' + JSON.stringify(args) + ', state: ' + JSON.stringify(state));
+    if (!state.failCount) state.failCount = 0;
+    state.failCount++;
+    if (state.failCount < 3) throw new Error('Backoff job failing, attempt ' + state.failCount);
+    return { done: true };
+  };
+
+  // 8. Run kernel in batch mode
+  Logger.log('--- Running kernel in batch mode ---');
+  ContinuationOrchestrationKernel({ fullDrain: false });
+
+  // 9. Run kernel in full-drain mode
+  Logger.log('--- Running kernel in full-drain mode ---');
+  ContinuationOrchestrationKernel({ fullDrain: true });
+
+  // 10. Print final queue and DLQ states
+  Logger.log('--- Final distributed queue ---');
+  var finalQueue = distributedQueueListAll();
+  Logger.log(JSON.stringify(finalQueue, null, 2));
+  if (typeof listDeadLetterQueue === 'function') {
+    Logger.log('--- Final DLQ ---');
+    var finalDLQ = listDeadLetterQueue();
+    Logger.log(JSON.stringify(finalDLQ, null, 2));
+    // Assertions: Check that failed/invalid jobs are in DLQ
+    var dlqIds = finalDLQ.map(function(j) { return j.id || (j.payload && j.payload.id); });
+    if (!dlqIds.includes('modern3')) Logger.log('ASSERTION FAILED: modern3 should be in DLQ');
+    if (!dlqIds.includes('legacy3')) Logger.log('ASSERTION FAILED: legacy3 should be in DLQ');
+    if (!dlqIds.includes('invalid1')) Logger.log('ASSERTION FAILED: invalid1 should be in DLQ');
+  }
+  // Assertions: Check that dependency job is still pending (if dependency logic is enforced)
+  var depJob = finalQueue.find(function(j) { return j.id === 'modernDep'; });
+  if (depJob && depJob.status !== 'PENDING') Logger.log('ASSERTION FAILED: modernDep should still be pending due to unresolved dependency');
+  Logger.log('--- TEST HARNESS COMPLETE ---');
+}
+
+/**
+ * Enhanced Command Interpreter ("Agent" Interface)
+ * Supports:
+ * - Action commands: enqueue jobs, trigger kernel (batch/full-drain), pause/resume/cancel jobs (if supported)
+ * - Query commands: process list, DLQ, job status/history, system status
+ * - Advanced parameter extraction (dates, priorities, fallback prompts)
+ */
+function executeSystemCommand(commandString) {
+  Logger.log('[Agent] Received command: ' + commandString);
+  if (!commandString || typeof commandString !== 'string') {
+    Logger.log('[Agent] Invalid command string');
+    return { success: false, error: 'Invalid command string' };
+  }
+  var lowerCmd = commandString.toLowerCase();
+
+  // --- Helper: Parse natural language dates ---
+  function parseDateFromCommand(cmd) {
+    var today = new Date();
+    if (/today/.test(cmd)) return Utilities.formatDate(today, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    if (/tomorrow/.test(cmd)) {
+      var tmr = new Date(today.getTime() + 24*60*60*1000);
+      return Utilities.formatDate(tmr, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    }
+    var dateMatch = cmd.match(/\d{4}-\d{2}-\d{2}/);
+    if (dateMatch) return dateMatch[0];
+    var monthDay = cmd.match(/(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}/i);
+    if (monthDay) {
+      var year = today.getFullYear();
+      var d = new Date(monthDay[0] + ' ' + year);
+      if (!isNaN(d)) return Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    }
+    return null;
+  }
+
+  // --- Helper: Lookup job by ID or partial match ---
+  function findJobByIdOrDesc(idOrDesc) {
+    var queue = typeof distributedQueueListAll === 'function' ? distributedQueueListAll() : [];
+    var dlq = typeof listDeadLetterQueue === 'function' ? listDeadLetterQueue() : [];
+    var all = queue.concat(dlq);
+    return all.find(function(j) {
+      return (j.id && j.id.toLowerCase() === idOrDesc.toLowerCase()) ||
+             (j.taskName && j.taskName.toLowerCase().includes(idOrDesc.toLowerCase())) ||
+             (j.originalCommand && j.originalCommand.toLowerCase().includes(idOrDesc.toLowerCase()));
+    });
+  }
+
+  // --- 1. System/Process/Job Status Queries ---
+  if (/\b(list|show|status|queue|dlq|failed|pending|running|processes|job|history|completed|archived)\b/.test(lowerCmd)) {
+    if (/\b(dlq|failed)\b/.test(lowerCmd)) {
+      if (typeof listDeadLetterQueue === 'function') {
+        var dlq = listDeadLetterQueue();
+        Logger.log('[Agent] DLQ: ' + JSON.stringify(dlq, null, 2));
+        return { success: true, type: 'dlq', jobs: dlq };
+      } else {
+        Logger.log('[Agent] DLQ listing not available');
+        return { success: false, error: 'DLQ listing not available' };
+      }
+    } else if (/\b(queue|pending|processes)\b/.test(lowerCmd)) {
+      var queue = typeof distributedQueueListAll === 'function' ? distributedQueueListAll() : [];
+      Logger.log('[Agent] Queue: ' + JSON.stringify(queue, null, 2));
+      return { success: true, type: 'queue', jobs: queue };
+    } else if (/\b(running|active)\b/.test(lowerCmd)) {
+      var running = typeof distributedQueueListAll === 'function' ? distributedQueueListAll().filter(function(j) { return j.status === 'PENDING'; }) : [];
+      Logger.log('[Agent] Running jobs: ' + JSON.stringify(running, null, 2));
+      return { success: true, type: 'running', jobs: running };
+    } else if (/\b(status|summary|system)\b/.test(lowerCmd)) {
+      var queue = typeof distributedQueueListAll === 'function' ? distributedQueueListAll() : [];
+      var dlq = typeof listDeadLetterQueue === 'function' ? listDeadLetterQueue() : [];
+      var summary = {
+        queueLength: queue.length,
+        dlqLength: dlq.length,
+        queue: queue,
+        dlq: dlq
+      };
+      Logger.log('[Agent] System status: ' + JSON.stringify(summary, null, 2));
+      return { success: true, type: 'status', summary: summary };
+    } else if (/\b(job|status of job|show job|completed|archived|history)\b/.test(lowerCmd)) {
+      // Job status/history lookup
+      var idMatch = commandString.match(/job\s*([\w-]+)/i);
+      var idOrDesc = idMatch ? idMatch[1] : commandString.split('job').pop().trim();
+      var job = findJobByIdOrDesc(idOrDesc);
+      if (job) {
+        Logger.log('[Agent] Job found: ' + JSON.stringify(job, null, 2));
+        return { success: true, type: 'job', job: job };
+      } else {
+        Logger.log('[Agent] No job found for: ' + idOrDesc);
+        return { success: false, error: 'No job found for: ' + idOrDesc };
+      }
+    }
+    Logger.log('[Agent] Query command not recognized');
+    return { success: false, error: 'Query command not recognized' };
+  }
+
+  // --- 2. Kernel Control Commands ---
+  if (/\b(drain all|process everything|full-drain|process all|run all)\b/.test(lowerCmd)) {
+    Logger.log('[Agent] Triggering ContinuationOrchestrationKernel (full-drain mode)');
+    ContinuationOrchestrationKernel({ fullDrain: true });
+    return { success: true, action: 'full-drain', message: 'Kernel triggered in full-drain mode.' };
+  }
+  if (/\b(pause|resume|cancel)\b/.test(lowerCmd)) {
+    // These require implementation in your kernel (e.g., a global PAUSED flag, job cancellation logic)
+    Logger.log('[Agent] Pause/resume/cancel not implemented in kernel.');
+    return { success: false, error: 'Pause/resume/cancel not implemented in kernel.' };
+  }
+
+  // --- 3. Action commands: fuzzy match to TASK_REGISTRY, extract parameters, enqueue, and trigger kernel ---
+  var bestMatch = null;
+  var bestScore = 0;
+  for (var taskName in TASK_REGISTRY) {
+    var desc = (TASK_REGISTRY[taskName].description || '').toLowerCase();
+    var fnName = (TASK_REGISTRY[taskName].functionName || '').toLowerCase();
+    var score = 0;
+    if (desc && lowerCmd.includes(desc.split(' ')[0])) score += 2;
+    if (desc && lowerCmd.includes(desc)) score += 5;
+    if (fnName && lowerCmd.includes(fnName)) score += 2;
+    var shared = desc.split(' ').filter(function(w) { return lowerCmd.includes(w); }).length;
+    score += shared;
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = taskName;
+    }
+  }
+  if (!bestMatch) {
+    Logger.log('[Agent] No matching task found for command: ' + commandString);
+    return { success: false, error: 'No matching task found' };
+  }
+  var task = TASK_REGISTRY[bestMatch];
+  Logger.log('[Agent] Matched command to task: ' + bestMatch);
+  // --- Advanced parameter extraction ---
+  var args = {};
+  if (task.parameters && task.parameters.length) {
+    for (var i = 0; i < task.parameters.length; i++) {
+      var pname = task.parameters[i].name;
+      var regex = new RegExp(pname + '\\s*[:=]\\s*([\w-]+)', 'i');
+      var match = commandString.match(regex);
+      if (match) {
+        args[pname] = match[1];
+      } else {
+        // Try to parse date
+        if (/date|day/i.test(pname)) {
+          var parsedDate = parseDateFromCommand(commandString);
+          if (parsedDate) args[pname] = parsedDate;
+        }
+        // Try to parse priority
+        if (/priority/i.test(pname)) {
+          var prioMatch = commandString.match(/priority\s*[:=]?\s*(high|medium|low|\d+)/i);
+          if (prioMatch) args[pname] = prioMatch[1];
+        }
+        // Try to find a number
+        if (!args[pname] && /\d+/.test(commandString)) {
+          var numMatch = commandString.match(/\d+/);
+          if (numMatch) args[pname] = numMatch[0];
+        }
+      }
+    }
+    // Fallback: prompt for missing parameters
+    var missing = task.parameters.filter(function(p) { return !args[p.name]; });
+    if (missing.length) {
+      Logger.log('[Agent] Missing parameters: ' + missing.map(function(p) { return p.name; }).join(', '));
+      return { success: false, error: 'Missing parameters: ' + missing.map(function(p) { return p.name; }).join(', '), prompt: true };
+    }
+  }
+  // Enqueue the job
+  var job = {
+    id: 'agent_' + Utilities.getUuid(),
+    taskName: bestMatch,
+    args: args,
+    status: 'PENDING',
+    priority: 10,
+    enqueuedBy: 'agent',
+    originalCommand: commandString
+  };
+  try {
+    distributedQueueEnqueue(job);
+    Logger.log('[Agent] Enqueued job: ' + JSON.stringify(job));
+    Logger.log('[Agent] Triggering ContinuationOrchestrationKernel (batch mode)');
+    ContinuationOrchestrationKernel({ fullDrain: false });
+    return { success: true, job: job, message: 'Job enqueued and kernel triggered.' };
+  } catch (e) {
+    Logger.log('[Agent] Failed to enqueue or trigger job: ' + e.toString());
+    return { success: false, error: e.toString() };
+  }
+}
+
+/**
+ * PAUSE/RESUME/CANCEL support for the kernel (stateless, persistent)
+ * Uses PropertiesService for global state.
+ * In Apps Script, 'pause' only affects future invocations, not running executions.
+ */
+function pauseKernel() {
+  PropertiesService.getScriptProperties().setProperty('KERNEL_PAUSED', 'true');
+  Logger.log('[Kernel] System PAUSED');
+}
+function resumeKernel() {
+  PropertiesService.getScriptProperties().deleteProperty('KERNEL_PAUSED');
+  Logger.log('[Kernel] System RESUMED');
+}
+function isKernelPaused() {
+  return PropertiesService.getScriptProperties().getProperty('KERNEL_PAUSED') === 'true';
+}
+function cancelJobById(jobId) {
+  var props = PropertiesService.getScriptProperties();
+  var cancelled = JSON.parse(props.getProperty('CANCELLED_JOBS') || '[]');
+  if (!cancelled.includes(jobId)) cancelled.push(jobId);
+  props.setProperty('CANCELLED_JOBS', JSON.stringify(cancelled));
+  Logger.log('[Kernel] Job cancelled: ' + jobId);
+}
+function isJobCancelled(jobId) {
+  var cancelled = JSON.parse(PropertiesService.getScriptProperties().getProperty('CANCELLED_JOBS') || '[]');
+  return cancelled.includes(jobId);
+}
+function clearCancelledJobs() {
+  PropertiesService.getScriptProperties().deleteProperty('CANCELLED_JOBS');
+}
+
+// --- Refactor kernel for persistent, stateless pause/cancel ---
+function ContinuationOrchestrationKernel(options, e) {
+  options = options || {};
+  const fullDrain = !!options.fullDrain;
+  const workerId = 'kernel_async_' + Utilities.getUuid();
+  let leaseAcquired = false;
+  const maxBatch = 5;
+  const executionStart = Date.now();
+  const maxExecutionTime = 4 * 60 * 1000;
+  let processedCount = 0;
+
+  // --- PAUSE CHECK (stateless, persistent) ---
+  if (isKernelPaused()) {
+    Logger.log('[Kernel] PAUSED: Exiting without processing jobs.');
+    return;
+  }
+
+  // Business hours check (Mon-Fri, 8am-5pm)
+  const now = new Date();
+  const day = now.getDay();
+  const hour = now.getHours();
+  if (day === 0 || day === 6 || hour < 8 || hour >= 17) {
+    Logger.log('ContinuationOrchestrationKernel: Outside business hours, skipping run.');
+    return;
+  }
+
+  try {
+    leaseAcquired = WorkerLeaseManager.acquireLease(workerId);
+    if (!leaseAcquired) {
+      Logger.log('ContinuationOrchestrationKernel: Failed to acquire lease, another worker is active');
+      return;
+    }
+    const queueStatus = checkQueueStatus ? checkQueueStatus() : { pendingJobs: 0 };
+    if (typeof ConcurrencyMonitor !== 'undefined') {
+      ConcurrencyMonitor.logQueueDepth(queueStatus.pendingJobs || 0);
+    }
+
+    if (fullDrain) {
+      const taskName = 'FULL_DRAIN_QUEUE_STATE';
+      const continuationFnName = 'ContinuationOrchestrationKernel';
+      let state = e && e.state ? e.state : ContinuationManager.loadState(taskName, { row: 2, processed: 0 });
+      const sheet = ensureDistributedQueueSheet();
+      const lastRow = sheet.getLastRow();
+      let processedThisRun = 0;
+      while (state.row <= lastRow) {
+        const rowValues = sheet.getRange(state.row, 1, 1, sheet.getLastColumn()).getValues()[0];
+        if (!rowValues || !rowValues[0]) {
+          state.row++;
+          continue;
+        }
+        let job;
+        try {
+          job = JSON.parse(rowValues[1]);
+        } catch (err) {
+          job = { id: rowValues[0], legacyPayload: rowValues[1] };
+        }
+        job.row = state.row;
+        // --- CANCEL CHECK (stateless, persistent) ---
+        if (isJobCancelled(job.id)) {
+          Logger.log('[Kernel] Job ' + job.id + ' is CANCELLED. Marking as CANCELLED and completing.');
+          job.status = 'CANCELLED';
+          distributedQueueComplete(job.row);
+          if (typeof ConcurrencyMonitor !== 'undefined') {
+            ConcurrencyMonitor._logMetric('job_cancelled', {
+              jobId: job.id,
+              jobType: job.taskName,
+              workerId: workerId
+            });
+          }
+          state.row++;
+          state.processed++;
+          processedThisRun++;
+          continue;
+        }
+        const result = processSingleJob(job, {
+          workerId,
+          mode: 'full-drain',
+          maxExecutionTime,
+          executionStart
+        });
+        processedThisRun++;
+        state.row++;
+        state.processed++;
+        if (!ContinuationManager.shouldContinue(executionStart, maxExecutionTime)) {
+          Logger.log(`[Kernel] [full-drain] Pausing after ${processedThisRun} jobs, will continue...`);
+          ContinuationManager.saveAndContinue(taskName, state, continuationFnName);
+          return;
+        }
+      }
+      Logger.log(`[Kernel] [full-drain] Finished. Total jobs processed: ${state.processed}`);
+      ContinuationManager.finish(taskName, continuationFnName);
+      return;
+    }
+
+    // --- Regular Batch Mode (default) ---
+    const jobs = distributedQueueListAll()
+      .filter(j => j.status === 'PENDING' && j.dependenciesResolved !== false)
+      .sort((a, b) => (b.priority || 0) - (a.priority || 0))
+      .slice(0, maxBatch);
+    for (const job of jobs) {
+      Logger.log(`[Kernel] [batch] Selected job ${job.id} of task ${job.taskName}`);
+      // --- CANCEL CHECK (stateless, persistent) ---
+      if (isJobCancelled(job.id)) {
+        Logger.log('[Kernel] Job ' + job.id + ' is CANCELLED. Marking as CANCELLED and completing.');
+        job.status = 'CANCELLED';
+        distributedQueueComplete(job.row);
+        if (typeof ConcurrencyMonitor !== 'undefined') {
+          ConcurrencyMonitor._logMetric('job_cancelled', {
+            jobId: job.id,
+            jobType: job.taskName,
+            workerId: workerId
+          });
+        }
+        processedCount++;
+        continue;
+      }
+      processSingleJob(job, {
+        workerId,
+        mode: 'batch',
+        maxExecutionTime,
+        executionStart
+      });
+      processedCount++;
+      if ((Date.now() - executionStart) > maxExecutionTime) {
+        Logger.log('[Kernel] [batch] Execution time limit reached, stopping');
+        break;
+      }
+    }
+  } finally {
+    if (leaseAcquired) {
+      WorkerLeaseManager.releaseLease(workerId);
+    }
+    const executionTime = Date.now() - executionStart;
+    Logger.log(`[Kernel] Finished run, processed ${processedCount} jobs in ${executionTime}ms`);
+    if (typeof ConcurrencyMonitor !== 'undefined') {
+      ConcurrencyMonitor._logMetric('worker_performance', {
+        workerId: workerId,
+        processedCount: processedCount,
+        executionTime: executionTime,
+        leaseAcquired: leaseAcquired
+      });
+    }
+  }
+}
+
+// --- Enhance agent interface for pause/resume/cancel ---
+// In Apps Script, pause/resume/cancel only affect future invocations, not running executions.
+var _originalExecuteSystemCommand = executeSystemCommand;
+executeSystemCommand = function(commandString) {
+  var lowerCmd = commandString.toLowerCase();
+  if (/\bpause\b/.test(lowerCmd)) {
+    pauseKernel();
+    return { success: true, action: 'pause', message: 'Kernel paused. (Affects future runs only)' };
+  }
+  if (/\bresume\b/.test(lowerCmd)) {
+    resumeKernel();
+    return { success: true, action: 'resume', message: 'Kernel resumed.' };
+  }
+  if (/\bcancel\b/.test(lowerCmd)) {
+    var idMatch = commandString.match(/job\s*([\w-]+)/i);
+    var jobId = idMatch ? idMatch[1] : commandString.split('job').pop().trim();
+    if (jobId) {
+      cancelJobById(jobId);
+      return { success: true, action: 'cancel', message: 'Job ' + jobId + ' cancelled. (Affects future runs only)' };
+    } else {
+      return { success: false, error: 'No job ID specified to cancel.' };
+    }
+  }
+  // Fallback to original agent logic
+  return _originalExecuteSystemCommand(commandString);
+};
+
+/**
+ * Comprehensive system initialization for autonomous bootstrapping.
+ * Stages:
+ * 1. Boot: Log system boot, check for first-run, set up core state.
+ * 2. Populate: Create/populate all Google Sheets, tabs, and Forms as needed.
+ * 3. Write variables/constants to a specified Google Sheet for diagnostics.
+ * 4. Set up triggers, initialize distributed queue, enqueue self-test.
+ * Idempotent: Safe to re-run.
+ */
+function initializeSystem() {
+  // SECURITY: Only allow admins to run
+  if (!isAdminUser()) {
+    Logger.log('[Security] Unauthorized initializeSystem attempt.');
+    throw new Error('Unauthorized: Only admins can initialize the system.');
+  }
+  Logger.log('=== [System Boot] Sogod Waterworks Appointment System Initialization ===');
+  var summary = { boot: null, kernel: null, populate: [], config: null, triggers: null, queue: null, selfTest: null, errors: [], warnings: [], rollbacks: [] };
+  var rollbackActions = [];
+  try {
+    // G. Check for required helper functions
+    var requiredFns = [validateResources, modernPopulateResources, validateConsistency, validateDataQuality, setupFreeTierSystem, ensureDistributedQueueSheet, distributedQueueEnqueue];
+    var requiredFnNames = ['validateResources', 'modernPopulateResources', 'validateConsistency', 'validateDataQuality', 'setupFreeTierSystem', 'ensureDistributedQueueSheet', 'distributedQueueEnqueue'];
+    for (var i = 0; i < requiredFns.length; i++) {
+      if (typeof requiredFns[i] !== 'function') {
+        var msg = '[Init] Required function missing: ' + requiredFnNames[i];
+        Logger.log(msg);
+        summary.errors.push(msg);
+      }
+    }
+
+    // 1. BOOT: Check for first-run, set up core state
+    try {
+      var props = PropertiesService.getScriptProperties();
+      var firstRun = !props.getProperty('SYSTEM_INITIALIZED');
+      if (firstRun) {
+        Logger.log('[Boot] First run detected.');
+        props.setProperty('SYSTEM_INITIALIZED', new Date().toISOString());
+        clearCancelledJobs();
+        resumeKernel();
+      } else {
+        Logger.log('[Boot] System already initialized. Proceeding with idempotent setup.');
+      }
+      summary.boot = 'OK';
+    } catch (e) {
+      Logger.log('[Boot] Error: ' + e.toString());
+      summary.boot = 'ERROR';
+      summary.errors.push('Boot: ' + e.toString());
+    }
+
+    // 2. KERNEL: Call kernel as first action (before population)
+    try {
+      Logger.log('[Kernel] Running kernel as first step of initialization...');
+      ContinuationOrchestrationKernel({ fullDrain: false });
+      summary.kernel = 'OK';
+    } catch (e) {
+      Logger.log('[Kernel] Error running kernel: ' + e.toString());
+      summary.kernel = 'ERROR';
+      summary.errors.push('Kernel: ' + e.toString());
+    }
+
+    // 3. POPULATE: Create/populate all Sheets, tabs, Forms (with existence checks)
+    Logger.log('[Populate] Validating and populating resources...');
+    var populationSnapshots = [];
+    for (var i = 0; i < FORM_REGISTRY.length; i++) {
+      var entry = FORM_REGISTRY[i];
+      try {
+        var ss = SpreadsheetApp.openById(entry.spreadsheetId);
+        var sheet = ss.getSheetByName(entry.sheetName);
+        // Take snapshot for rollback if sheet exists
+        var snap = sheet ? snapshotSheet(sheet) : { name: entry.sheetName, exists: false, index: 1 };
+        populationSnapshots.push({ ssId: entry.spreadsheetId, snap: snap });
+        var sheetExists = !!sheet;
+        if (!sheetExists) {
+          Logger.log('[Populate] Sheet ' + entry.sheetName + ' does not exist, will be created by populator.');
+        }
+        var report = validateResources(entry.spreadsheetId);
+        Logger.log('[Populate] Validation report for ' + entry.sheetName + ': ' + JSON.stringify(report));
+        modernPopulateResources(entry.spreadsheetId, { repairOnly: false });
+        summary.populate.push({ sheet: entry.sheetName, status: 'OK' });
+      } catch (e) {
+        Logger.log('[Populate] Error populating resources for ' + entry.sheetName + ': ' + e.toString());
+        summary.populate.push({ sheet: entry.sheetName, status: 'ERROR', error: e.toString() });
+        summary.errors.push('Populate ' + entry.sheetName + ': ' + e.toString());
+        // Register rollback for all previous population
+        rollbackActions.push(function() {
+          Logger.log('[Rollback] Restoring sheets from population snapshots...');
+          for (var j = 0; j < populationSnapshots.length; j++) {
+            var snapObj = populationSnapshots[j];
+            var ss2 = SpreadsheetApp.openById(snapObj.ssId);
+            if (snapObj.snap.exists) {
+              restoreSheetFromSnapshot(ss2, snapObj.snap);
+              Logger.log('[Rollback] Restored sheet: ' + snapObj.snap.name);
+            } else {
+              var s = ss2.getSheetByName(snapObj.snap.name);
+              if (s) ss2.deleteSheet(s);
+              Logger.log('[Rollback] Deleted created sheet: ' + snapObj.snap.name);
+            }
+          }
+          summary.rollbacks.push('Population: Rolled back sheet changes.');
+        });
+        break; // Stop further population on error
+      }
+    }
+    try {
+      for (var i = 0; i < FORM_REGISTRY.length; i++) {
+        var entry = FORM_REGISTRY[i];
+        validateConsistency(entry.spreadsheetId);
+        validateDataQuality(entry.spreadsheetId);
+      }
+    } catch (e) {
+      Logger.log('[Populate] Error in consistency/data quality checks: ' + e.toString());
+      summary.errors.push('Consistency/DataQuality: ' + e.toString());
+    }
+
+    // 4. WRITE VARIABLES/CONSTANTS TO SHEET (preserve extra columns/data)
+    var configSheetName = 'SystemConfig';
+    var configSpreadsheetId = FORM_REGISTRY[0].spreadsheetId;
+    var ss = SpreadsheetApp.openById(configSpreadsheetId);
+    // --- Autonomous backup/versioning before config write ---
+    backupSheetWithTimestamp(ss, configSheetName, 'SystemConfig_backup_');
+    var configSheet = ss.getSheetByName(configSheetName) || ss.insertSheet(configSheetName);
+    var configVars = [
+      ['Key', 'Value'],
+      ['SCRIPT_VERSION', typeof SCRIPT_VERSION !== 'undefined' ? SCRIPT_VERSION : ''],
+      ['IS_DEV', typeof IS_DEV !== 'undefined' ? IS_DEV : ''],
+      ['SLOT_CAP', typeof SLOT_CAP !== 'undefined' ? SLOT_CAP : ''],
+      ['FUTURE_DAYS', typeof FUTURE_DAYS !== 'undefined' ? FUTURE_DAYS : ''],
+      ['RESPONSE_RETENTION_DAYS', typeof RESPONSE_RETENTION_DAYS !== 'undefined' ? RESPONSE_RETENTION_DAYS : ''],
+      ['BUSINESS_DAYS_WINDOW', typeof BUSINESS_DAYS_WINDOW !== 'undefined' ? BUSINESS_DAYS_WINDOW : ''],
+      ['BATCH_DAYS_WINDOW', typeof BATCH_DAYS_WINDOW !== 'undefined' ? BATCH_DAYS_WINDOW : ''],
+      ['CALENDAR_API_CALL_LIMIT_PER_RUN', typeof CALENDAR_API_CALL_LIMIT_PER_RUN !== 'undefined' ? CALENDAR_API_CALL_LIMIT_PER_RUN : ''],
+      ['CALENDAR_API_CALL_LIMIT_PER_DAY', typeof CALENDAR_API_CALL_LIMIT_PER_DAY !== 'undefined' ? CALENDAR_API_CALL_LIMIT_PER_DAY : ''],
+      ['HOLIDAY_CAL_ID', typeof HOLIDAY_CAL_ID !== 'undefined' ? HOLIDAY_CAL_ID : ''],
+      ['BARANGAY_LIST', typeof BARANGAY_LIST !== 'undefined' ? BARANGAY_LIST.join(', ') : ''],
+      ['SYSTEM_INITIALIZED', PropertiesService.getScriptProperties().getProperty('SYSTEM_INITIALIZED')],
+      ['LAST_INIT', new Date().toISOString()]
+    ];
+    try {
+      var existing = configSheet.getDataRange().getValues();
+      var keyIndex = {};
+      for (var i = 1; i < existing.length; i++) {
+        keyIndex[existing[i][0]] = i;
+      }
+      for (var i = 1; i < configVars.length; i++) {
+        if (keyIndex[configVars[i][0]]) {
+          configSheet.getRange(keyIndex[configVars[i][0]] + 1, 2).setValue(configVars[i][1]);
+        } else {
+          configSheet.appendRow(configVars[i]);
+        }
+      }
+      summary.config = 'OK';
+      // Rollback action: revert config changes (not full rollback, but logs intent)
+      rollbackActions.push(function() {
+        Logger.log('[Rollback] No direct config rollback implemented (manual review required).');
+        summary.rollbacks.push('Config: Manual review required for rollback.');
+      });
+    } catch (e) {
+      Logger.log('[Config] Error writing config sheet: ' + e.toString());
+      summary.config = 'ERROR';
+      summary.errors.push('Config: ' + e.toString());
+      // Rollback: attempt to revert config changes (not possible, so log intent)
+      rollbackActions.push(function() {
+        Logger.log('[Rollback] Config write failed, no rollback possible.');
+        summary.rollbacks.push('Config: No rollback possible.');
+      });
+    }
+
+    // 5. SETUP TRIGGERS, INIT QUEUE, ENQUEUE SELF-TEST
+    try {
+      Logger.log('[Triggers] Checking/setting up triggers...');
+      var triggers = ScriptApp.getProjectTriggers();
+      var triggerExists = triggers.some(function(t) {
+        return t.getHandlerFunction() === 'ContinuationOrchestrationKernel';
+      });
+      if (!triggerExists) {
+        setupFreeTierSystem();
+        summary.triggers = 'CREATED';
+        // Rollback: remove triggers if needed
+        rollbackActions.push(function() {
+          Logger.log('[Rollback] Removing triggers created by initializeSystem.');
+          var triggers = ScriptApp.getProjectTriggers();
+          triggers.forEach(function(t) {
+            if (t.getHandlerFunction() === 'ContinuationOrchestrationKernel') {
+              ScriptApp.deleteTrigger(t);
+              summary.rollbacks.push('Triggers: Removed ContinuationOrchestrationKernel trigger.');
+            }
+          });
+        });
+      } else {
+        Logger.log('[Triggers] Triggers already exist, skipping setup.');
+        summary.triggers = 'EXISTED';
+      }
+    } catch (e) {
+      Logger.log('[Triggers] Error setting up triggers: ' + e.toString());
+      summary.triggers = 'ERROR';
+      summary.errors.push('Triggers: ' + e.toString());
+      // Rollback: remove triggers if setup failed
+      rollbackActions.push(function() {
+        Logger.log('[Rollback] Removing triggers after setup failure.');
+        var triggers = ScriptApp.getProjectTriggers();
+        triggers.forEach(function(t) {
+          if (t.getHandlerFunction() === 'ContinuationOrchestrationKernel') {
+            ScriptApp.deleteTrigger(t);
+            summary.rollbacks.push('Triggers: Removed ContinuationOrchestrationKernel trigger after failure.');
+          }
+        });
+      });
+    }
+    try {
+      var queueSheetExists = false;
+      try {
+        var ss = SpreadsheetApp.openById(FORM_REGISTRY[0].spreadsheetId);
+        queueSheetExists = !!ss.getSheetByName('DistributedQueue');
+      } catch (e) {}
+      if (!queueSheetExists) {
+        ensureDistributedQueueSheet();
+        summary.queue = 'CREATED';
+        // Rollback: delete queue sheet if needed
+        rollbackActions.push(function() {
+          Logger.log('[Rollback] Deleting DistributedQueue sheet created by initializeSystem.');
+          var ss = SpreadsheetApp.openById(FORM_REGISTRY[0].spreadsheetId);
+          var sheet = ss.getSheetByName('DistributedQueue');
+          if (sheet) {
+            ss.deleteSheet(sheet);
+            summary.rollbacks.push('Queue: Deleted DistributedQueue sheet.');
+          }
+        });
+      } else {
+        Logger.log('[Queue] Distributed queue sheet already exists, skipping creation.');
+        summary.queue = 'EXISTED';
+      }
+    } catch (e) {
+      Logger.log('[Queue] Error ensuring distributed queue sheet: ' + e.toString());
+      summary.queue = 'ERROR';
+      summary.errors.push('Queue: ' + e.toString());
+      // Rollback: attempt to delete queue sheet if setup failed
+      rollbackActions.push(function() {
+        Logger.log('[Rollback] Deleting DistributedQueue sheet after setup failure.');
+        var ss = SpreadsheetApp.openById(FORM_REGISTRY[0].spreadsheetId);
+        var sheet = ss.getSheetByName('DistributedQueue');
+        if (sheet) {
+          ss.deleteSheet(sheet);
+          summary.rollbacks.push('Queue: Deleted DistributedQueue sheet after failure.');
+        }
+      });
+    }
+    try {
+      var queue = typeof distributedQueueListAll === 'function' ? distributedQueueListAll() : [];
+      var selfTestExists = queue.some(function(j) {
+        return j.taskName === 'productionSystemDiagnostics' && j.status === 'PENDING';
+      });
+      if (!selfTestExists) {
+        distributedQueueEnqueue({
+          id: 'selftest_' + Utilities.getUuid(),
+          taskName: 'productionSystemDiagnostics',
+          args: {},
+          status: 'PENDING',
+          priority: 100,
+          enqueuedBy: 'system',
+          originalCommand: 'self-test on init'
+        });
+        Logger.log('[SelfTest] Enqueued productionSystemDiagnostics job.');
+        summary.selfTest = 'ENQUEUED';
+        // Rollback: remove self-test job if needed (cannot remove from queue, so log intent)
+        rollbackActions.push(function() {
+          Logger.log('[Rollback] Self-test job cannot be removed from queue (manual review required).');
+          summary.rollbacks.push('SelfTest: Manual review required to remove self-test job.');
+        });
+      } else {
+        Logger.log('[SelfTest] Self-test job already pending, not enqueuing duplicate.');
+        summary.selfTest = 'EXISTED';
+      }
+    } catch (e) {
+      Logger.log('[SelfTest] Error enqueuing self-test: ' + e.toString());
+      summary.selfTest = 'ERROR';
+      summary.errors.push('SelfTest: ' + e.toString());
+      // Rollback: log intent (cannot remove from queue)
+      rollbackActions.push(function() {
+        Logger.log('[Rollback] Self-test job cannot be removed from queue after failure (manual review required).');
+        summary.rollbacks.push('SelfTest: Manual review required to remove self-test job after failure.');
+      });
+    }
+
+    // E. Write summary to SystemInitLog sheet
+    try {
+      var logSheetName = 'SystemInitLog';
+      var logSpreadsheetId = FORM_REGISTRY[0].spreadsheetId;
+      var ss = SpreadsheetApp.openById(logSpreadsheetId);
+      // --- Autonomous backup/versioning before log write ---
+      backupSheetWithTimestamp(ss, logSheetName, 'SystemInitLog_backup_');
+      var logSheet = ss.getSheetByName(logSheetName) || ss.insertSheet(logSheetName);
+      logSheet.appendRow([new Date().toISOString(), JSON.stringify(summary)]);
+      logAudit('InitSummary', summary);
+    } catch (e) {
+      Logger.log('[InitLog] Error writing summary to SystemInitLog: ' + e.toString());
+      summary.warnings.push('InitLog: ' + e.toString());
+    }
+    // E. Optionally send email if there are errors
+    try {
+      if (summary.errors.length && typeof Session !== 'undefined' && Session.getActiveUser) {
+        var user = Session.getActiveUser().getEmail();
+        if (SYSTEM_ADMINS.indexOf(user) !== -1) {
+          MailApp.sendEmail(user, 'System Initialization Errors', JSON.stringify(summary, null, 2));
+        }
+      }
+    } catch (e) {
+      Logger.log('[InitEmail] Error sending error notification: ' + e.toString());
+      summary.warnings.push('InitEmail: ' + e.toString());
+    }
+    Logger.log('=== [System Boot] Initialization complete. ===');
+    Logger.log('[System Boot] Summary: ' + JSON.stringify(summary, null, 2));
+    return summary;
+  } catch (e) {
+    Logger.log('[System Boot] Initialization failed: ' + e.toString());
+    // Rollback all background stages if a top-level error occurs
+    for (var i = rollbackActions.length - 1; i >= 0; i--) {
+      try { rollbackActions[i](); logAudit('Rollback', { index: i }); } catch (err) { Logger.log('[Rollback] Error during rollback: ' + err); }
+    }
+    return { success: false, error: e.toString(), rollbacks: summary.rollbacks };
+  }
+}
+
+// --- SECURITY: Admin allowlist for all critical operations ---
+var SYSTEM_ADMINS = [
+  // Add your admin emails here
+  'your.admin@email.com',
+  // Add more as needed
+];
+
+function isAdminUser() {
+  try {
+    var user = (typeof Session !== 'undefined' && Session.getActiveUser) ? Session.getActiveUser().getEmail() : null;
+    return user && SYSTEM_ADMINS.indexOf(user) !== -1;
+  } catch (e) {
+    Logger.log('[Security] Error checking admin user: ' + e);
+    return false;
+  }
+}
+
+// --- SECURITY: Audit log for destructive/rollback actions ---
+function logAudit(action, details) {
+  try {
+    var logSheetName = 'SystemAuditLog';
+    var logSpreadsheetId = FORM_REGISTRY[0].spreadsheetId;
+    var ss = SpreadsheetApp.openById(logSpreadsheetId);
+    var logSheet = ss.getSheetByName(logSheetName) || ss.insertSheet(logSheetName);
+    logSheet.appendRow([new Date().toISOString(), action, JSON.stringify(details)]);
+  } catch (e) {
+    Logger.log('[AuditLog] Error writing to SystemAuditLog: ' + e);
+  }
+}
+
+// --- SECURITY: Sanitize agent command input ---
+function sanitizeCommandInput(cmd) {
+  if (typeof cmd !== 'string') return '';
+  // Remove dangerous characters, limit length, log suspicious input
+  var clean = cmd.replace(/[<>"'`;=]/g, '').substring(0, 500);
+  if (clean !== cmd) Logger.log('[Security] Suspicious agent command input sanitized: ' + cmd);
+  return clean;
+}
+
+// --- SECURITY: Restrict agent interface to admins, sanitize input ---
+var _originalExecuteSystemCommand = executeSystemCommand;
+executeSystemCommand = function(commandString) {
+  if (!isAdminUser()) {
+    Logger.log('[Security] Unauthorized agent command attempt.');
+    throw new Error('Unauthorized: Only admins can use the agent interface.');
+  }
+  var cleanCommand = sanitizeCommandInput(commandString);
+  return _originalExecuteSystemCommand(cleanCommand);
+};
+
+/**
+ * Helper: Create a timestamped backup of a sheet (for versioning)
+ * @param {Spreadsheet} ss - The spreadsheet object
+ * @param {string} sheetName - The name of the sheet to backup
+ * @param {string} [prefix] - Optional prefix for backup sheet name
+ * @return {Sheet|null} The backup sheet, or null if not found
+ */
+function backupSheetWithTimestamp(ss, sheetName, prefix) {
+  var sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return null;
+  var timestamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd_HHmmss');
+  var backupName = (prefix || sheetName + '_backup_') + timestamp;
+  var backup = sheet.copyTo(ss).setName(backupName);
+  Logger.log('[Backup] Created backup: ' + backupName);
+  return backup;
+}
+
+/**
+ * Helper: Snapshot a sheet's data and structure for rollback
+ * @param {Sheet} sheet
+ * @return {Object} Snapshot object
+ */
+function snapshotSheet(sheet) {
+  if (!sheet) return null;
+  return {
+    name: sheet.getName(),
+    data: sheet.getDataRange().getValues(),
+    exists: true,
+    index: sheet.getIndex(),
+    frozenRows: sheet.getFrozenRows(),
+    frozenCols: sheet.getFrozenColumns(),
+    hidden: sheet.isSheetHidden(),
+    tabColor: sheet.getTabColor(),
+    // Add more properties as needed
+  };
+}
+
+/**
+ * Helper: Restore a sheet from snapshot (for rollback)
+ * @param {Spreadsheet} ss
+ * @param {Object} snap
+ */
+function restoreSheetFromSnapshot(ss, snap) {
+  var sheet = ss.getSheetByName(snap.name);
+  if (!sheet) {
+    sheet = ss.insertSheet(snap.name, snap.index);
+  } else {
+    sheet.clear();
+  }
+  sheet.getRange(1, 1, snap.data.length, snap.data[0].length).setValues(snap.data);
+  if (snap.frozenRows) sheet.setFrozenRows(snap.frozenRows);
+  if (snap.frozenCols) sheet.setFrozenColumns(snap.frozenCols);
+  if (snap.hidden) sheet.hideSheet(); else sheet.showSheet();
+  if (snap.tabColor) sheet.setTabColor(snap.tabColor);
+}
+
+/**
+ * Garbage-collects old rows from a log sheet by max row count and/or max age (days).
+ * Logs all deletions to the audit log.
+ *
+ * NOTE: This is now a FALLBACK/EMERGENCY tool only.
+ * Use AI/agentic data consolidation for all regular log/metric cleanup.
+ */
+function garbageCollectLogSheet(sheetName, options) {
+  var maxRows = options.maxRows || 1000;
+  var maxAgeDays = options.maxAgeDays || 30;
+  var ss = SpreadsheetApp.openById(FORM_REGISTRY[0].spreadsheetId);
+  var sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return;
+  var now = new Date();
+  var data = sheet.getDataRange().getValues();
+  var rowsToDelete = [];
+  // Delete by age
+  for (var i = 1; i < data.length; i++) {
+    var rowDate = new Date(data[i][0]);
+    if ((now - rowDate) / (1000 * 60 * 60 * 24) > maxAgeDays) {
+      rowsToDelete.push(i + 1);
+    }
+  }
+  // If still too many rows, delete oldest
+  var remainingRows = data.length - rowsToDelete.length;
+  if (remainingRows > maxRows) {
+    var extra = remainingRows - maxRows;
+    for (var i = 1; i <= extra; i++) {
+      if (!rowsToDelete.includes(i + 1)) rowsToDelete.push(i + 1);
+    }
+  }
+  // Delete in reverse order to avoid shifting
+  rowsToDelete.sort(function(a, b) { return b - a; }).forEach(function(r) { sheet.deleteRow(r); });
+  if (rowsToDelete.length) logAudit('GarbageCollectLogSheet', { sheetName: sheetName, rowsDeleted: rowsToDelete.length });
+}
+
+/**
+ * Garbage-collects old or orphaned save states from PropertiesService.
+ * Deletes CONT_STATE_* keys older than maxAgeDays.
+ * Logs all deletions to the audit log.
+ *
+ * NOTE: This is now a FALLBACK/EMERGENCY tool only.
+ * Use AI/agentic data consolidation for all regular log/metric cleanup.
+ */
+function garbageCollectSaveStates(options) {
+  var maxAgeDays = options.maxAgeDays || 30;
+  var props = PropertiesService.getScriptProperties();
+  var all = props.getProperties();
+  var now = Date.now();
+  var deleted = 0;
+  Object.keys(all).forEach(function(key) {
+    if (key.startsWith('CONT_STATE_')) {
+      try {
+        var state = JSON.parse(all[key]);
+        var ts = state.lastModified || state.timestamp || 0;
+        if (ts && (now - ts) / (1000 * 60 * 60 * 24) > maxAgeDays) {
+          props.deleteProperty(key);
+          deleted++;
+        }
+      } catch (e) {
+        // If state is invalid or missing timestamp, delete as orphaned
+        props.deleteProperty(key);
+        deleted++;
+      }
+    }
+  });
+  if (deleted) logAudit('GarbageCollectSaveStates', { deleted: deleted });
+}
+
+/**
+ * Orchestrated system garbage collection: logs and save states.
+ * Can be triggered by agent, kernel, or schedule.
+ *
+ * NOTE: This is now a FALLBACK/EMERGENCY tool only.
+ * Use AI/agentic data consolidation for all regular log/metric cleanup.
+ */
+function garbageCollectSystem() {
+  garbageCollectLogSheet('SystemInitLog', { maxRows: 1000, maxAgeDays: 30 });
+  garbageCollectLogSheet('SystemAuditLog', { maxRows: 1000, maxAgeDays: 90 });
+  garbageCollectSaveStates({ maxAgeDays: 30 });
+}
+
+// Add to TASK_REGISTRY for agentic invocation
+if (typeof TASK_REGISTRY !== 'undefined') {
+  TASK_REGISTRY.garbageCollectSystem = {
+    functionName: 'garbageCollectSystem',
+    description: 'Prunes old log entries and obsolete save states.',
+    parameters: [],
+    resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  };
+}
+
+/**
+ * Enhanced: Consolidates raw performance log data into daily summaries.
+ * For each day, computes total jobs, average duration, total API calls, errors, etc.
+ * Stores summary in PerformanceSummary sheet, then deletes raw rows for that day if older than retention period.
+ * Uses batch deletion and AI/agent-driven retention policy.
+ */
+function consolidatePerformanceLog() {
+  var ss = SpreadsheetApp.openById(FORM_REGISTRY[0].spreadsheetId);
+  var logSheet = ss.getSheetByName('PerformanceLog_v1');
+  if (!logSheet) return;
+  var summarySheet = ss.getSheetByName('PerformanceSummary') || ss.insertSheet('PerformanceSummary');
+  var data = logSheet.getDataRange().getValues();
+  if (data.length < 2) return; // No data
+  var header = data[0];
+  var byDay = {};
+  var now = new Date();
+  var retentionDays = getMetricsRetentionDays();
+  var rowsToDelete = [];
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    var date = new Date(row[0]);
+    var dayKey = Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    if (!byDay[dayKey]) byDay[dayKey] = [];
+    byDay[dayKey].push({row: row, idx: i});
+  }
+  for (var day in byDay) {
+    var rows = byDay[day];
+    var totalDuration = 0, totalJobs = 0, totalApi = 0, errors = 0, lastBatch = 0;
+    for (var j = 0; j < rows.length; j++) {
+      var r = rows[j].row;
+      totalDuration += Number(r[2] || 0); // TotalDurationMs
+      totalJobs++;
+      totalApi += Number(r[4] || 0); // TotalApiCalls
+      lastBatch = Number(r[7] || 0); // LastBatchSize
+      if (r[8] && r[8].toString().toLowerCase().includes('error')) errors++;
+    }
+    var avgDuration = totalJobs ? totalDuration / totalJobs : 0;
+    var avgApi = totalJobs ? totalApi / totalJobs : 0;
+    summarySheet.appendRow([day, totalJobs, avgDuration, totalApi, avgApi, errors, lastBatch]);
+    // Mark all rows for this day for deletion if older than retention period
+    for (var j = 0; j < rows.length; j++) {
+      var rowDate = new Date(rows[j].row[0]);
+      if ((now - rowDate) / (1000*60*60*24) > retentionDays) {
+        rowsToDelete.push(rows[j].idx + 1); // +1 for 1-based
+      }
+    }
+  }
+  // Batch delete in reverse order
+  batchDeleteRows(logSheet, rowsToDelete);
+  if (rowsToDelete.length) logAudit('ConsolidatePerformanceLog', { days: Object.keys(byDay).length, rowsDeleted: rowsToDelete.length });
+}
+
+/**
+ * Orchestrated system data consolidation: performance logs, metrics, etc.
+ * Use consolidation for metrics, garbage collection for true logs.
+ */
+function consolidateSystemMetrics() {
+  consolidatePerformanceLog();
+  // Add more consolidation functions here as needed (e.g., for ConcurrencyMonitor, etc.)
+}
+
+// Add to TASK_REGISTRY for agentic invocation
+if (typeof TASK_REGISTRY !== 'undefined') {
+  TASK_REGISTRY.consolidateSystemMetrics = {
+    functionName: 'consolidateSystemMetrics',
+    description: 'Consolidates raw metrics into summaries (e.g., performance logs).',
+    parameters: [],
+    resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
+  };
+}
+
+/**
+ * Consolidates ConcurrencyMonitor metrics into daily summaries by type.
+ * Summarizes queue depth, lock wait, and task processing metrics.
+ * Stores in ConcurrencySummary, deletes raw rows after consolidation.
+ */
+function consolidateConcurrencyMonitor() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(CONCURRENCY_MONITOR_SHEET);
+  if (!sheet) return;
+  var data = sheet.getDataRange().getValues();
+  if (data.length < 2) return; // Only header
+  var header = data[0];
+  var rows = data.slice(1);
+  var byDayType = {};
+  var retentionDays = getMetricsRetentionDays();
+  var now = new Date();
+  var keepRows = [];
+  var deleteRows = [];
+  rows.forEach(function(row, idx) {
+    var ts = new Date(row[0]);
+    var day = ts.getFullYear() + '-' + String(ts.getMonth()+1).padStart(2,'0') + '-' + String(ts.getDate()).padStart(2,'0');
+    var type = row[1];
+    var payload = {};
+    try { payload = JSON.parse(row[2]); } catch(e) {}
+    if (!byDayType[day]) byDayType[day] = {};
+    if (!byDayType[day][type]) byDayType[day][type] = [];
+    byDayType[day][type].push(payload);
+    // Retention: keep if within retentionDays
+    if ((now - ts) / (1000*60*60*24) < retentionDays) keepRows.push(idx+2); // +2 for 1-based, skip header
+    else deleteRows.push(idx+2);
+  });
+  var summarySheet = ss.getSheetByName('ConcurrencySummary') || ss.insertSheet('ConcurrencySummary');
+  if (summarySheet.getLastRow() === 0) summarySheet.appendRow(['date','type','count','avg','max','min','details']);
+  Object.keys(byDayType).forEach(function(day) {
+    Object.keys(byDayType[day]).forEach(function(type) {
+      var vals = byDayType[day][type];
+      var count = vals.length;
+      var nums = [];
+      if (type === 'queue_depth') nums = vals.map(v=>v.depth);
+      else if (type === 'lock_wait') nums = vals.map(v=>v.waitMs);
+      else if (type === 'task_processing') nums = vals.map(v=>v.ms);
+      else if (type === 'function_perf') nums = vals.map(v=>v.ms);
+      else nums = [];
+      var avg = nums.length ? (nums.reduce((a,b)=>a+b,0)/nums.length) : '';
+      var max = nums.length ? Math.max.apply(null,nums) : '';
+      var min = nums.length ? Math.min.apply(null,nums) : '';
+      var details = '';
+      if (type === 'lock_wait') details = vals.map(v=>v.lockType).join(',');
+      else if (type === 'task_processing') details = vals.map(v=>v.taskType).join(',');
+      summarySheet.appendRow([day,type,count,avg,max,min,details]);
+    });
+  });
+  // Batch delete only rows older than retention period
+  batchDeleteRows(sheet, deleteRows);
+}
+
+/**
+ * Consolidates error logs from script properties into daily/context summaries.
+ * Summarizes error count, unique messages, first/last occurrence.
+ * Stores in ErrorSummary sheet, deletes raw errors after consolidation.
+ */
+function consolidateErrorLogs() {
+  var props = PropertiesService.getScriptProperties();
+  var errors = JSON.parse(props.getProperty('RECENT_ERRORS') || '[]');
+  if (!errors.length) return;
+  var byDayContext = {};
+  var retentionDays = getMetricsRetentionDays();
+  var now = new Date();
+  var keepErrors = [];
+  var deleteErrors = [];
+  errors.forEach(function(err, idx) {
+    var ts = err.timestamp ? new Date(err.timestamp) : null;
+    if (ts && (now - ts) / (1000*60*60*24) < retentionDays) keepErrors.push(err);
+    else deleteErrors.push(err);
+    var day = ts ? ts.toISOString().substr(0,10) : 'unknown';
+    var ctx = err.context || 'unknown';
+    if (!byDayContext[day]) byDayContext[day] = {};
+    if (!byDayContext[day][ctx]) byDayContext[day][ctx] = [];
+    byDayContext[day][ctx].push(err);
+  });
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var summarySheet = ss.getSheetByName('ErrorSummary') || ss.insertSheet('ErrorSummary');
+  if (summarySheet.getLastRow() === 0) summarySheet.appendRow(['date','context','errorCount','uniqueMessages','firstOccurrence','lastOccurrence']);
+  Object.keys(byDayContext).forEach(function(day) {
+    Object.keys(byDayContext[day]).forEach(function(ctx) {
+      var errs = byDayContext[day][ctx];
+      var errorCount = errs.length;
+      var uniqueMessages = Array.from(new Set(errs.map(e=>e.message))).join('; ');
+      var first = errs[errs.length-1].timestamp;
+      var last = errs[0].timestamp;
+      summarySheet.appendRow([day,ctx,errorCount,uniqueMessages,first,last]);
+    });
+  });
+  // Only keep errors within retention period
+  props.setProperty('RECENT_ERRORS', JSON.stringify(keepErrors));
+}
+
+/**
+ * Consolidates all system metrics and logs as appropriate.
+ * Called by agent/kernel or scheduled trigger.
+ * Uses consolidation for metrics, garbage collection for true logs.
+ */
+function consolidateSystemMetrics() {
+  consolidatePerformanceLog();
+  consolidateConcurrencyMonitor();
+  consolidateErrorLogs();
+  // Add more as needed
+}
+
+/**
+ * Returns the current retention period (in days) for raw metrics/logs.
+ * Default is 7 days, can be set by agent/kernel.
+ */
+function getMetricsRetentionDays() {
+  var props = PropertiesService.getScriptProperties();
+  var days = parseInt(props.getProperty('METRICS_RETENTION_DAYS') || '7', 10);
+  return isNaN(days) ? 7 : days;
+}
+
+/**
+ * Sets the retention period (in days) for raw metrics/logs.
+ * Can be called by agent/kernel/AI.
+ */
+function setMetricsRetentionDays(days) {
+  var props = PropertiesService.getScriptProperties();
+  props.setProperty('METRICS_RETENTION_DAYS', String(days));
+}
+
+/**
+ * Batch deletes rows from a sheet, given a list of row indices (1-based, excluding header).
+ * Deletes in reverse order in batches of 100 to avoid Apps Script limits.
+ */
+function batchDeleteRows(sheet, rowIndices) {
+  rowIndices.sort((a,b)=>b-a); // Descending
+  while (rowIndices.length) {
+    var batch = rowIndices.splice(0, 100);
+    batch.forEach(function(rowIdx) {
+      sheet.deleteRow(rowIdx);
+    });
+  }
+}
+
+/**
+ * Enhanced: Consolidates ConcurrencyMonitor metrics, keeps last N days of raw data, batch deletes old rows.
+ */
+function consolidateConcurrencyMonitor() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(CONCURRENCY_MONITOR_SHEET);
+  if (!sheet) return;
+  var data = sheet.getDataRange().getValues();
+  if (data.length < 2) return; // Only header
+  var header = data[0];
+  var rows = data.slice(1);
+  var byDayType = {};
+  var retentionDays = getMetricsRetentionDays();
+  var now = new Date();
+  var keepRows = [];
+  var deleteRows = [];
+  rows.forEach(function(row, idx) {
+    var ts = new Date(row[0]);
+    var day = ts.getFullYear() + '-' + String(ts.getMonth()+1).padStart(2,'0') + '-' + String(ts.getDate()).padStart(2,'0');
+    var type = row[1];
+    var payload = {};
+    try { payload = JSON.parse(row[2]); } catch(e) {}
+    if (!byDayType[day]) byDayType[day] = {};
+    if (!byDayType[day][type]) byDayType[day][type] = [];
+    byDayType[day][type].push(payload);
+    // Retention: keep if within retentionDays
+    if ((now - ts) / (1000*60*60*24) < retentionDays) keepRows.push(idx+2); // +2 for 1-based, skip header
+    else deleteRows.push(idx+2);
+  });
+  var summarySheet = ss.getSheetByName('ConcurrencySummary') || ss.insertSheet('ConcurrencySummary');
+  if (summarySheet.getLastRow() === 0) summarySheet.appendRow(['date','type','count','avg','max','min','details']);
+  Object.keys(byDayType).forEach(function(day) {
+    Object.keys(byDayType[day]).forEach(function(type) {
+      var vals = byDayType[day][type];
+      var count = vals.length;
+      var nums = [];
+      if (type === 'queue_depth') nums = vals.map(v=>v.depth);
+      else if (type === 'lock_wait') nums = vals.map(v=>v.waitMs);
+      else if (type === 'task_processing') nums = vals.map(v=>v.ms);
+      else if (type === 'function_perf') nums = vals.map(v=>v.ms);
+      else nums = [];
+      var avg = nums.length ? (nums.reduce((a,b)=>a+b,0)/nums.length) : '';
+      var max = nums.length ? Math.max.apply(null,nums) : '';
+      var min = nums.length ? Math.min.apply(null,nums) : '';
+      var details = '';
+      if (type === 'lock_wait') details = vals.map(v=>v.lockType).join(',');
+      else if (type === 'task_processing') details = vals.map(v=>v.taskType).join(',');
+      summarySheet.appendRow([day,type,count,avg,max,min,details]);
+    });
+  });
+  // Batch delete only rows older than retention period
+  batchDeleteRows(sheet, deleteRows);
+}
+
+/**
+ * Enhanced: Consolidates error logs, keeps last N days, batch deletes old errors.
+ */
+function consolidateErrorLogs() {
+  var props = PropertiesService.getScriptProperties();
+  var errors = JSON.parse(props.getProperty('RECENT_ERRORS') || '[]');
+  if (!errors.length) return;
+  var byDayContext = {};
+  var retentionDays = getMetricsRetentionDays();
+  var now = new Date();
+  var keepErrors = [];
+  var deleteErrors = [];
+  errors.forEach(function(err, idx) {
+    var ts = err.timestamp ? new Date(err.timestamp) : null;
+    if (ts && (now - ts) / (1000*60*60*24) < retentionDays) keepErrors.push(err);
+    else deleteErrors.push(err);
+    var day = ts ? ts.toISOString().substr(0,10) : 'unknown';
+    var ctx = err.context || 'unknown';
+    if (!byDayContext[day]) byDayContext[day] = {};
+    if (!byDayContext[day][ctx]) byDayContext[day][ctx] = [];
+    byDayContext[day][ctx].push(err);
+  });
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var summarySheet = ss.getSheetByName('ErrorSummary') || ss.insertSheet('ErrorSummary');
+  if (summarySheet.getLastRow() === 0) summarySheet.appendRow(['date','context','errorCount','uniqueMessages','firstOccurrence','lastOccurrence']);
+  Object.keys(byDayContext).forEach(function(day) {
+    Object.keys(byDayContext[day]).forEach(function(ctx) {
+      var errs = byDayContext[day][ctx];
+      var errorCount = errs.length;
+      var uniqueMessages = Array.from(new Set(errs.map(e=>e.message))).join('; ');
+      var first = errs[errs.length-1].timestamp;
+      var last = errs[0].timestamp;
+      summarySheet.appendRow([day,ctx,errorCount,uniqueMessages,first,last]);
+    });
+  });
+  // Only keep errors within retention period
+  props.setProperty('RECENT_ERRORS', JSON.stringify(keepErrors));
+}
+
+/**
+ * Schedules or unschedules the consolidation trigger. Can be called by agent/kernel/AI.
+ * If enable=true, sets up a daily trigger. If false, removes it.
+ */
+function setConsolidationScheduled(enable) {
+  var triggers = ScriptApp.getProjectTriggers();
+  var found = triggers.find(t => t.getHandlerFunction() === 'consolidateSystemMetrics');
+  if (enable && !found) {
+    ScriptApp.newTrigger('consolidateSystemMetrics').timeBased().everyDays(1).create();
+  } else if (!enable && found) {
+    ScriptApp.deleteTrigger(found);
+  }
 }
