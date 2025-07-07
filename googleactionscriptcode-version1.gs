@@ -67,9 +67,6 @@
  * // Run system diagnostics:
  *   const diag = productionSystemDiagnostics();
  *
- * // Process async jobs (normally run by trigger):
- *   masterAsyncJobWorker();
- *
  * // Set up triggers and initialize system:
  *   setupFreeTierSystem();
  *
@@ -117,7 +114,7 @@
  *
  * 2. **Distributed Queue & Async Worker**
  *    - Robust, idempotent, and concurrency-safe job processing.
- *    - Functions: `distributedQueueEnqueue`, `distributedQueueDequeueAtomic`, `distributedQueueComplete`, `masterAsyncJobWorker`, job handlers.
+ *    - Functions: `distributedQueueEnqueue`, `distributedQueueDequeueAtomic`, `distributedQueueComplete`, job handlers.
  *
  * 3. **Monitoring & Diagnostics**
  *    - Tracks queue depth, lock wait times, job metrics, and system health.
@@ -170,7 +167,7 @@
  * - To add new features, create new functions or services in the appropriate section.
  * - Document all new functions and update this documentation as needed.
  * - For new forms or sheets, update the `FORM_REGISTRY` at the top of the orchestrator file.
- * - For new job types, add a handler in `masterAsyncJobWorker` and update the distributed queue logic.
+
  */
 
 /**
@@ -182,7 +179,6 @@
  * - `validateConsistency(sheetId)`: Checks cross-resource consistency.
  * - `validateDataQuality(sheetId)`: Checks data quality in all tabs.
  * - `sendFormLinksEmail(sheetId)`: Emails Google Form embed codes to the script owner.
- * - `masterAsyncJobWorker()`: Processes async jobs from the distributed queue.
  * - `productionSystemDiagnostics()`: Returns a full system health/diagnostics report.
  * - `setupFreeTierSystem()`: Sets up all triggers, quotas, and unified list.
  * - `CalendarSyncService.syncDateRange(start, end)`: Syncs all summary and appointment events for a date range (robust, deduplicated, quota-aware).
@@ -318,8 +314,9 @@ const FORM_REGISTRY = [
 ];
 
 // Sheet/slot configuration
-const SLOT_CAP = 20;
-const FUTURE_DAYS = 60;
+// [REMOVE or COMMENT OUT]:
+// const SLOT_CAP = 20;
+// const FUTURE_DAYS = 60;
 const RESPONSE_RETENTION_DAYS = 60;
 const RESP_DATE_COL = 6;
 const AVAIL_BOOKED_COL = 2;
@@ -327,7 +324,11 @@ const AVAIL_LEFT_COL = 3;
 const MAX_ADVANCE_DAYS = 60;
 const BUSINESS_DAYS_WINDOW = 60;
 const BATCH_DAYS_WINDOW = 30;
-const CHUNK_SIZE = 50;
+// [REPLACE ALL USAGES]:
+// SLOT_CAP -> ConfigService.get('SLOT_CAP', 20)
+// FUTURE_DAYS -> ConfigService.get('FUTURE_DAYS', 60)
+// CHUNK_SIZE -> ConfigService.get('CHUNK_SIZE', 500)
+const CHUNK_SIZE = ConfigService.get('CHUNK_SIZE', 500);
 
 // Throttling and timeouts
 const THROTTLE_INTERVAL_MS = 60000;
@@ -350,11 +351,11 @@ const TAG_HOLIDAY = '[AUTO_HOLIDAY]';
 
 // Field mapping for forms
 const FIELD_ID_MAP = {
-  'Last Name': '1111111111111111111',
-  'First Name': '2222222222222222222',
-  'Purok': '3333333333333333333',
-  'Barangay': '4444444444444444444',
-  'Date of Appointment': '5555555555555555555'
+  'Last Name': 'REPLACE_WITH_FIELD_ID', // TODO: Replace with actual field ID
+  'First Name': 'REPLACE_WITH_FIELD_ID', // TODO: Replace with actual field ID
+  'Purok': 'REPLACE_WITH_FIELD_ID', // TODO: Replace with actual field ID
+  'Barangay': 'REPLACE_WITH_FIELD_ID', // TODO: Replace with actual field ID
+  'Date of Appointment': 'REPLACE_WITH_FIELD_ID' // TODO: Replace with actual field ID
 };
 
 // Timezone and core services
@@ -554,55 +555,79 @@ const HolidayService = {
 };
 
 /**
- * ConfigService: Manages all system configuration from a dedicated sheet.
- * Reads settings from a 'Configuration' sheet and caches them.
+ * ConfigService: Centralized configuration management using a Configuration sheet.
+ * - Reads config from the sheet, auto-replenishes missing/corrupted values from defaults.
+ * - Use ConfigService.get('KEY', defaultValue) everywhere.
  */
 const ConfigService = {
-  _config: null,
-  _registry: null,
-  CONFIG_SHEET_NAME: 'Configuration',
-  CACHE_KEY: `${SCRIPT_VERSION}_config`,
-  CACHE_TTL: 3600, // 1 hour
-
+  CONFIG_SHEET: 'Configuration',
+  CACHE_TTL: 300, // seconds
+  _cache: {},
+  _lastLoad: 0,
   _loadConfig() {
-    const cached = safeCacheGet(this.CACHE_KEY);
-    if (cached) {
-      const parsed = JSON.parse(cached);
-      this._config = parsed.config;
-      this._registry = parsed.registry;
-      return;
+    const now = Date.now();
+    if (now - this._lastLoad < this.CACHE_TTL * 1000 && Object.keys(this._cache).length > 0) {
+      return this._cache;
     }
-
     const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const sheet = ss.getSheetByName(this.CONFIG_SHEET_NAME);
-    if (!sheet) throw new Error(`Configuration sheet '${this.CONFIG_SHEET_NAME}' not found.`);
-
+    let sheet = ss.getSheetByName(this.CONFIG_SHEET);
+    if (!sheet) {
+      sheet = ss.insertSheet(this.CONFIG_SHEET);
+      sheet.appendRow(['KEY', 'VALUE', 'DEFAULT']);
+    }
     const data = sheet.getDataRange().getValues();
-    this._config = {};
-    data.slice(1).forEach(([key, value]) => {
-      if (key) this._config[key] = value;
-    });
-
-    // Assuming FORM_REGISTRY is now in a sheet named 'FormRegistry'
-    const registrySheet = ss.getSheetByName('FormRegistry');
-    if (!registrySheet) throw new Error('FormRegistry sheet not found.');
-    const registryData = registrySheet.getDataRange().getValues();
-    const headers = registryData.shift();
-    this._registry = registryData.map(row =>
-      headers.reduce((obj, header, index) => ({ ...obj, [header]: row[index] }), {})
-    );
-
-    safeCachePut(this.CACHE_KEY, JSON.stringify({ config: this._config, registry: this._registry }), this.CACHE_TTL);
+    const config = {};
+    for (let i = 1; i < data.length; i++) {
+      const [key, value, def] = data[i];
+      if (key) config[key] = (value !== undefined && value !== '') ? value : def;
+    }
+    this._cache = config;
+    this._lastLoad = now;
+    return config;
   },
-
-  get(key, defaultValue = null) {
-    if (!this._config) this._loadConfig();
-    return this._config[key] !== undefined ? this._config[key] : defaultValue;
+  get(key, defaultValue) {
+    const config = this._loadConfig();
+    if (config[key] !== undefined && config[key] !== '') return this._parse(config[key]);
+    // If missing/corrupted, auto-replenish from defaultValue
+    this.set(key, defaultValue, true);
+    return defaultValue;
   },
-
+  set(key, value, isDefault = false) {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet = ss.getSheetByName(this.CONFIG_SHEET);
+    if (!sheet) {
+      sheet = ss.insertSheet(this.CONFIG_SHEET);
+      sheet.appendRow(['KEY', 'VALUE', 'DEFAULT']);
+    }
+    const data = sheet.getDataRange().getValues();
+    let found = false;
+    for (let i = 1; i < data.length; i++) {
+      if (data[i][0] === key) {
+        if (isDefault) {
+          sheet.getRange(i + 1, 3).setValue(value);
+        } else {
+          sheet.getRange(i + 1, 2).setValue(value);
+        }
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      const row = [key, isDefault ? '' : value, isDefault ? value : ''];
+      sheet.appendRow(row);
+    }
+    this._cache[key] = value;
+  },
+  _parse(val) {
+    if (typeof val === 'string' && /^\d+$/.test(val)) return parseInt(val, 10);
+    if (typeof val === 'string' && /^\d+\.\d+$/.test(val)) return parseFloat(val);
+    if (val === 'true') return true;
+    if (val === 'false') return false;
+    return val;
+  },
   getRegistry() {
-    if (!this._registry) this._loadConfig();
-    return this._registry;
+    // ... existing logic ...
+    return FORM_REGISTRY;
   }
 };
 
@@ -696,39 +721,48 @@ function distributedQueueEnqueue(job) {
  */
 function distributedQueueDequeueAtomic(workerId, claimTimeoutSec) {
   claimTimeoutSec = claimTimeoutSec || 60;
-  const sheet = ensureDistributedQueueSheet();
-  const data = sheet.getDataRange().getValues();
-  const now = new Date();
-  for (let i = 1; i < data.length; i++) { // skip header
-    const row = data[i];
-    const status = row[5];
-    const claimedAt = row[3] ? new Date(row[3]) : null;
-    let expired = false;
-    if (status === 'CLAIMED' && claimedAt) {
-      expired = ((now - claimedAt) / 1000) > claimTimeoutSec;
-    }
-    if (status === 'PENDING' || expired) {
-      const rowIdx = i + 1; // 1-based
-      const range = sheet.getRange(rowIdx, 6, 1, 1); // status col
-      const currentStatus = range.getValue();
-      if (currentStatus === status) { // compare-and-swap
-        sheet.getRange(rowIdx, 4, 1, 3).setValues([[now.toISOString(), workerId, 'CLAIMED']]);
-        // Parse agentic job payload
-        let jobPayload;
-        try {
-          jobPayload = JSON.parse(row[1]);
-        } catch (e) {
-          // Legacy/old jobs: fallback to old payload
-          jobPayload = { id: row[0], legacyPayload: row[1] };
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(5000); // Wait up to 5 seconds for the lock
+    const sheet = ensureDistributedQueueSheet();
+    const data = sheet.getDataRange().getValues();
+    const now = new Date();
+    for (let i = 1; i < data.length; i++) { // skip header
+      const row = data[i];
+      const status = row[5];
+      const claimedAt = row[3] ? new Date(row[3]) : null;
+      let expired = false;
+      if (status === 'CLAIMED' && claimedAt) {
+        expired = ((now - claimedAt) / 1000) > claimTimeoutSec;
+      }
+      if (status === 'PENDING' || expired) {
+        const rowIdx = i + 1; // 1-based
+        const range = sheet.getRange(rowIdx, 6, 1, 1); // status col
+        const currentStatus = range.getValue();
+        if (currentStatus === status) { // compare-and-swap
+          sheet.getRange(rowIdx, 4, 1, 3).setValues([[now.toISOString(), workerId, 'CLAIMED']]);
+          // Parse agentic job payload
+          let jobPayload;
+          try {
+            jobPayload = JSON.parse(row[1]);
+          } catch (e) {
+            // Legacy/old jobs: fallback to old payload
+            jobPayload = { id: row[0], legacyPayload: row[1] };
+          }
+          return {
+            ...jobPayload,
+            row: rowIdx
+          };
         }
-        return {
-          ...jobPayload,
-          row: rowIdx
-        };
       }
     }
+    return null;
+  } catch (e) {
+    Logger.log('distributedQueueDequeueAtomic: Lock acquisition failed or error: ' + e);
+    return null;
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
   }
-  return null;
 }
 
 /**
@@ -1330,32 +1364,44 @@ function rebuildSlotCounters(e) {
       runBatchJobWithContinuation({
         taskName,
         continuationFnName: 'rebuildSlotCounters',
-        batchFn: (state, rows, batchStartRow) => {
+        batchFn: (state, rows) => {
+          // Optimization: Use a map to avoid looping the availability sheet every time.
+          // The map is built once per continuation run.
+          if (!state.availabilityMap) {
+            const availData = sheet.getRange(2, 1, sheet.getLastRow() - 1, 3).getValues();
+            state.availabilityMap = availData.reduce((acc, [date, booked, left], index) => {
+              if (date) acc[date] = { row: index + 2, booked, left }; // Store 1-based row index and values
+              return acc;
+            }, {});
+          }
+
           for (let i = 0; i < rows.length; i++) {
-            const data = rows[i];
-            const dateChoice = data[5];
+            const dateChoice = rows[i][RESP_DATE_COL - 1];
             if (!dateChoice) continue;
             const dateStr = typeof dateChoice === 'string' ? dateChoice.split(' ')[0] : '';
-            // Find or create row in availability
-            let found = false;
-            const availLastRow = sheet.getLastRow();
-            for (let j = 2; j <= availLastRow; j++) {
-              if (sheet.getRange(j, 1).getValue() === dateStr) {
-                const booked = sheet.getRange(j, 2).getValue() + 1;
-                const left = Math.max(0, sheet.getRange(j, 3).getValue() - 1);
-                sheet.getRange(j, 2, 1, 2).setValues([[booked, left]]);
-                found = true;
-                break;
-              }
-            }
-            if (!found) {
+
+            const availEntry = state.availabilityMap[dateStr];
+            if (availEntry) {
+              availEntry.booked++;
+              availEntry.left--;
+            } else {
+              // This part for creating a new row if date not found remains the same.
               const newRow = sheet.getLastRow() + 1;
               sheet.getRange(newRow, 1, 1, 3).setValues([[dateStr, 1, ConfigService.get('SLOT_CAP', 20) - 1]]);
+              state.availabilityMap[dateStr] = { row: newRow, booked: 1, left: ConfigService.get('SLOT_CAP', 20) - 1 };
             }
             state.apiCalls = (state.apiCalls || 0) + 2; // Example: 2 API calls per row
           }
         },
-        doneFn: () => updateAllChecksums(sheet),
+        doneFn: (state) => {
+          // Write back the updated counts in a single batch operation
+          const updatedData = Object.values(state.availabilityMap).map(entry => [entry.booked, entry.left]);
+          const startRow = 2; // Assuming data starts at row 2
+          if (updatedData.length > 0) {
+            sheet.getRange(startRow, AVAIL_BOOKED_COL, updatedData.length, 2).setValues(updatedData);
+          }
+          updateAllChecksums(sheet);
+        },
         batchSize: state.batchSize || ConfigService.get('CHUNK_SIZE', 500),
         softTimeLimitMs: 5 * 60 * 1000,
         startRowKey: 'lastRow',
@@ -1368,68 +1414,6 @@ function rebuildSlotCounters(e) {
   }
 }
 
-// Refactor rebuildAppointmentEventsAllForms to use ContinuationManager
-function rebuildAppointmentEventsAllForms(e) {
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
-    Logger.log('rebuildAppointmentEventsAllForms: Lock busy, skipping');
-    return;
-  }
-  try {
-    for (const entry of ConfigService.getRegistry()) {
-      try {
-        const sheet = getSpreadsheet(entry).getSheetByName(entry.sheetName);
-        if (!sheet) continue;
-        const taskName = 'BATCH_CONTINUATION_STATE_rebuildAppointmentEventsAllForms_' + entry.sheetName;
-        let state = e && e.state ? e.state : ContinuationManager.loadState(taskName, {});
-        if (!state.deleted) {
-          const today = new Date();
-          const start = new Date(1970, 0, 1);
-          const end = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-          const allEvents = CAL.getEvents(start, end);
-          for (const event of allEvents) {
-            const title = event.getTitle();
-            if (title.includes(APPT_EVENT_TAG) || title.includes(FULL_SUMMARY_TAG)) {
-              CalendarQuotaManager.safeDeleteEvent(() => event.deleteEvent());
-            }
-          }
-          state.deleted = true;
-        }
-        runBatchJobWithContinuation({
-          taskName,
-          continuationFnName: 'rebuildAppointmentEventsAllForms',
-          batchFn: (state, rows, batchStartRow) => {
-            for (let i = 0; i < rows.length; i++) {
-              const [timestamp, lastName, firstName, purok, barangay, dateChoice] = rows[i];
-              if (!dateChoice) continue;
-              const dateStr = typeof dateChoice === 'string' ? dateChoice.split(' ')[0] : '';
-              const dateObj = DateUtils.parseDate(dateStr);
-              if (!dateObj) continue;
-              CalendarQuotaManager.safeCreateEvent(() => {
-                const event = CAL.createAllDayEvent(
-                  `${APPT_EVENT_TAG} ${lastName}, ${firstName} (${barangay})`,
-                  dateObj
-                );
-                event.setColor(CalendarApp.EventColor.PALE_BLUE);
-                return event;
-              });
-            }
-          },
-          doneFn: () => Logger.log('rebuildAppointmentEventsAllForms:end'),
-          batchSize: ConfigService.get('CHUNK_SIZE', 500),
-          softTimeLimitMs: 5 * 60 * 1000,
-          startRowKey: 'lastRow',
-          sheet,
-          getLastRowFn: s => s.getLastRow()
-        }, e);
-      } catch (e) {
-        Logger.log('rebuildAppointmentEventsAllForms: Error for ' + entry.sheetName + ': ' + e);
-      }
-    }
-  } finally {
-    lock.releaseLock();
-  }
-}
 
 /**
  * Rebuilds the date dropdown for all forms from scratch based on latest availability.
@@ -1466,58 +1450,6 @@ function rebuildAllFormDropdowns() {
   }
 }
 
-/**
- * Deletes all appointment events and recreates them from form responses.
- * Ensures the calendar is a perfect mirror of the data.
- */
-function rebuildAppointmentEventsAllForms() {
-  Logger.log('rebuildAppointmentEventsAllForms:start');
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
-    Logger.log('rebuildAppointmentEventsAllForms: Lock busy, skipping');
-    return;
-  }
-  try {
-    // Delete all appointment events
-    const start = new Date(1970, 0, 1);
-    const end = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
-    const allEvents = CAL.getEvents(start, end);
-    for (const event of allEvents) {
-      const title = event.getTitle();
-      if (title.includes(APPT_EVENT_TAG)) {
-        CalendarQuotaManager.safeDeleteEvent(() => event.deleteEvent());
-      }
-    }
-    // Recreate from all form responses
-    for (const entry of FORM_REGISTRY) {
-      try {
-        const sheet = getSpreadsheet(entry).getSheetByName(entry.sheetName);
-        if (!sheet) continue;
-        const data = sheet.getDataRange().getValues();
-        for (let i = 1; i < data.length; i++) {
-          const [timestamp, lastName, firstName, purok, barangay, dateChoice] = data[i];
-          if (!dateChoice) continue;
-          const dateStr = typeof dateChoice === 'string' ? dateChoice.split(' ')[0] : '';
-          const dateObj = DateUtils.parseDate(dateStr);
-          if (!dateObj) continue;
-          CalendarQuotaManager.safeCreateEvent(() => {
-            const event = CAL.createAllDayEvent(
-              `${APPT_EVENT_TAG} ${lastName}, ${firstName} (${barangay})`,
-              dateObj
-            );
-            event.setColor(CalendarApp.EventColor.PALE_BLUE);
-            return event;
-          });
-        }
-      } catch (e) {
-        Logger.log('rebuildAppointmentEventsAllForms: Error for ' + entry.sheetName + ': ' + e);
-      }
-    }
-    Logger.log('rebuildAppointmentEventsAllForms:end');
-  } finally {
-    lock.releaseLock();
-  }
-}
 
 // === Unified List Block Layout Configuration ===
 const UNIFIED_LIST_BLOCK_ROWS = 23; // Total rows per date block (including header)
@@ -1652,7 +1584,7 @@ function renderUnifiedDateBlock(sheet, dateKey, appointments, startRow) {
   sheet.getRange(rowPtr, 1, 1, UNIFIED_LIST_VIEW_COLS).setValues([UNIFIED_LIST_HEADERS]);
   rowPtr++;
   // Write up to SLOT_CAP appointments
-  const appointmentsToWrite = appointments.slice(0, SLOT_CAP);
+  const appointmentsToWrite = appointments.slice(0, ConfigService.get('SLOT_CAP', 20));
   for (const appt of appointmentsToWrite) {
     const rowData = [
       appt.form,
@@ -1849,18 +1781,8 @@ const FreeTierTriggerManager = {
       }
     }
   },
-  /**
-   * Sets up async job worker trigger to run every 5 minutes.
-   */
-  setupAsyncJobWorkerTrigger() {
-    if (!this.hasTrigger('masterAsyncJobWorker', ScriptApp.EventType.CLOCK)) {
-      ScriptApp.newTrigger('masterAsyncJobWorker')
-        .timeBased()
-        .everyMinutes(5)
-        .create();
-      Logger.log('FreeTierTriggerManager: Created async job worker trigger (every 5 minutes)');
-    }
-  },
+
+
   /**
    * Sets up daily maintenance trigger that combines multiple functions.
    * Runs at 2 AM to avoid conflicts with business hours.
@@ -1952,21 +1874,68 @@ function setupFreeTierSystem() {
  * Runs at 2 AM to avoid business hours.
  */
 function dailyMaintenanceRoutine() {
-  Logger.log('dailyMaintenanceRoutine: start');
-  const startTime = Date.now();
   try {
-    CalendarQuotaManager.initRun();
-    Logger.log('dailyMaintenanceRoutine: Reset calendar quota');
+    distributedQueueEnqueue({
+      taskName: RUN_DAILY_MAINTENANCE,
+      args: {},
+      priority: 50 // Medium-high priority
+    });
+  } catch (err) {
+    ErrorService.sendThrottledError('dailyMaintenanceRoutine', err);
+  }
+}
+
+/**
+ * Handler for RUN_DAILY_MAINTENANCE jobs. Enqueues sub-tasks as jobs.
+ */
+function runDailyMaintenanceJob(args) {
+  try {
+    // Enqueue sub-tasks as jobs (no dependencies for now, can be extended)
+    distributedQueueEnqueue({ taskName: PURGE_OLD_RESPONSES, args: {}, priority: 40 });
+    distributedQueueEnqueue({ taskName: SYNC_CALENDAR_RANGE, args: {}, priority: 40 });
+    distributedQueueEnqueue({ taskName: AUDIT_SHEETS, args: {}, priority: 40 });
+    Logger.log('runDailyMaintenanceJob: Enqueued all maintenance sub-tasks.');
+  } catch (err) {
+    ErrorService.sendThrottledError('runDailyMaintenanceJob', err, args);
+  }
+}
+
+/**
+ * Handler for PURGE_OLD_RESPONSES jobs.
+ */
+function purgeOldResponsesJob(args) {
+  try {
     purgeOldResponses();
-    Logger.log('dailyMaintenanceRoutine: Purged old responses');
-    syncAllAppointmentEvents();
-    Logger.log('dailyMaintenanceRoutine: Synced calendar events');
-    checkCalendarIntegrityLimited();
-    Logger.log('dailyMaintenanceRoutine: Checked calendar integrity');
-    const duration = Date.now() - startTime;
-    Logger.log(`dailyMaintenanceRoutine: completed in ${duration}ms`);
-  } catch (e) {
-    Logger.log('dailyMaintenanceRoutine: Error: ' + e);
+    Logger.log('purgeOldResponsesJob: Completed.');
+  } catch (err) {
+    ErrorService.sendThrottledError('purgeOldResponsesJob', err, args);
+  }
+}
+
+/**
+ * Handler for SYNC_CALENDAR_RANGE jobs.
+ */
+function syncCalendarRangeJob(args) {
+  try {
+    // Example: Sync for the next 30 days
+    const today = new Date();
+    const end = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 30);
+    CalendarSyncService.syncDateRange(today, end);
+    Logger.log('syncCalendarRangeJob: Completed.');
+  } catch (err) {
+    ErrorService.sendThrottledError('syncCalendarRangeJob', err, args);
+  }
+}
+
+/**
+ * Handler for AUDIT_SHEETS jobs.
+ */
+function auditSheetsJob(args) {
+  try {
+    auditAvailabilitySheets();
+    Logger.log('auditSheetsJob: Completed.');
+  } catch (err) {
+    ErrorService.sendThrottledError('auditSheetsJob', err, args);
   }
 }
 
@@ -2206,162 +2175,7 @@ const ErrorService = {
   }
 };
 
-/**
- * Main async job worker: processes jobs from the distributed queue with lease management and DLQ support.
- */
-function masterAsyncJobWorker(options, e) {
-  options = options || {};
-  const fullDrain = !!options.fullDrain;
-  const workerId = 'worker_async_' + Utilities.getUuid();
-  const claimTimeoutSec = 60; // 1 minute
-  const maxBatch = 5; // Regular mode: process up to 5 jobs per run
-  let processedCount = 0;
-  let leaseAcquired = false;
 
-  // Only run during business hours (Mon-Fri, 8am-5pm)
-  const now = new Date();
-  const day = now.getDay();
-  const hour = now.getHours();
-  if (day === 0 || day === 6 || hour < 8 || hour >= 17) {
-    Logger.log('masterAsyncJobWorker: Outside business hours, skipping run.');
-    return;
-  }
-
-  const executionStart = Date.now();
-  const maxExecutionTime = 4 * 60 * 1000; // 4 minutes
-  Logger.log('masterAsyncJobWorker: start (production-grade with lease management)');
-
-  // --- Full-Drain Mode: Use ContinuationManager to process the entire queue ---
-  if (fullDrain) {
-    const taskName = 'FULL_DRAIN_QUEUE_STATE';
-    const continuationFnName = 'masterAsyncJobWorker';
-    let state = e && e.state ? e.state : ContinuationManager.loadState(taskName, { row: 2, processed: 0 });
-    const sheet = ensureDistributedQueueSheet();
-    const lastRow = sheet.getLastRow();
-    let processedThisRun = 0;
-    try {
-      leaseAcquired = WorkerLeaseManager.acquireLease(workerId);
-      if (!leaseAcquired) {
-        Logger.log('masterAsyncJobWorker: Failed to acquire lease, another worker is active');
-        return;
-      }
-      while (state.row <= lastRow) {
-        const rowValues = sheet.getRange(state.row, 1, 1, sheet.getLastColumn()).getValues()[0];
-        if (!rowValues || !rowValues[0]) {
-          state.row++;
-          continue;
-        }
-        const job = {
-          id: rowValues[0],
-          payload: JSON.parse(rowValues[1]),
-          row: state.row
-        };
-        try {
-          const handler = JOB_HANDLERS && JOB_HANDLERS[job.payload.type];
-          if (handler) {
-            handler(job.payload);
-            distributedQueueComplete(job.row);
-            Logger.log(`masterAsyncJobWorker (full-drain): Completed job ${job.id}`);
-          } else {
-            Logger.log(`masterAsyncJobWorker (full-drain): Unknown job type: ${job.payload.type}`);
-            deadLetterEnqueue(job, `Unknown job type: ${job.payload.type}`);
-            distributedQueueComplete(job.row);
-          }
-        } catch (e) {
-          Logger.log(`masterAsyncJobWorker (full-drain): FAILED job ${job.id}. Error: ${e.toString()}`);
-          deadLetterEnqueue(job, e.toString());
-          distributedQueueComplete(job.row);
-        }
-        state.row++;
-        state.processed++;
-        processedThisRun++;
-        if (!ContinuationManager.shouldContinue(executionStart, maxExecutionTime)) {
-          Logger.log(`masterAsyncJobWorker (full-drain): Pausing after ${processedThisRun} jobs this run, will continue...`);
-          ContinuationManager.saveAndContinue(taskName, state, continuationFnName);
-          return;
-        }
-      }
-      Logger.log(`masterAsyncJobWorker (full-drain): Finished. Total jobs processed: ${state.processed}`);
-      ContinuationManager.finish(taskName, continuationFnName);
-    } finally {
-      if (leaseAcquired) {
-        WorkerLeaseManager.releaseLease(workerId);
-      }
-    }
-    return;
-  }
-
-  // --- Regular Batch Mode (default) ---
-  try {
-    leaseAcquired = WorkerLeaseManager.acquireLease(workerId);
-    if (!leaseAcquired) {
-      Logger.log('masterAsyncJobWorker: Failed to acquire lease, another worker is active');
-      return;
-    }
-    Logger.log(`masterAsyncJobWorker: Lease acquired, starting job processing`);
-    while (processedCount < maxBatch) {
-      if (Date.now() - executionStart > maxExecutionTime) {
-        Logger.log('masterAsyncJobWorker: Execution time limit reached, stopping');
-        break;
-      }
-      const job = distributedQueueDequeueAtomic(workerId, claimTimeoutSec);
-      if (!job) {
-        Logger.log('masterAsyncJobWorker: No pending jobs found');
-        break;
-      }
-      const { payload, row: rowIdx, id: jobId } = job;
-      Logger.log(`masterAsyncJobWorker: Claimed job ${jobId} of type ${payload.type}`);
-      try {
-        const handler = JOB_HANDLERS && JOB_HANDLERS[payload.type];
-        if (handler) {
-          handler(payload);
-          distributedQueueComplete(rowIdx);
-          Logger.log(`masterAsyncJobWorker: Completed job ${jobId}`);
-        } else {
-          Logger.log(`masterAsyncJobWorker: Unknown job type: ${payload.type}`);
-          deadLetterEnqueue(job, `Unknown job type: ${payload.type}`);
-          distributedQueueComplete(rowIdx);
-          ConcurrencyMonitor._logMetric('job_failure', {
-            jobId: jobId,
-            jobType: payload.type,
-            error: 'Unknown job type',
-            workerId: workerId
-          });
-        }
-      } catch (e) {
-        Logger.log(`masterAsyncJobWorker: FAILED job ${jobId}. Error: ${e.toString()}`);
-        deadLetterEnqueue(job, e.toString());
-        distributedQueueComplete(rowIdx);
-        ConcurrencyMonitor._logMetric('job_failure', {
-          jobId: jobId,
-          jobType: payload.type,
-          error: e.toString(),
-          workerId: workerId
-        });
-      }
-      processedCount++;
-    }
-  } catch (e) {
-    Logger.log(`masterAsyncJobWorker: Critical error: ${e.toString()}`);
-    ConcurrencyMonitor._logMetric('worker_error', {
-      workerId: workerId,
-      error: e.toString(),
-      processedCount: processedCount
-    });
-  } finally {
-    if (leaseAcquired) {
-      WorkerLeaseManager.releaseLease(workerId);
-    }
-    const executionTime = Date.now() - executionStart;
-    Logger.log(`masterAsyncJobWorker: Finished run, processed ${processedCount} jobs in ${executionTime}ms`);
-    ConcurrencyMonitor._logMetric('worker_performance', {
-      workerId: workerId,
-      processedCount: processedCount,
-      executionTime: executionTime,
-      leaseAcquired: leaseAcquired
-    });
-  }
-}
 
 /**
  * Handler for CALENDAR_SYNC jobs. Uses CalendarSyncService to update calendar for a date.
@@ -2638,7 +2452,7 @@ const CalendarSyncService = {
    * @return {Object} Availability data
    */
   getAvailabilityForDate(dateStr) {
-    let minLeft = SLOT_CAP;
+    let minLeft = ConfigService.get('SLOT_CAP', 20);
     let totalBooked = 0;
     for (const entry of FORM_REGISTRY) {
       try {
@@ -2649,7 +2463,7 @@ const CalendarSyncService = {
           const row = data[i];
           if (row[0] === dateStr) {
             const booked = row[AVAIL_BOOKED_COL - 1] || 0;
-            const left = row[AVAIL_LEFT_COL - 1] || SLOT_CAP;
+            const left = row[AVAIL_LEFT_COL - 1] || ConfigService.get('SLOT_CAP', 20);
             totalBooked += booked;
             minLeft = Math.min(minLeft, left);
           }
@@ -2697,35 +2511,11 @@ function onFormSubmit(e) {
   try {
     const payload = _getSubmissionPayload(e);
     if (!payload) return;
-
-    // --- Advanced deduplication: override old entries ---
-    // Key: lastName + firstName + barangay + dateString
-    const dedupKey = [payload.rowData.lastName, payload.rowData.firstName, payload.rowData.barangay, payload.dateString].join('|');
-    const sheet = e.range.getSheet();
-    const data = sheet.getDataRange().getValues();
-    const currentRow = e.range.getRow();
-    for (let i = data.length - 1; i >= 1; i--) { // skip header
-      const [ts, lastName, firstName, purok, barangay, dateOfAppt] = data[i];
-      const rowKey = [lastName, firstName, barangay, (dateOfAppt || '').split(' ')[0]].join('|');
-      if (rowKey === dedupKey && (i + 1) !== currentRow) {
-        sheet.deleteRow(i + 1); // delete old duplicate
-      }
-    }
-
-    if (_isRequestDuplicate(payload.idempotencyKey)) {
-      Logger.log(`onFormSubmit: Duplicate request, skipping: ${payload.idempotencyKey}`);
-      return;
-    }
-
-    const wasProcessed = _processBooking(payload);
-
-    if (wasProcessed) {
-      _enqueueSideEffects(payload);
-      _markRequestAsProcessed(payload.idempotencyKey);
-      Logger.log('onFormSubmit: Submission processed and jobs enqueued.');
-      // Immediate dropdown update for better user experience
-      updateFormDropdownForDate(payload.registry, payload.dateString);
-    }
+    distributedQueueEnqueue({
+      taskName: 'processFormSubmissionJob',
+      args: { payload },
+      priority: 100 // High priority for user-facing jobs
+    });
   } catch (err) {
     ErrorService.sendThrottledError('onFormSubmit', err, { eventObject: e });
   }
@@ -3059,11 +2849,12 @@ const ContinuationManager = {
    * @param {string} continuationFnName - The function name to call on continuation.
    */
   saveAndContinue(taskName, state, continuationFnName) {
-    this.saveState(taskName, state);
-    ScriptApp.newTrigger(continuationFnName)
+    const trigger = ScriptApp.newTrigger(continuationFnName)
       .timeBased()
       .after(10000) // 10 seconds
       .create();
+    state.continuationTriggerId = trigger.getUniqueId();
+    this.saveState(taskName, state);
   },
 
   /**
@@ -3080,9 +2871,17 @@ const ContinuationManager = {
     }
     const props = PropertiesService.getScriptProperties();
     props.deleteProperty(taskName);
-    ScriptApp.getProjectTriggers().forEach(t => {
-      if (t.getHandlerFunction() === continuationFnName) ScriptApp.deleteTrigger(t);
-    });
+    // More efficient trigger deletion
+    if (state && state.continuationTriggerId) {
+      const trigger = ScriptApp.getProjectTriggers().find(t => t.getUniqueId() === state.continuationTriggerId);
+      if (trigger) {
+        ScriptApp.deleteTrigger(trigger);
+      }
+    } else { // Fallback for older states or if ID was lost
+      ScriptApp.getProjectTriggers().forEach(t => {
+        if (t.getHandlerFunction() === continuationFnName) ScriptApp.deleteTrigger(t);
+      });
+    }
   },
 
   /**
@@ -3171,60 +2970,7 @@ const ContinuationManager = {
   }
 };
 
-/**
- * drainQueueWithContinuation: Processes all jobs in the distributed queue using ContinuationManager.
- * This function will process the entire queue, chunked across multiple invocations if needed.
- * Usage: Run drainQueueWithContinuation() from the Apps Script editor or as an admin function.
- * State is managed by ContinuationManager under the key 'DRAIN_QUEUE_STATE'.
- */
-function drainQueueWithContinuation(e) {
-  const taskName = 'DRAIN_QUEUE_STATE';
-  const continuationFnName = 'drainQueueWithContinuation';
-  let state = e && e.state ? e.state : ContinuationManager.loadState(taskName, { row: 2, processed: 0 });
-  const startTime = Date.now();
-  const sheet = ensureDistributedQueueSheet();
-  const lastRow = sheet.getLastRow();
-  let processedThisRun = 0;
 
-  while (state.row <= lastRow) {
-    const rowValues = sheet.getRange(state.row, 1, 1, sheet.getLastColumn()).getValues()[0];
-    if (!rowValues || !rowValues[0]) {
-      state.row++;
-      continue;
-    }
-    const job = {
-      id: rowValues[0],
-      payload: JSON.parse(rowValues[1]),
-      row: state.row
-    };
-    try {
-      const handler = JOB_HANDLERS && JOB_HANDLERS[job.payload.type];
-      if (handler) {
-        handler(job.payload);
-        distributedQueueComplete(job.row);
-        Logger.log(`drainQueueWithContinuation: Completed job ${job.id}`);
-      } else {
-        Logger.log(`drainQueueWithContinuation: Unknown job type: ${job.payload.type}`);
-        deadLetterEnqueue(job, `Unknown job type: ${job.payload.type}`);
-        distributedQueueComplete(job.row);
-      }
-    } catch (e) {
-      Logger.log(`drainQueueWithContinuation: FAILED job ${job.id}. Error: ${e.toString()}`);
-      deadLetterEnqueue(job, e.toString());
-      distributedQueueComplete(job.row);
-    }
-    state.row++;
-    state.processed++;
-    processedThisRun++;
-    if (!ContinuationManager.shouldContinue(startTime)) {
-      Logger.log(`drainQueueWithContinuation: Pausing after ${processedThisRun} jobs this run, will continue...`);
-      ContinuationManager.saveAndContinue(taskName, state, continuationFnName);
-      return;
-    }
-  }
-  Logger.log(`drainQueueWithContinuation: Finished. Total jobs processed: ${state.processed}`);
-  ContinuationManager.finish(taskName, continuationFnName);
-}
 
 /**
  * Ensures the PerformanceLog_v1 sheet exists and has the correct headers.
@@ -3333,223 +3079,9 @@ function dequeueNextJobByPriority(sheet) {
   return null;
 }
 
-// Refactor masterAsyncJobWorker to use JobHandlerRegistry, prioritization, and retry policy
-function masterAsyncJobWorker(options, e) {
-  options = options || {};
-  const fullDrain = !!options.fullDrain;
-  const workerId = 'worker_async_' + Utilities.getUuid();
-  const claimTimeoutSec = 60; // 1 minute
-  const maxBatch = 5; // Regular mode: process up to 5 jobs per run
-  let processedCount = 0;
-  let leaseAcquired = false;
 
-  // Only run during business hours (Mon-Fri, 8am-5pm)
-  const now = new Date();
-  const day = now.getDay();
-  const hour = now.getHours();
-  if (day === 0 || day === 6 || hour < 8 || hour >= 17) {
-    Logger.log('masterAsyncJobWorker: Outside business hours, skipping run.');
-    return;
-  }
 
-  const executionStart = Date.now();
-  const maxExecutionTime = 4 * 60 * 1000; // 4 minutes
-  Logger.log('masterAsyncJobWorker: start (production-grade with lease management)');
 
-  // --- Full-Drain Mode: Use ContinuationManager to process the entire queue ---
-  if (fullDrain) {
-    const taskName = 'FULL_DRAIN_QUEUE_STATE';
-    const continuationFnName = 'masterAsyncJobWorker';
-    let state = e && e.state ? e.state : ContinuationManager.loadState(taskName, { row: 2, processed: 0 });
-    const sheet = ensureDistributedQueueSheet();
-    const lastRow = sheet.getLastRow();
-    let processedThisRun = 0;
-    try {
-      leaseAcquired = WorkerLeaseManager.acquireLease(workerId);
-      if (!leaseAcquired) {
-        Logger.log('masterAsyncJobWorker: Failed to acquire lease, another worker is active');
-        return;
-      }
-      while (state.row <= lastRow) {
-        const rowValues = sheet.getRange(state.row, 1, 1, sheet.getLastColumn()).getValues()[0];
-        if (!rowValues || !rowValues[0]) {
-          state.row++;
-          continue;
-        }
-        const job = {
-          id: rowValues[0],
-          payload: JSON.parse(rowValues[1]),
-          row: state.row
-        };
-        try {
-          const handler = JobHandlerRegistry.getHandler(job.payload.type);
-          if (handler) {
-            handler(job.payload);
-            distributedQueueComplete(job.row);
-            Logger.log(`masterAsyncJobWorker (full-drain): Completed job ${job.id}`);
-          } else {
-            Logger.log(`masterAsyncJobWorker (full-drain): Unknown job type: ${job.payload.type}`);
-            deadLetterEnqueue(job, `Unknown job type: ${job.payload.type}`);
-            distributedQueueComplete(job.row);
-          }
-        } catch (e) {
-          Logger.log(`masterAsyncJobWorker (full-drain): FAILED job ${job.id}. Error: ${e.toString()}`);
-          // Retry policy
-          job.payload.retries = (job.payload.retries || 0) + 1;
-          if (job.payload.retries > MAX_JOB_RETRIES) {
-            deadLetterEnqueue(job, `Max retries exceeded: ${e.toString()}`);
-            distributedQueueComplete(job.row);
-          } else {
-            Logger.log(`masterAsyncJobWorker: Retrying job ${job.id}, attempt ${job.payload.retries}`);
-            distributedQueueEnqueue(job.payload);
-            distributedQueueComplete(job.row);
-          }
-        }
-        state.processed++;
-        processedThisRun++;
-        if (!ContinuationManager.shouldContinue(executionStart, maxExecutionTime)) {
-          Logger.log(`masterAsyncJobWorker (full-drain): Pausing after ${processedThisRun} jobs this run, will continue...`);
-          ContinuationManager.saveAndContinue(taskName, state, continuationFnName);
-          return;
-        }
-      }
-      Logger.log(`masterAsyncJobWorker (full-drain): Finished. Total jobs processed: ${state.processed}`);
-      ContinuationManager.finish(taskName, continuationFnName);
-    } finally {
-      if (leaseAcquired) {
-        WorkerLeaseManager.releaseLease(workerId);
-      }
-    }
-    return;
-  }
-
-  // --- Regular Batch Mode (default) ---
-  try {
-    leaseAcquired = WorkerLeaseManager.acquireLease(workerId);
-    if (!leaseAcquired) {
-      Logger.log('masterAsyncJobWorker: Failed to acquire lease, another worker is active');
-      return;
-    }
-    Logger.log(`masterAsyncJobWorker: Lease acquired, starting job processing`);
-    const sheet = ensureDistributedQueueSheet();
-    while (processedCount < maxBatch) {
-      if (Date.now() - executionStart > maxExecutionTime) {
-        Logger.log('masterAsyncJobWorker: Execution time limit reached, stopping');
-        break;
-      }
-      const job = dequeueNextJobByPriority(sheet);
-      if (!job) {
-        Logger.log('masterAsyncJobWorker: No pending jobs found');
-        break;
-      }
-      Logger.log(`masterAsyncJobWorker: Claimed job ${job.id} of type ${job.payload.type}`);
-      try {
-        const handler = JobHandlerRegistry.getHandler(job.payload.type);
-        if (handler) {
-          handler(job.payload);
-          distributedQueueComplete(job.row);
-          Logger.log(`masterAsyncJobWorker: Completed job ${job.id}`);
-        } else {
-          Logger.log(`masterAsyncJobWorker: Unknown job type: ${job.payload.type}`);
-          deadLetterEnqueue(job, `Unknown job type: ${job.payload.type}`);
-          distributedQueueComplete(job.row);
-          ConcurrencyMonitor._logMetric('job_failure', {
-            jobId: job.id,
-            jobType: job.payload.type,
-            error: 'Unknown job type',
-            workerId: workerId
-          });
-        }
-      } catch (e) {
-        Logger.log(`masterAsyncJobWorker: FAILED job ${job.id}. Error: ${e.toString()}`);
-        // Retry policy
-        job.payload.retries = (job.payload.retries || 0) + 1;
-        if (job.payload.retries > MAX_JOB_RETRIES) {
-          deadLetterEnqueue(job, `Max retries exceeded: ${e.toString()}`);
-          distributedQueueComplete(job.row);
-        } else {
-          Logger.log(`masterAsyncJobWorker: Retrying job ${job.id}, attempt ${job.payload.retries}`);
-          distributedQueueEnqueue(job.payload);
-          distributedQueueComplete(job.row);
-        }
-        ConcurrencyMonitor._logMetric('job_failure', {
-          jobId: job.id,
-          jobType: job.payload.type,
-          error: e.toString(),
-          workerId: workerId
-        });
-      }
-      processedCount++;
-    }
-  } catch (e) {
-    Logger.log(`masterAsyncJobWorker: Critical error: ${e.toString()}`);
-    ConcurrencyMonitor._logMetric('worker_error', {
-      workerId: workerId,
-      error: e.toString(),
-      processedCount: processedCount
-    });
-  } finally {
-    if (leaseAcquired) {
-      WorkerLeaseManager.releaseLease(workerId);
-    }
-    const executionTime = Date.now() - executionStart;
-    Logger.log(`masterAsyncJobWorker: Finished run, processed ${processedCount} jobs in ${executionTime}ms`);
-    ConcurrencyMonitor._logMetric('worker_performance', {
-      workerId: workerId,
-      processedCount: processedCount,
-      executionTime: executionTime,
-      leaseAcquired: leaseAcquired
-    });
-  }
-}
-
-// Refactor drainQueueWithContinuation to use JobHandlerRegistry, prioritization, and retry policy
-function drainQueueWithContinuation(e) {
-  const taskName = 'DRAIN_QUEUE_STATE';
-  const continuationFnName = 'drainQueueWithContinuation';
-  let state = e && e.state ? e.state : ContinuationManager.loadState(taskName, { row: 2, processed: 0 });
-  const startTime = Date.now();
-  const sheet = ensureDistributedQueueSheet();
-  let processedThisRun = 0;
-
-  while (true) {
-    const job = dequeueNextJobByPriority(sheet);
-    if (!job) break;
-    try {
-      const handler = JobHandlerRegistry.getHandler(job.payload.type);
-      if (handler) {
-        handler(job.payload);
-        distributedQueueComplete(job.row);
-        Logger.log(`drainQueueWithContinuation: Completed job ${job.id}`);
-      } else {
-        Logger.log(`drainQueueWithContinuation: Unknown job type: ${job.payload.type}`);
-        deadLetterEnqueue(job, `Unknown job type: ${job.payload.type}`);
-        distributedQueueComplete(job.row);
-      }
-    } catch (e) {
-      Logger.log(`drainQueueWithContinuation: FAILED job ${job.id}. Error: ${e.toString()}`);
-      // Retry policy
-      job.payload.retries = (job.payload.retries || 0) + 1;
-      if (job.payload.retries > MAX_JOB_RETRIES) {
-        deadLetterEnqueue(job, `Max retries exceeded: ${e.toString()}`);
-        distributedQueueComplete(job.row);
-      } else {
-        Logger.log(`drainQueueWithContinuation: Retrying job ${job.id}, attempt ${job.payload.retries}`);
-        distributedQueueEnqueue(job.payload);
-        distributedQueueComplete(job.row);
-      }
-    }
-    state.processed++;
-    processedThisRun++;
-    if (!ContinuationManager.shouldContinue(startTime)) {
-      Logger.log(`drainQueueWithContinuation: Pausing after ${processedThisRun} jobs this run, will continue...`);
-      ContinuationManager.saveAndContinue(taskName, state, continuationFnName);
-      return;
-    }
-  }
-  Logger.log(`drainQueueWithContinuation: Finished. Total jobs processed: ${state.processed}`);
-  ContinuationManager.finish(taskName, continuationFnName);
-}
 
 // === TASK_REGISTRY: System Call Table for Apps Script OS ===
 // This registry defines all orchestratable/admin tasks for dynamic scheduling and agentic invocation.
@@ -3591,18 +3123,6 @@ const TASK_REGISTRY = {
     parameters: [ { name: 'sheetId', type: 'string', required: true } ],
     resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
   },
-  masterAsyncJobWorker: {
-    functionName: 'masterAsyncJobWorker',
-    description: 'Processes jobs from the distributed queue with lease management and retry policy.',
-    parameters: [ { name: 'options', type: 'object', required: false }, { name: 'e', type: 'object', required: false } ],
-    resourceCost: 'HIGH', retryPolicy: 'linear_backoff', dependencies: []
-  },
-  drainQueueWithContinuation: {
-    functionName: 'drainQueueWithContinuation',
-    description: 'Processes all jobs in the distributed queue using ContinuationManager.',
-    parameters: [ { name: 'e', type: 'object', required: false } ],
-    resourceCost: 'HIGH', retryPolicy: 'move_to_dlq', dependencies: []
-  },
   rebuildSlotCounters: {
     functionName: 'rebuildSlotCounters',
     description: 'Rebuilds slot counters for all availability sheets.',
@@ -3611,8 +3131,8 @@ const TASK_REGISTRY = {
   },
   rebuildAppointmentEventsAllForms: {
     functionName: 'rebuildAppointmentEventsAllForms',
-    description: 'Deletes and recreates all appointment events from form responses.',
-    parameters: [ { name: 'e', type: 'object', required: false } ],
+    description: 'Modernized: Deletes and recreates all appointment events from form responses using leasing and resumable sub-tasks.',
+    parameters: [ { name: 'args', type: 'object', required: false } ],
     resourceCost: 'HIGH', retryPolicy: 'move_to_dlq', dependencies: []
   },
   rebuildAllFormDropdowns: {
@@ -3744,7 +3264,67 @@ const TASK_REGISTRY = {
     description: 'Orchestrated system data consolidation: performance logs, metrics, etc.',
     parameters: [],
     resourceCost: 'LOW', retryPolicy: 'none', dependencies: []
-  }
+  },
+  processFormSubmissionJob: {
+    functionName: 'processFormSubmissionJob',
+    description: 'Handles PROCESS_FORM_SUBMISSION jobs: deduplication, booking, and side-effect jobs.',
+    parameters: [ { name: 'args', type: 'object', required: true } ],
+    resourceCost: 'HIGH', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  [RUN_DAILY_MAINTENANCE]: {
+    functionName: 'runDailyMaintenanceJob',
+    description: 'Handles RUN_DAILY_MAINTENANCE jobs: enqueues sub-tasks for maintenance.',
+    parameters: [ { name: 'args', type: 'object', required: false } ],
+    resourceCost: 'MEDIUM', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  [PURGE_OLD_RESPONSES]: {
+    functionName: 'purgeOldResponsesJob',
+    description: 'Purges old responses as part of maintenance.',
+    parameters: [ { name: 'args', type: 'object', required: false } ],
+    resourceCost: 'LOW', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  [SYNC_CALENDAR_RANGE]: {
+    functionName: 'syncCalendarRangeJob',
+    description: 'Syncs calendar events for a date range as part of maintenance.',
+    parameters: [ { name: 'args', type: 'object', required: false } ],
+    resourceCost: 'MEDIUM', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  [AUDIT_SHEETS]: {
+    functionName: 'auditSheetsJob',
+    description: 'Audits availability sheets as part of maintenance.',
+    parameters: [ { name: 'args', type: 'object', required: false } ],
+    resourceCost: 'LOW', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  [SETUP_FREE_TIER_SYSTEM]: {
+    functionName: 'setupFreeTierSystemTask',
+    description: 'Sets up all triggers, quotas, and unified list for free-tier system (agentic-invokable).',
+    parameters: [ { name: 'args', type: 'object', required: false } ],
+    resourceCost: 'MEDIUM', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  [REBUILD_ALL_DROPDOWNS]: {
+    functionName: 'rebuildAllFormDropdownsTask',
+    description: 'High-level task to rebuild all form dropdowns by enqueuing UPDATE_DROPDOWN jobs for each form.',
+    parameters: [ { name: 'args', type: 'object', required: false } ],
+    resourceCost: 'MEDIUM', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  [UPDATE_DROPDOWN]: {
+    functionName: 'updateDropdownJob',
+    description: 'Updates the dropdown for a single form.',
+    parameters: [ { name: 'args', type: 'object', required: true } ],
+    resourceCost: 'LOW', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  [GENERATE_UNIFIED_LIST]: {
+    functionName: 'generateUnifiedAppointmentListTask',
+    description: 'Generates the unified appointment list in batches using ContinuationManager.',
+    parameters: [ { name: 'args', type: 'object', required: false } ],
+    resourceCost: 'HIGH', retryPolicy: 'linear_backoff', dependencies: []
+  },
+  [AUDIT_AVAILABILITY_SHEETS_BATCH]: {
+    functionName: 'auditAvailabilitySheetsBatchTask',
+    description: 'Audits all availability sheets in batches using runBatchJobWithContinuation.',
+    parameters: [ { name: 'args', type: 'object', required: false } ],
+    resourceCost: 'MEDIUM', retryPolicy: 'linear_backoff', dependencies: []
+  },
 };
 
 /**
@@ -3761,149 +3341,7 @@ const TASK_REGISTRY = {
  * - Supports full-drain/ContinuationManager mode for long-running jobs
  * - Logs metrics to ConcurrencyMonitor
  */
-function ContinuationOrchestrationKernel(options, e) {
-  options = options || {};
-  const fullDrain = !!options.fullDrain;
-  const workerId = 'kernel_async_' + Utilities.getUuid();
-  let leaseAcquired = false;
-  const maxBatch = 5;
-  const executionStart = Date.now();
-  const maxExecutionTime = 4 * 60 * 1000;
-  let processedCount = 0;
 
-  // --- PAUSE CHECK (stateless, persistent) ---
-  if (isKernelPaused()) {
-    Logger.log('[Kernel] PAUSED: Exiting without processing jobs.');
-    return;
-  }
-
-  // Business hours check (Mon-Fri, 8am-5pm)
-  const now = new Date();
-  const day = now.getDay();
-  const hour = now.getHours();
-  if (day === 0 || day === 6 || hour < 8 || hour >= 17) {
-    Logger.log('ContinuationOrchestrationKernel: Outside business hours, skipping run.');
-    return;
-  }
-
-  try {
-    leaseAcquired = WorkerLeaseManager.acquireLease(workerId);
-    if (!leaseAcquired) {
-      Logger.log('ContinuationOrchestrationKernel: Failed to acquire lease, another worker is active');
-      return;
-    }
-    const queueStatus = checkQueueStatus ? checkQueueStatus() : { pendingJobs: 0 };
-    if (typeof ConcurrencyMonitor !== 'undefined') {
-      ConcurrencyMonitor.logQueueDepth(queueStatus.pendingJobs || 0);
-    }
-
-    if (fullDrain) {
-      const taskName = 'FULL_DRAIN_QUEUE_STATE';
-      const continuationFnName = 'ContinuationOrchestrationKernel';
-      let state = e && e.state ? e.state : ContinuationManager.loadState(taskName, { row: 2, processed: 0 });
-      const sheet = ensureDistributedQueueSheet();
-      const lastRow = sheet.getLastRow();
-      let processedThisRun = 0;
-      while (state.row <= lastRow) {
-        const rowValues = sheet.getRange(state.row, 1, 1, sheet.getLastColumn()).getValues()[0];
-        if (!rowValues || !rowValues[0]) {
-          state.row++;
-          continue;
-        }
-        let job;
-        try {
-          job = JSON.parse(rowValues[1]);
-        } catch (err) {
-          job = { id: rowValues[0], legacyPayload: rowValues[1] };
-        }
-        job.row = state.row;
-        // --- CANCEL CHECK (stateless, persistent) ---
-        if (isJobCancelled(job.id)) {
-          Logger.log('[Kernel] Job ' + job.id + ' is CANCELLED. Marking as CANCELLED and completing.');
-          job.status = 'CANCELLED';
-          distributedQueueComplete(job.row);
-          if (typeof ConcurrencyMonitor !== 'undefined') {
-            ConcurrencyMonitor._logMetric('job_cancelled', {
-              jobId: job.id,
-              jobType: job.taskName,
-              workerId: workerId
-            });
-          }
-          state.row++;
-          state.processed++;
-          processedThisRun++;
-          continue;
-        }
-        const result = processSingleJob(job, {
-          workerId,
-          mode: 'full-drain',
-          maxExecutionTime,
-          executionStart
-        });
-        processedThisRun++;
-        state.row++;
-        state.processed++;
-        if (!ContinuationManager.shouldContinue(executionStart, maxExecutionTime)) {
-          Logger.log(`[Kernel] [full-drain] Pausing after ${processedThisRun} jobs, will continue...`);
-          ContinuationManager.saveAndContinue(taskName, state, continuationFnName);
-          return;
-        }
-      }
-      Logger.log(`[Kernel] [full-drain] Finished. Total jobs processed: ${state.processed}`);
-      ContinuationManager.finish(taskName, continuationFnName);
-      return;
-    }
-
-    // --- Regular Batch Mode (default) ---
-    const jobs = distributedQueueListAll()
-      .filter(j => j.status === 'PENDING' && j.dependenciesResolved !== false)
-      .sort((a, b) => (b.priority || 0) - (a.priority || 0))
-      .slice(0, maxBatch);
-    for (const job of jobs) {
-      Logger.log(`[Kernel] [batch] Selected job ${job.id} of task ${job.taskName}`);
-      // --- CANCEL CHECK (stateless, persistent) ---
-      if (isJobCancelled(job.id)) {
-        Logger.log('[Kernel] Job ' + job.id + ' is CANCELLED. Marking as CANCELLED and completing.');
-        job.status = 'CANCELLED';
-        distributedQueueComplete(job.row);
-        if (typeof ConcurrencyMonitor !== 'undefined') {
-          ConcurrencyMonitor._logMetric('job_cancelled', {
-            jobId: job.id,
-            jobType: job.taskName,
-            workerId: workerId
-          });
-        }
-        processedCount++;
-        continue;
-      }
-      processSingleJob(job, {
-        workerId,
-        mode: 'batch',
-        maxExecutionTime,
-        executionStart
-      });
-      processedCount++;
-      if ((Date.now() - executionStart) > maxExecutionTime) {
-        Logger.log('[Kernel] [batch] Execution time limit reached, stopping');
-        break;
-      }
-    }
-  } finally {
-    if (leaseAcquired) {
-      WorkerLeaseManager.releaseLease(workerId);
-    }
-    const executionTime = Date.now() - executionStart;
-    Logger.log(`[Kernel] Finished run, processed ${processedCount} jobs in ${executionTime}ms`);
-    if (typeof ConcurrencyMonitor !== 'undefined') {
-      ConcurrencyMonitor._logMetric('worker_performance', {
-        workerId: workerId,
-        processedCount: processedCount,
-        executionTime: executionTime,
-        leaseAcquired: leaseAcquired
-      });
-    }
-  }
-}
 
 /**
  * Process a single job (used by both full-drain and batch modes)
@@ -4709,8 +4147,8 @@ function initializeSystem() {
       ['Key', 'Value'],
       ['SCRIPT_VERSION', typeof SCRIPT_VERSION !== 'undefined' ? SCRIPT_VERSION : ''],
       ['IS_DEV', typeof IS_DEV !== 'undefined' ? IS_DEV : ''],
-      ['SLOT_CAP', typeof SLOT_CAP !== 'undefined' ? SLOT_CAP : ''],
-      ['FUTURE_DAYS', typeof FUTURE_DAYS !== 'undefined' ? FUTURE_DAYS : ''],
+      ['SLOT_CAP', typeof ConfigService.get('SLOT_CAP', 20) !== 'undefined' ? ConfigService.get('SLOT_CAP', 20) : ''],
+      ['FUTURE_DAYS', typeof ConfigService.get('FUTURE_DAYS', 60) !== 'undefined' ? ConfigService.get('FUTURE_DAYS', 60) : ''],
       ['RESPONSE_RETENTION_DAYS', typeof RESPONSE_RETENTION_DAYS !== 'undefined' ? RESPONSE_RETENTION_DAYS : ''],
       ['BUSINESS_DAYS_WINDOW', typeof BUSINESS_DAYS_WINDOW !== 'undefined' ? BUSINESS_DAYS_WINDOW : ''],
       ['BATCH_DAYS_WINDOW', typeof BATCH_DAYS_WINDOW !== 'undefined' ? BATCH_DAYS_WINDOW : ''],
@@ -4908,7 +4346,7 @@ function initializeSystem() {
 
 // --- SECURITY: Admin allowlist for all critical operations ---
 var SYSTEM_ADMINS = [
-  // Add your admin emails here
+  // Add your admin emails here. Ignore the placeholder.
   'your.admin@email.com',
   // Add more as needed
 ];
@@ -5421,5 +4859,394 @@ function setConsolidationScheduled(enable) {
     ScriptApp.newTrigger('consolidateSystemMetrics').timeBased().everyDays(1).create();
   } else if (!enable && found) {
     ScriptApp.deleteTrigger(found);
+  }
+}
+
+/**
+ * Handler for PROCESS_FORM_SUBMISSION jobs. Performs deduplication, booking, and enqueues side-effects.
+ * @param {Object} args - { payload }
+ */
+function processFormSubmissionJob(args) {
+  try {
+    // --- Robust payload validation ---
+    if (!args || typeof args !== 'object' || !args.payload) {
+      throw new Error('processFormSubmissionJob: Invalid or missing payload');
+    }
+    const payload = args.payload;
+    if (!payload.rowData || !payload.registry || !payload.dateString || !payload.idempotencyKey) {
+      throw new Error('processFormSubmissionJob: Payload missing required fields');
+    }
+    // --- Advanced deduplication: override old entries ---
+    const dedupKey = [payload.rowData.lastName, payload.rowData.firstName, payload.rowData.barangay, payload.dateString].join('|');
+    const sheet = getSpreadsheet(payload.registry).getSheetByName(payload.registry.sheetName);
+    const data = sheet.getDataRange().getValues();
+    for (let i = data.length - 1; i >= 1; i--) { // skip header
+      const [ts, lastName, firstName, purok, barangay, dateOfAppt] = data[i];
+      const rowKey = [lastName, firstName, barangay, (dateOfAppt || '').split(' ')[0]].join('|');
+      if (rowKey === dedupKey) {
+        sheet.deleteRow(i + 1); // delete old duplicate
+      }
+    }
+    if (_isRequestDuplicate(payload.idempotencyKey)) {
+      Logger.log(`processFormSubmissionJob: Duplicate request, skipping: ${payload.idempotencyKey}`);
+      return;
+    }
+    const wasProcessed = _processBooking(payload);
+    if (wasProcessed) {
+      _enqueueSideEffects(payload);
+      _markRequestAsProcessed(payload.idempotencyKey);
+      Logger.log('processFormSubmissionJob: Submission processed and jobs enqueued.');
+      updateFormDropdownForDate(payload.registry, payload.dateString);
+    }
+  } catch (err) {
+    ErrorService.sendThrottledError('processFormSubmissionJob', err, args);
+  }
+}
+
+/**
+ * Refactored setupFreeTierSystem: Uses FreeTierTriggerManager for all triggers, agentic-invokable.
+ */
+function setupFreeTierSystemTask(args) {
+  Logger.log('setupFreeTierSystemTask: Starting free-tier system setup');
+  try {
+    FreeTierTriggerManager.setupFreeTierTriggers();
+    FreeTierTriggerManager.setupSystemHealthDigestTrigger();
+    CalendarQuotaManager.initRun();
+    generateUnifiedAppointmentList();
+    FreeTierTriggerManager.listAllTriggers();
+    Logger.log('setupFreeTierSystemTask: Free-tier system setup completed successfully');
+  } catch (e) {
+    Logger.log('setupFreeTierSystemTask: Error during setup: ' + e);
+    throw e;
+  }
+}
+
+// Add to FreeTierTriggerManager:
+FreeTierTriggerManager.setupSystemHealthDigestTrigger = function() {
+  if (!this.hasTrigger('sendSystemHealthDigest', ScriptApp.EventType.CLOCK)) {
+    ScriptApp.newTrigger('sendSystemHealthDigest')
+      .timeBased()
+      .everyDays(1)
+      .atHour(7)
+      .create();
+    Logger.log('FreeTierTriggerManager: Created daily system health digest trigger (7 AM)');
+  }
+};
+
+/**
+ * Modernized: Rebuilds all appointment events from form responses using leasing and resumable sub-tasks.
+ * - Deletion: Resumable, batch by month.
+ * - Creation: Uses runBatchJobWithContinuation.
+ * - Uses WorkerLeaseManager for concurrency.
+ */
+function rebuildAppointmentEventsAllForms(args) {
+  const workerId = 'rebuild_appt_' + Utilities.getUuid();
+  let leaseAcquired = false;
+  try {
+    leaseAcquired = WorkerLeaseManager.acquireLease(workerId);
+    if (!leaseAcquired) {
+      Logger.log('rebuildAppointmentEventsAllForms: Lease busy, skipping');
+      return;
+    }
+    // --- Deletion phase: resumable, batch by month ---
+    let state = args && args.state ? args.state : ContinuationManager.loadState('REBUILD_APPT_EVENTS', {});
+    if (!state.deletionDone) {
+      const startYear = 1970;
+      const endDate = new Date();
+      const endYear = endDate.getFullYear();
+      const endMonth = endDate.getMonth();
+      state.currentYear = state.currentYear || startYear;
+      state.currentMonth = state.currentMonth || 0;
+      while (state.currentYear < endYear || (state.currentYear === endYear && state.currentMonth <= endMonth)) {
+        const monthStart = new Date(state.currentYear, state.currentMonth, 1);
+        const monthEnd = new Date(state.currentYear, state.currentMonth + 1, 0);
+        const events = CAL.getEvents(monthStart, monthEnd);
+        for (const event of events) {
+          const title = event.getTitle();
+          if (title.includes(APPT_EVENT_TAG) || title.includes(FULL_SUMMARY_TAG)) {
+            CalendarQuotaManager.safeDeleteEvent(() => event.deleteEvent());
+          }
+        }
+        // Move to next month
+        if (state.currentMonth === 11) {
+          state.currentMonth = 0;
+          state.currentYear++;
+        } else {
+          state.currentMonth++;
+        }
+        // Save state and yield if running long
+        if (!ContinuationManager.shouldContinue(state.startTime || (state.startTime = Date.now()), 4 * 60 * 1000)) {
+          ContinuationManager.saveAndContinue('REBUILD_APPT_EVENTS', state, 'rebuildAppointmentEventsAllForms');
+          return;
+        }
+      }
+      state.deletionDone = true;
+      state.currentYear = undefined;
+      state.currentMonth = undefined;
+      ContinuationManager.saveState('REBUILD_APPT_EVENTS', state);
+    }
+    // --- Creation phase: runBatchJobWithContinuation for each form ---
+    if (!state.creationDone) {
+      for (const entry of FORM_REGISTRY) {
+        try {
+          const sheet = getSpreadsheet(entry).getSheetByName(entry.sheetName);
+          if (!sheet) continue;
+          const taskName = 'BATCH_CONTINUATION_STATE_rebuildAppointmentEventsAllForms_' + entry.sheetName;
+          let batchState = state[taskName] || {};
+          runBatchJobWithContinuation({
+            taskName,
+            continuationFnName: 'rebuildAppointmentEventsAllForms',
+            batchFn: (batchState, rows, batchStartRow) => {
+              for (let i = 0; i < rows.length; i++) {
+                const [timestamp, lastName, firstName, purok, barangay, dateChoice] = rows[i];
+                if (!dateChoice) continue;
+                const dateStr = typeof dateChoice === 'string' ? dateChoice.split(' ')[0] : '';
+                const dateObj = DateUtils.parseDate(dateStr);
+                if (!dateObj) continue;
+                CalendarQuotaManager.safeCreateEvent(() => {
+                  const event = CAL.createAllDayEvent(
+                    `${APPT_EVENT_TAG} ${lastName}, ${firstName} (${barangay})`,
+                    dateObj
+                  );
+                  event.setColor(CalendarApp.EventColor.PALE_BLUE);
+                  return event;
+                });
+              }
+            },
+            doneFn: () => Logger.log('rebuildAppointmentEventsAllForms:end'),
+            batchSize: ConfigService.get('CHUNK_SIZE', 500),
+            softTimeLimitMs: 4 * 60 * 1000,
+            startRowKey: 'lastRow',
+            sheet,
+            getLastRowFn: s => s.getLastRow()
+          }, { state: batchState });
+          state[taskName] = batchState;
+        } catch (e) {
+          Logger.log('rebuildAppointmentEventsAllForms: Error for ' + entry.sheetName + ': ' + e);
+        }
+      }
+      state.creationDone = true;
+      ContinuationManager.saveState('REBUILD_APPT_EVENTS', state);
+    }
+    Logger.log('rebuildAppointmentEventsAllForms: All done.');
+  } finally {
+    if (leaseAcquired) WorkerLeaseManager.releaseLease(workerId);
+  }
+}
+
+/**
+ * Modernized: High-level task to rebuild all form dropdowns by enqueuing UPDATE_DROPDOWN jobs for each form.
+ */
+function rebuildAllFormDropdownsTask(args) {
+  try {
+    for (const entry of FORM_REGISTRY) {
+      distributedQueueEnqueue({
+        taskName: UPDATE_DROPDOWN,
+        args: { formId: entry.formId, sheetName: entry.availabilitySheetName, registry: entry },
+        priority: 30
+      });
+    }
+    Logger.log('rebuildAllFormDropdownsTask: Enqueued UPDATE_DROPDOWN jobs for all forms.');
+  } catch (err) {
+    ErrorService.sendThrottledError('rebuildAllFormDropdownsTask', err, args);
+  }
+}
+
+/**
+ * Handler for UPDATE_DROPDOWN jobs. Updates the dropdown for a single form.
+ */
+function updateDropdownJob(args) {
+  try {
+    const { formId, sheetName, registry } = args;
+    const sheet = getSpreadsheet(registry).getSheetByName(sheetName);
+    if (!sheet) throw new Error('Sheet not found for dropdown update');
+    const lastRow = sheet.getLastRow();
+    const dateLabels = [];
+    for (let i = 2; i <= lastRow; i++) {
+      const row = sheet.getRange(i, 1, 1, 3).getValues()[0];
+      const dateStr = row[0];
+      const slotsLeft = row[2];
+      if (typeof dateStr === 'string' && dateStr.match(/^\\d{4}-\\d{2}-\\d{2}/) && slotsLeft > 0) {
+        dateLabels.push(`${dateStr} (${slotsLeft} slot${slotsLeft === 1 ? '' : 's'} left)`);
+      }
+    }
+    dateLabels.sort();
+    const form = FormApp.openById(formId);
+    const items = form.getItems(FormApp.ItemType.LIST);
+    for (const item of items) {
+      const title = item.getTitle();
+      if (title.toLowerCase().includes('date')) {
+        const list = item.asListItem();
+        list.setChoiceValues(dateLabels);
+      }
+    }
+    Logger.log(`updateDropdownJob: Updated dropdown for form ${formId}`);
+  } catch (err) {
+    ErrorService.sendThrottledError('updateDropdownJob', err, args);
+  }
+}
+
+/**
+ * Modernized: Generates the unified appointment list in batches using ContinuationManager.
+ * Handles large data sets without timeouts.
+ */
+function generateUnifiedAppointmentListTask(args) {
+  let state = args && args.state ? args.state : ContinuationManager.loadState(GENERATE_UNIFIED_LIST, {});
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet = ss.getSheetByName(UNIFIED_LIST_SHEET);
+    if (!sheet) {
+      sheet = ss.insertSheet(UNIFIED_LIST_SHEET);
+    }
+    if (!state.initialized) {
+      // Clear only the main view columns
+      sheet.getRange(1, 1, sheet.getMaxRows(), UNIFIED_LIST_VIEW_COLS).clearContent();
+      state.rowPtr = 1;
+      // Write title
+      sheet.getRange(state.rowPtr, 1).setValue(UNIFIED_LIST_TITLE);
+      sheet.getRange(state.rowPtr, 1).setFontWeight('bold').setFontSize(14);
+      state.rowPtr++;
+      state.unifiedList = buildUnifiedBlockList();
+      state.grouped = Array.from(groupByDateBlock(state.unifiedList));
+      state.groupIndex = 0;
+      state.initialized = true;
+      ContinuationManager.saveState(GENERATE_UNIFIED_LIST, state);
+    }
+    // Process in batches of date blocks
+    const batchSize = 5; // Number of date blocks per batch
+    let processed = 0;
+    while (state.groupIndex < state.grouped.length && processed < batchSize) {
+      const [dateKey, appointments] = state.grouped[state.groupIndex];
+      renderUnifiedDateBlock(sheet, dateKey, appointments, state.rowPtr);
+      state.rowPtr += UNIFIED_LIST_BLOCK_ROWS;
+      state.groupIndex++;
+      processed++;
+      // Save state and yield if running long
+      if (!ContinuationManager.shouldContinue(state.startTime || (state.startTime = Date.now()), 4 * 60 * 1000)) {
+        ContinuationManager.saveAndContinue(GENERATE_UNIFIED_LIST, state, 'generateUnifiedAppointmentListTask');
+        return;
+      }
+    }
+    if (state.groupIndex >= state.grouped.length) {
+      // Freeze panes at Row 2
+      sheet.setFrozenRows(2);
+      // Apply bold+bg for date rows (every block start row)
+      let dateRowPtr = 2;
+      for (let i = 0; i < state.grouped.length; i++) {
+        sheet.getRange(dateRowPtr, 1, 1, UNIFIED_LIST_VIEW_COLS)
+          .setBackground('#e6f3ff')
+          .setFontWeight('bold');
+        dateRowPtr += UNIFIED_LIST_BLOCK_ROWS;
+      }
+      Logger.log('generateUnifiedAppointmentListTask: All done.');
+      ContinuationManager.finish(GENERATE_UNIFIED_LIST, 'generateUnifiedAppointmentListTask');
+      return;
+    }
+    ContinuationManager.saveState(GENERATE_UNIFIED_LIST, state);
+  } catch (err) {
+    ErrorService.sendThrottledError('generateUnifiedAppointmentListTask', err, args);
+    throw err;
+  }
+}
+
+/**
+ * Modernized: Audits all availability sheets in batches using runBatchJobWithContinuation.
+ * Each batch audits a single sheet, making the audit resumable and robust.
+ */
+function auditAvailabilitySheetsBatchTask(args) {
+  try {
+    for (const entry of FORM_REGISTRY) {
+      const sheet = getSpreadsheet(entry).getSheetByName(entry.availabilitySheetName);
+      if (!sheet) continue;
+      const taskName = 'BATCH_CONTINUATION_STATE_auditAvailabilitySheets_' + entry.availabilitySheetName;
+      runBatchJobWithContinuation({
+        taskName,
+        continuationFnName: 'auditAvailabilitySheetsBatchTask',
+        batchFn: (state, rows, batchStartRow) => {
+          ensureVersionColumn(sheet);
+          ensureChecksumColumn(sheet);
+          for (let i = 0; i < rows.length; i++) {
+            const rowIdx = batchStartRow + i;
+            const { valid, errors } = validateRow(sheet, rowIdx);
+            if (!valid) {
+              Logger.log(`auditAvailabilitySheets: Issue in ${entry.availabilitySheetName} row ${rowIdx}: ${errors.join(', ')}`);
+              // Auto-correct checksum only
+              if (errors.includes('Checksum mismatch')) {
+                updateRowChecksum(sheet, rowIdx);
+                Logger.log(`auditAvailabilitySheets: Auto-corrected checksum for row ${rowIdx}`);
+              }
+            }
+          }
+        },
+        doneFn: () => Logger.log(`auditAvailabilitySheets: ${entry.availabilitySheetName} - batch audit done`),
+        batchSize: ConfigService.get('CHUNK_SIZE', 500),
+        softTimeLimitMs: 5 * 60 * 1000,
+        startRowKey: 'lastRow',
+        sheet,
+        getLastRowFn: s => s.getLastRow()
+      });
+    }
+    Logger.log('auditAvailabilitySheetsBatchTask: All sheets audited.');
+  } catch (err) {
+    ErrorService.sendThrottledError('auditAvailabilitySheetsBatchTask', err, args);
+  }
+}
+
+// SECURITY: Add isAdminUser() protection to all admin/system functions
+function retryFailedJobs(limit) {
+  if (!isAdminUser()) {
+    Logger.log('[Security] Unauthorized retryFailedJobs attempt.');
+    throw new Error('Unauthorized: Only admins can retry failed jobs.');
+  }
+  limit = typeof limit === 'number' && limit > 0 ? limit : 5;
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const dlqSheet = ss.getSheetByName(DLQ_TAB_NAME);
+    if (!dlqSheet || dlqSheet.getLastRow() <= 1) {
+      Logger.log('retryFailedJobs: No failed jobs found in DLQ');
+      return { retried: 0, remaining: 0 };
+    }
+    const data = dlqSheet.getRange(2, 1, dlqSheet.getLastRow() - 1, 4).getValues();
+    let retriedCount = 0;
+    const rowsToDelete = [];
+    for (let i = 0; i < Math.min(data.length, limit); i++) {
+      const [failedAt, jobId, reason, payloadStr] = data[i];
+      try {
+        const payload = JSON.parse(payloadStr);
+        distributedQueueEnqueue(payload);
+        Logger.log(`retryFailedJobs: Re-enqueued job ${jobId}`);
+        rowsToDelete.push(i + 2);
+        retriedCount++;
+      } catch (e) {
+        Logger.log(`retryFailedJobs: Error retrying job ${jobId}: ${e.toString()}`);
+        if (typeof ErrorService !== 'undefined') ErrorService.logError('retryFailedJobs', e, { jobId, payloadStr });
+      }
+    }
+    for (let i = rowsToDelete.length - 1; i >= 0; i--) {
+      dlqSheet.deleteRow(rowsToDelete[i]);
+    }
+    const remainingJobs = dlqSheet.getLastRow() - 1;
+    Logger.log(`retryFailedJobs: Retried ${retriedCount} jobs, ${remainingJobs} remaining in DLQ`);
+    return { retried: retriedCount, remaining: remainingJobs };
+  } catch (e) {
+    Logger.log('retryFailedJobs: Error during retry process: ' + e);
+    if (typeof ErrorService !== 'undefined') ErrorService.logError('retryFailedJobs', e);
+    throw e;
+  }
+}
+
+function forceReleaseWorkerLeases() {
+  if (!isAdminUser()) {
+    Logger.log('[Security] Unauthorized forceReleaseWorkerLeases attempt.');
+    throw new Error('Unauthorized: Only admins can force release worker leases.');
+  }
+  try {
+    WorkerLeaseManager.forceReleaseLease();
+    Logger.log('forceReleaseWorkerLeases: Successfully released all worker leases');
+    return { success: true, message: 'All worker leases released' };
+  } catch (e) {
+    Logger.log('forceReleaseWorkerLeases: Error releasing leases: ' + e);
+    if (typeof ErrorService !== 'undefined') ErrorService.logError('forceReleaseWorkerLeases', e);
+    return { success: false, error: e.toString() };
   }
 }
